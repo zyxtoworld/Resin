@@ -10,12 +10,28 @@ type Platform struct {
 	StickyTTLNs                      int64  `json:"sticky_ttl_ns"`
 	RegexFilters                     []string
 	RegionFilters                    []string
-	ReverseProxyMissAction           string `json:"reverse_proxy_miss_action"`
-	ReverseProxyEmptyAccountBehavior string `json:"reverse_proxy_empty_account_behavior"`
-	ReverseProxyFixedAccountHeader   string `json:"reverse_proxy_fixed_account_header"`
-	AllocationPolicy                 string `json:"allocation_policy"`
-	PassiveCircuitBreakerDisabled    bool   `json:"passive_circuit_breaker_disabled"`
-	UpdatedAtNs                      int64  `json:"updated_at_ns"`
+	ResponseRules                    []PlatformResponseRule `json:"response_rules"`
+	ReverseProxyMissAction           string                 `json:"reverse_proxy_miss_action"`
+	ReverseProxyEmptyAccountBehavior string                 `json:"reverse_proxy_empty_account_behavior"`
+	ReverseProxyFixedAccountHeader   string                 `json:"reverse_proxy_fixed_account_header"`
+	AllocationPolicy                 string                 `json:"allocation_policy"`
+	PassiveCircuitBreakerDisabled    bool                   `json:"passive_circuit_breaker_disabled"`
+	UpdatedAtNs                      int64                  `json:"updated_at_ns"`
+}
+
+// PlatformResponseRule describes an upstream HTTP response that should
+// temporarily quarantine the route that produced it. Regexes are matched
+// against the response body; expiry_regex must contain the value to parse in
+// its first capture group. If cooldown is omitted, the response must provide
+// Retry-After or a matching expiry_regex value or the route is not quarantined.
+type PlatformResponseRule struct {
+	Name          string `json:"name,omitempty"`
+	StatusCodes   []int  `json:"status_codes"`
+	ResponseRegex string `json:"response_regex,omitempty"`
+	ExpiryRegex   string `json:"expiry_regex,omitempty"`
+	ExpiryLayout  string `json:"expiry_layout,omitempty"`
+	Cooldown      string `json:"cooldown,omitempty"`
+	Scope         string `json:"scope,omitempty"`
 }
 
 // Subscription represents a node subscription source.

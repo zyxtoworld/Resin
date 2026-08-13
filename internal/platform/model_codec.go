@@ -130,7 +130,7 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		)
 	}
 
-	return NewConfiguredPlatform(
+	plat := NewConfiguredPlatform(
 		mp.ID,
 		mp.Name,
 		regexFilters,
@@ -141,5 +141,11 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		fixedHeader,
 		mp.AllocationPolicy,
 		mp.PassiveCircuitBreakerDisabled,
-	), nil
+	)
+	responseRules, err := CompileResponseRules(mp.ID, mp.ResponseRules)
+	if err != nil {
+		return nil, err
+	}
+	plat.ResponseRules = responseRules
+	return plat, nil
 }

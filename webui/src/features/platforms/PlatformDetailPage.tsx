@@ -583,6 +583,25 @@ export function PlatformDetailPage() {
                     </Select>
                   </div>
 
+                  <div className="field-group" style={{ gridColumn: "1 / -1" }}>
+                    <label className="field-label" htmlFor="detail-edit-response-rules">
+                      {t("上游响应规则（可选，JSON）")}
+                    </label>
+                    <Textarea
+                      id="detail-edit-response-rules"
+                      rows={8}
+                      invalid={Boolean(editForm.formState.errors.response_rules_text)}
+                      placeholder={t('[{"name":"OpenCode 免费额度","status_codes":[429],"response_regex":"FreeUsageLimitError","scope":"egress_ip"}]')}
+                      {...editForm.register("response_rules_text")}
+                    />
+                    {editForm.formState.errors.response_rules_text?.message ? (
+                      <p className="field-error">{t(editForm.formState.errors.response_rules_text.message)}</p>
+                    ) : null}
+                    <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                      {t("期限只取响应的 Retry-After，或 expiry_regex + expiry_layout（rfc3339、unix_seconds、unix_milliseconds、duration）；未读到期限不会猜测 24 小时。cooldown 仅用于明确的固定窗口。scope 可填 node 或 egress_ip。")}
+                    </p>
+                  </div>
+
                   <div className="field-group">
                     <label className="field-label" htmlFor="detail-edit-passive-circuit-breaker" style={{ visibility: "hidden" }}>
                       {t("禁用请求失败熔断")}

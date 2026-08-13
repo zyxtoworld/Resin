@@ -31,6 +31,18 @@ func randomRoute(
 	authorities []string,
 	p2cWindow time.Duration,
 ) (node.Hash, error) {
+	return randomRouteFiltered(plat, stats, pool, targetDomain, authorities, p2cWindow, nil)
+}
+
+func randomRouteFiltered(
+	plat *platform.Platform,
+	stats *IPLoadStats,
+	pool PoolAccessor,
+	targetDomain string,
+	authorities []string,
+	p2cWindow time.Duration,
+	eligible func(node.Hash) bool,
+) (node.Hash, error) {
 	view := plat.View()
 	size := view.Size()
 	if size == 0 {
@@ -41,7 +53,27 @@ func randomRoute(
 	defer randomRouteRNGPool.Put(rng)
 
 	pick := func() (node.Hash, bool) {
-		return view.RandomPick(rng)
+		if eligible == nil {
+			return view.RandomPick(rng)
+		}
+		for i := 0; i < 8; i++ {
+			h, ok := view.RandomPick(rng)
+			if !ok {
+				return node.Zero, false
+			}
+			if eligible(h) {
+				return h, true
+			}
+		}
+		var selected node.Hash
+		view.Range(func(h node.Hash) bool {
+			if eligible(h) {
+				selected = h
+				return false
+			}
+			return true
+		})
+		return selected, selected != node.Zero
 	}
 
 	// Pick 1st candidate.

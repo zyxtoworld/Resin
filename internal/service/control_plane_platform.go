@@ -21,29 +21,32 @@ import (
 
 // PlatformResponse is the API response model for a platform.
 type PlatformResponse struct {
-	ID                               string   `json:"id"`
-	Name                             string   `json:"name"`
-	StickyTTL                        string   `json:"sticky_ttl"`
-	RegexFilters                     []string `json:"regex_filters"`
-	RegionFilters                    []string `json:"region_filters"`
-	RoutableNodeCount                int      `json:"routable_node_count"`
-	ReverseProxyMissAction           string   `json:"reverse_proxy_miss_action"`
-	ReverseProxyEmptyAccountBehavior string   `json:"reverse_proxy_empty_account_behavior"`
-	ReverseProxyFixedAccountHeader   string   `json:"reverse_proxy_fixed_account_header"`
-	AllocationPolicy                 string   `json:"allocation_policy"`
-	PassiveCircuitBreakerDisabled    bool     `json:"passive_circuit_breaker_disabled"`
-	UpdatedAt                        string   `json:"updated_at"`
+	ID                               string                       `json:"id"`
+	Name                             string                       `json:"name"`
+	StickyTTL                        string                       `json:"sticky_ttl"`
+	RegexFilters                     []string                     `json:"regex_filters"`
+	RegionFilters                    []string                     `json:"region_filters"`
+	ResponseRules                    []model.PlatformResponseRule `json:"response_rules"`
+	RoutableNodeCount                int                          `json:"routable_node_count"`
+	ReverseProxyMissAction           string                       `json:"reverse_proxy_miss_action"`
+	ReverseProxyEmptyAccountBehavior string                       `json:"reverse_proxy_empty_account_behavior"`
+	ReverseProxyFixedAccountHeader   string                       `json:"reverse_proxy_fixed_account_header"`
+	AllocationPolicy                 string                       `json:"allocation_policy"`
+	PassiveCircuitBreakerDisabled    bool                         `json:"passive_circuit_breaker_disabled"`
+	UpdatedAt                        string                       `json:"updated_at"`
 }
 
 func platformToResponse(p model.Platform) PlatformResponse {
 	behavior := normalizePlatformEmptyAccountBehavior(p.ReverseProxyEmptyAccountBehavior)
 	fixedHeader := normalizeHeaderFieldName(p.ReverseProxyFixedAccountHeader)
+	responseRules := append([]model.PlatformResponseRule{}, p.ResponseRules...)
 	return PlatformResponse{
 		ID:                               p.ID,
 		Name:                             p.Name,
 		StickyTTL:                        time.Duration(p.StickyTTLNs).String(),
 		RegexFilters:                     append([]string(nil), p.RegexFilters...),
 		RegionFilters:                    append([]string(nil), p.RegionFilters...),
+		ResponseRules:                    responseRules,
 		RoutableNodeCount:                0,
 		ReverseProxyMissAction:           p.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: behavior,
@@ -71,6 +74,7 @@ type platformConfig struct {
 	StickyTTLNs                      int64
 	RegexFilters                     []string
 	RegionFilters                    []string
+	ResponseRules                    []model.PlatformResponseRule
 	ReverseProxyMissAction           string
 	ReverseProxyEmptyAccountBehavior string
 	ReverseProxyFixedAccountHeader   string
@@ -116,6 +120,7 @@ func platformConfigFromModel(mp model.Platform) platformConfig {
 		StickyTTLNs:                      mp.StickyTTLNs,
 		RegexFilters:                     append([]string(nil), mp.RegexFilters...),
 		RegionFilters:                    append([]string(nil), mp.RegionFilters...),
+		ResponseRules:                    append([]model.PlatformResponseRule(nil), mp.ResponseRules...),
 		ReverseProxyMissAction:           mp.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: normalizePlatformEmptyAccountBehavior(mp.ReverseProxyEmptyAccountBehavior),
 		ReverseProxyFixedAccountHeader:   normalizeHeaderFieldName(mp.ReverseProxyFixedAccountHeader),
@@ -125,12 +130,14 @@ func platformConfigFromModel(mp model.Platform) platformConfig {
 }
 
 func (cfg platformConfig) toModel(id string, updatedAtNs int64) model.Platform {
+	responseRules := append([]model.PlatformResponseRule{}, cfg.ResponseRules...)
 	return model.Platform{
 		ID:                               id,
 		Name:                             cfg.Name,
 		StickyTTLNs:                      cfg.StickyTTLNs,
 		RegexFilters:                     append([]string(nil), cfg.RegexFilters...),
 		RegionFilters:                    append([]string(nil), cfg.RegionFilters...),
+		ResponseRules:                    responseRules,
 		ReverseProxyMissAction:           cfg.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: cfg.ReverseProxyEmptyAccountBehavior,
 		ReverseProxyFixedAccountHeader:   cfg.ReverseProxyFixedAccountHeader,
@@ -145,7 +152,7 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 	if err != nil {
 		return nil, err
 	}
-	return platform.NewConfiguredPlatform(
+	plat := platform.NewConfiguredPlatform(
 		id,
 		cfg.Name,
 		compiledRegexFilters,
@@ -156,7 +163,13 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 		cfg.ReverseProxyFixedAccountHeader,
 		cfg.AllocationPolicy,
 		cfg.PassiveCircuitBreakerDisabled,
-	), nil
+	)
+	responseRules, err := platform.CompileResponseRules(id, cfg.ResponseRules)
+	if err != nil {
+		return nil, err
+	}
+	plat.ResponseRules = responseRules
+	return plat, nil
 }
 
 func validatePlatformMissAction(raw string) *ServiceError {
@@ -256,6 +269,9 @@ func setPlatformAllocationPolicy(cfg *platformConfig, policy string) *ServiceErr
 }
 
 func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *ServiceError {
+	if cfg == nil {
+		return invalidArg("platform config is required")
+	}
 	if validateRegionFilters {
 		if err := platform.ValidateRegionFilters(cfg.RegionFilters); err != nil {
 			return invalidArg(err.Error())
@@ -263,6 +279,9 @@ func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *Se
 	}
 	if err := validatePlatformEmptyAccountConfig(cfg); err != nil {
 		return err
+	}
+	if _, err := platform.CompileResponseRules("config", cfg.ResponseRules); err != nil {
+		return invalidArg(err.Error())
 	}
 	return nil
 }
@@ -325,15 +344,16 @@ func (s *ControlPlaneService) GetPlatform(id string) (*PlatformResponse, error) 
 
 // CreatePlatformRequest holds create platform parameters.
 type CreatePlatformRequest struct {
-	Name                             *string  `json:"name"`
-	StickyTTL                        *string  `json:"sticky_ttl"`
-	RegexFilters                     []string `json:"regex_filters"`
-	RegionFilters                    []string `json:"region_filters"`
-	ReverseProxyMissAction           *string  `json:"reverse_proxy_miss_action"`
-	ReverseProxyEmptyAccountBehavior *string  `json:"reverse_proxy_empty_account_behavior"`
-	ReverseProxyFixedAccountHeader   *string  `json:"reverse_proxy_fixed_account_header"`
-	AllocationPolicy                 *string  `json:"allocation_policy"`
-	PassiveCircuitBreakerDisabled    *bool    `json:"passive_circuit_breaker_disabled"`
+	Name                             *string                      `json:"name"`
+	StickyTTL                        *string                      `json:"sticky_ttl"`
+	RegexFilters                     []string                     `json:"regex_filters"`
+	RegionFilters                    []string                     `json:"region_filters"`
+	ReverseProxyMissAction           *string                      `json:"reverse_proxy_miss_action"`
+	ReverseProxyEmptyAccountBehavior *string                      `json:"reverse_proxy_empty_account_behavior"`
+	ReverseProxyFixedAccountHeader   *string                      `json:"reverse_proxy_fixed_account_header"`
+	AllocationPolicy                 *string                      `json:"allocation_policy"`
+	PassiveCircuitBreakerDisabled    *bool                        `json:"passive_circuit_breaker_disabled"`
+	ResponseRules                    []model.PlatformResponseRule `json:"response_rules"`
 }
 
 // CreatePlatform creates a new platform.
@@ -369,6 +389,9 @@ func (s *ControlPlaneService) CreatePlatform(req CreatePlatformRequest) (*Platfo
 	}
 	if req.RegionFilters != nil {
 		cfg.RegionFilters = req.RegionFilters
+	}
+	if req.ResponseRules != nil {
+		cfg.ResponseRules = req.ResponseRules
 	}
 	if req.ReverseProxyMissAction != nil {
 		if err := setPlatformMissAction(&cfg, *req.ReverseProxyMissAction); err != nil {
@@ -474,6 +497,11 @@ func (s *ControlPlaneService) UpdatePlatform(id string, patchJSON json.RawMessag
 	} else if ok {
 		regionFiltersPatched = true
 		cfg.RegionFilters = filters
+	}
+	if rules, ok, err := patch.optionalResponseRules("response_rules"); err != nil {
+		return nil, err
+	} else if ok {
+		cfg.ResponseRules = rules
 	}
 
 	if ma, ok, err := patch.optionalString("reverse_proxy_miss_action"); err != nil {

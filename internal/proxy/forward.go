@@ -286,6 +286,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	lifecycle.setHTTPStatus(resp.StatusCode)
+	if hasRoute {
+		applyResponseRules(p.router, route, resp)
+	}
 	lifecycle.setNetOK(true)
 
 	// Copy end-to-end response headers and body.

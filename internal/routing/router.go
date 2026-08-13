@@ -59,12 +59,13 @@ func NewRouter(cfg RouterConfig) *Router {
 }
 
 type RouteResult struct {
-	PlatformID   string
-	PlatformName string
-	NodeHash     node.Hash
-	EgressIP     netip.Addr
-	NodeTag      string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
-	LeaseCreated bool
+	PlatformID    string
+	PlatformName  string
+	NodeHash      node.Hash
+	EgressIP      netip.Addr
+	NodeTag       string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
+	LeaseCreated  bool
+	ResponseRules platform.ResponseRules
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -104,6 +105,7 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 func withPlatformContext(plat *platform.Platform, res RouteResult) RouteResult {
 	res.PlatformID = plat.ID
 	res.PlatformName = plat.Name
+	res.ResponseRules = plat.ResponseRules
 	return res
 }
 
@@ -196,10 +198,10 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
+		if newLease, hitResult, ok := r.tryLeaseHit(plat, state, account, current, nowNs); ok {
 			return newLease, xsync.UpdateOp, hitResult, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, state, account, current, targetDomain, nowNs); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -235,6 +237,13 @@ func (r *Router) createOrAbortStickyLease(
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
 		return lease, op, RouteResult{}, err
 	}
+	// Windows clocks can expose coarse Unix-nanosecond values. A recreated
+	// lease must still carry a new expiry even when the old and new calculations
+	// land in the same clock tick.
+	if hadPreviousLease && newLease.ExpiryNs == previous.ExpiryNs {
+		newLease.ExpiryNs++
+		createdResult.LeaseCreated = true
+	}
 
 	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
 	state.IPLoadStats.Inc(newLease.EgressIP)
@@ -250,12 +259,14 @@ func (r *Router) createOrAbortStickyLease(
 
 func (r *Router) tryLeaseHit(
 	plat *platform.Platform,
+	state *PlatformRoutingState,
 	account string,
 	current Lease,
 	nowNs int64,
 ) (Lease, RouteResult, bool) {
 	entry, ok := r.pool.GetEntry(current.NodeHash)
-	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
+	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP ||
+		state.ResponseCooldowns.IsCooling(current.NodeHash, current.EgressIP, time.Now()) {
 		return Lease{}, RouteResult{}, false
 	}
 
@@ -277,18 +288,20 @@ func (r *Router) tryLeaseHit(
 
 func (r *Router) tryLeaseSameIPRotation(
 	plat *platform.Platform,
+	state *PlatformRoutingState,
 	account string,
 	current Lease,
 	targetDomain string,
 	nowNs int64,
 ) (Lease, RouteResult, bool) {
-	bestHash, ok := chooseSameIPRotationCandidate(
+	bestHash, ok := chooseSameIPRotationCandidateWithCooldown(
 		plat,
 		r.pool,
 		current.EgressIP,
 		targetDomain,
 		r.authorities(),
 		r.p2cWindow(),
+		state.ResponseCooldowns,
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -395,7 +408,13 @@ func (r *Router) selectLiveRandomRoute(
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
-		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow())
+		h, err := randomRouteFiltered(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), func(hash node.Hash) bool {
+			entry, ok := r.pool.GetEntry(hash)
+			if !ok {
+				return true
+			}
+			return !r.responseCooldowns(plat.ID).IsCooling(hash, entry.GetEgressIP(), time.Now())
+		})
 		if err != nil {
 			return node.Zero, nil, err
 		}
@@ -419,13 +438,25 @@ func chooseSameIPRotationCandidate(
 	authorities []string,
 	window time.Duration,
 ) (node.Hash, bool) {
+	return chooseSameIPRotationCandidateWithCooldown(plat, pool, targetIP, targetDomain, authorities, window, nil)
+}
+
+func chooseSameIPRotationCandidateWithCooldown(
+	plat *platform.Platform,
+	pool PoolAccessor,
+	targetIP netip.Addr,
+	targetDomain string,
+	authorities []string,
+	window time.Duration,
+	cooldowns *ResponseCooldowns,
+) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
 	fallbackHash := node.Zero
 
 	plat.View().Range(func(h node.Hash) bool {
 		entry, ok := pool.GetEntry(h)
-		if !ok || entry.GetEgressIP() != targetIP {
+		if !ok || entry.GetEgressIP() != targetIP || (cooldowns != nil && cooldowns.IsCooling(h, targetIP, time.Now())) {
 			return true
 		}
 		if fallbackHash == node.Zero {
@@ -447,6 +478,19 @@ func chooseSameIPRotationCandidate(
 		return fallbackHash, true
 	}
 	return node.Zero, false
+}
+
+func (r *Router) responseCooldowns(platformID string) *ResponseCooldowns {
+	return r.ensurePlatformState(platformID).ResponseCooldowns
+}
+
+// QuarantineRoute records a response-driven cooldown for a route. Cooldowns
+// are in-memory and expire automatically when routing checks the deadline.
+func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleScope, until time.Time) {
+	if r == nil || route.PlatformID == "" {
+		return
+	}
+	r.responseCooldowns(route.PlatformID).Mark(scope, route.NodeHash, route.EgressIP, until)
 }
 
 func sameIPCandidateLatency(

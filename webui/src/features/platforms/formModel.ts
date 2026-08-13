@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { allocationPolicies, emptyAccountBehaviors, missActions } from "./constants";
 import { parseHeaderLines, parseLinesToList } from "./formParsers";
-import type { Platform, PlatformCreateInput, PlatformUpdateInput } from "./types";
+import type { Platform, PlatformCreateInput, PlatformResponseRule, PlatformUpdateInput } from "./types";
 
 const platformNameForbiddenChars = ".:|/\\@?#%~";
 const platformNameForbiddenSpacing = " \t\r\n";
@@ -33,6 +33,7 @@ export const platformFormSchema = z.object({
   sticky_ttl: z.string().optional(),
   regex_filters_text: z.string().optional(),
   region_filters_text: z.string().optional(),
+  response_rules_text: z.string(),
   reverse_proxy_miss_action: z.enum(missActions),
   reverse_proxy_empty_account_behavior: z.enum(emptyAccountBehaviors),
   reverse_proxy_fixed_account_header: z.string().optional(),
@@ -49,6 +50,15 @@ export const platformFormSchema = z.object({
       message: "用于提取 Account 的 Headers 不能为空",
     });
   }
+
+  try {
+    const parsed = JSON.parse(value.response_rules_text || "[]") as unknown;
+    if (!Array.isArray(parsed)) {
+      ctx.addIssue({ code: "custom", path: ["response_rules_text"], message: "响应规则必须是 JSON 数组" });
+    }
+  } catch {
+    ctx.addIssue({ code: "custom", path: ["response_rules_text"], message: "响应规则 JSON 格式无效" });
+  }
 });
 
 export type PlatformFormValues = z.infer<typeof platformFormSchema>;
@@ -58,6 +68,7 @@ export const defaultPlatformFormValues: PlatformFormValues = {
   sticky_ttl: "",
   regex_filters_text: "",
   region_filters_text: "",
+  response_rules_text: "",
   reverse_proxy_miss_action: "TREAT_AS_EMPTY",
   reverse_proxy_empty_account_behavior: "RANDOM",
   reverse_proxy_fixed_account_header: "Authorization",
@@ -74,6 +85,7 @@ export function platformToFormValues(platform: Platform): PlatformFormValues {
     sticky_ttl: platform.sticky_ttl,
     regex_filters_text: regexFilters.join("\n"),
     region_filters_text: regionFilters.join("\n"),
+    response_rules_text: JSON.stringify(platform.response_rules ?? [], null, 2),
     reverse_proxy_miss_action: platform.reverse_proxy_miss_action,
     reverse_proxy_empty_account_behavior: platform.reverse_proxy_empty_account_behavior,
     reverse_proxy_fixed_account_header: platform.reverse_proxy_fixed_account_header,
@@ -83,10 +95,12 @@ export function platformToFormValues(platform: Platform): PlatformFormValues {
 }
 
 function toPlatformPayloadBase(values: PlatformFormValues) {
+  const responseRules = JSON.parse(values.response_rules_text || "[]") as PlatformResponseRule[];
   return {
     name: values.name.trim(),
     regex_filters: parseLinesToList(values.regex_filters_text),
     region_filters: parseLinesToList(values.region_filters_text, (value) => value.toLowerCase()),
+    response_rules: responseRules,
     reverse_proxy_miss_action: values.reverse_proxy_miss_action,
     reverse_proxy_empty_account_behavior: values.reverse_proxy_empty_account_behavior,
     reverse_proxy_fixed_account_header: parseHeaderLines(values.reverse_proxy_fixed_account_header).join("\n"),

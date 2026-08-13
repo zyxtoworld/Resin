@@ -1026,6 +1026,59 @@ func TestAPIContract_PlatformPassiveCircuitBreaker(t *testing.T) {
 	assertErrorCode(t, rec, "INVALID_ARGUMENT")
 }
 
+func TestAPIContract_PlatformResponseRules(t *testing.T) {
+	srv, _, _ := newControlPlaneTestServer(t)
+
+	rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms", map[string]any{
+		"name": "response-rules",
+		"response_rules": []map[string]any{{
+			"name":           "OpenCode free quota",
+			"status_codes":   []int{429},
+			"response_regex": "FreeUsageLimitError",
+			"scope":          "egress_ip",
+			"cooldown":       "24h",
+		}},
+	}, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status: got %d, want %d, body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	body := decodeJSONMap(t, rec)
+	rules, ok := body["response_rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("response_rules: got %#v", body["response_rules"])
+	}
+	platformID, _ := body["id"].(string)
+
+	rec = doJSONRequest(t, srv, http.MethodPatch, "/api/v1/platforms/"+platformID, map[string]any{
+		"response_rules": []map[string]any{{
+			"status_codes":  []int{429},
+			"expiry_regex":  "reset_at=([^ ]+)",
+			"expiry_layout": "rfc3339",
+			"scope":         "node",
+		}},
+	}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body = decodeJSONMap(t, rec)
+	rules, ok = body["response_rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("patched response_rules: got %#v", body["response_rules"])
+	}
+	patched, ok := rules[0].(map[string]any)
+	if !ok || patched["scope"] != "node" {
+		t.Fatalf("patched response rule: got %#v", rules[0])
+	}
+
+	rec = doJSONRequest(t, srv, http.MethodPatch, "/api/v1/platforms/"+platformID, map[string]any{
+		"response_rules": []map[string]any{{"status_codes": []int{99}, "cooldown": "1h"}},
+	}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid response rule status: got %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "INVALID_ARGUMENT")
+}
+
 func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {
 	srv, _, runtimeCfg := newControlPlaneTestServer(t)
 

@@ -382,6 +382,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				return nil
 			}
+			applyResponseRules(p.router, route, resp)
 			if resp.Body != nil && resp.Body != http.NoBody {
 				body := resp.Body
 				if detailCfg.Enabled {

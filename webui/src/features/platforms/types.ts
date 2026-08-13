@@ -2,12 +2,23 @@ export type PlatformMissAction = "TREAT_AS_EMPTY" | "REJECT";
 export type PlatformEmptyAccountBehavior = "RANDOM" | "FIXED_HEADER" | "ACCOUNT_HEADER_RULE";
 export type PlatformAllocationPolicy = "BALANCED" | "PREFER_LOW_LATENCY" | "PREFER_IDLE_IP";
 
+export type PlatformResponseRule = {
+  name?: string;
+  status_codes: number[];
+  response_regex?: string;
+  expiry_regex?: string;
+  expiry_layout?: "rfc3339" | "rfc3339nano" | "unix_seconds" | "unix_milliseconds" | "duration";
+  cooldown?: string;
+  scope?: "node" | "egress_ip";
+};
+
 export type Platform = {
   id: string;
   name: string;
   sticky_ttl: string;
   regex_filters: string[];
   region_filters: string[];
+  response_rules: PlatformResponseRule[];
   routable_node_count: number;
   reverse_proxy_miss_action: PlatformMissAction;
   reverse_proxy_empty_account_behavior: PlatformEmptyAccountBehavior;
@@ -29,6 +40,7 @@ export type PlatformCreateInput = {
   sticky_ttl?: string;
   regex_filters?: string[];
   region_filters?: string[];
+  response_rules?: PlatformResponseRule[];
   reverse_proxy_miss_action?: PlatformMissAction;
   reverse_proxy_empty_account_behavior?: PlatformEmptyAccountBehavior;
   reverse_proxy_fixed_account_header?: string;
@@ -41,6 +53,7 @@ export type PlatformUpdateInput = {
   sticky_ttl?: string;
   regex_filters?: string[];
   region_filters?: string[];
+  response_rules?: PlatformResponseRule[];
   reverse_proxy_miss_action?: PlatformMissAction;
   reverse_proxy_empty_account_behavior?: PlatformEmptyAccountBehavior;
   reverse_proxy_fixed_account_header?: string;

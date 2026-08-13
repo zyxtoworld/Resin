@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Resinat/Resin/internal/model"
 )
 
 type mergePatch map[string]any
@@ -107,6 +109,25 @@ func (p mergePatch) optionalStringSlice(field string) ([]string, bool, *ServiceE
 		value[i] = itemStr
 	}
 	return value, true, nil
+}
+
+func (p mergePatch) optionalResponseRules(field string) ([]model.PlatformResponseRule, bool, *ServiceError) {
+	raw, ok := p[field]
+	if !ok {
+		return nil, false, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, true, invalidArg(fmt.Sprintf("%s: invalid JSON value", field))
+	}
+	var rules []model.PlatformResponseRule
+	if err := json.Unmarshal(data, &rules); err != nil {
+		return nil, true, invalidArg(fmt.Sprintf("%s: must be an array of response rules", field))
+	}
+	if rules == nil {
+		rules = []model.PlatformResponseRule{}
+	}
+	return rules, true, nil
 }
 
 func (p mergePatch) optionalDurationString(field string) (time.Duration, bool, *ServiceError) {
