@@ -182,7 +182,12 @@ func (m *cancellableRWMutex) Unlock() {
 }
 
 func (e *ServiceError) Error() string { return e.Message }
-func (e *ServiceError) Unwrap() error { return e.Err }
+func (e *ServiceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 func invalidArg(msg string) *ServiceError {
 	return &ServiceError{Code: "INVALID_ARGUMENT", Message: msg}

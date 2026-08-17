@@ -97,6 +97,44 @@ func TestPlatformMutationHoldsStateWriteAdmissionThroughRuntimePublish(t *testin
 	}
 }
 
+func TestUpdatePlatformContext_WithLiveRequestContextReturnsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+
+	name := "live-request-context-platform"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("CreatePlatform: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := cp.UpdatePlatformContext(requestCtx, created.ID, []byte(`{"sticky_ttl":"2h"}`)); err != nil {
+		t.Fatalf("UpdatePlatformContext: %v", err)
+	}
+}
+
 func TestUpdatePlatformContextCancellationWhileAnotherMutationOwnsPlatformLock(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(

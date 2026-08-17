@@ -408,7 +408,10 @@ func (s *ControlPlaneService) withPlatformMutationAdmissionContext(ctx context.C
 		if fn == nil {
 			return nil
 		}
-		return fn(writeCtx)
+		if serviceErr := fn(writeCtx); serviceErr != nil {
+			return serviceErr
+		}
+		return nil
 	})
 	if err == nil {
 		return nil
