@@ -208,3 +208,47 @@ func TestRouter_SnapshotLeasePageRejectsMalformedAndMismatchedCursors(t *testing
 		}
 	}
 }
+
+func TestRouter_SnapshotLeasePageRejectsCursorAfterProcessSecretRotation(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("lease-page-restart", "Lease Page Restart", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+	now := time.Now().UnixNano()
+	hash := node.HashFromRawOptions([]byte(`{"id":"lease-page-restart-node"}`)).Hex()
+	if err := router.UpsertLease(model.Lease{
+		PlatformID:     plat.ID,
+		Account:        "restart-account-1",
+		NodeHash:       hash,
+		EgressIP:       "198.51.100.121",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	}); err != nil {
+		t.Fatalf("seed first lease: %v", err)
+	}
+	if err := router.UpsertLease(model.Lease{
+		PlatformID:     plat.ID,
+		Account:        "restart-account-2",
+		NodeHash:       hash,
+		EgressIP:       "198.51.100.121",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now + 1,
+	}); err != nil {
+		t.Fatalf("seed second lease: %v", err)
+	}
+	query := LeasePageQuery{Limit: 1, SortBy: "account"}
+	page, ok, err := router.SnapshotLeasePageForPlatform(plat.ID, query)
+	if err != nil || !ok || !page.HasMore || page.NextCursor == "" {
+		t.Fatalf("initial page = %#v ok=%v err=%v", page, ok, err)
+	}
+
+	previousSecret := leaseCursorSecret
+	leaseCursorSecret = newLeaseCursorSecret()
+	t.Cleanup(func() { leaseCursorSecret = previousSecret })
+	query.Cursor = page.NextCursor
+	if _, ok, err := router.SnapshotLeasePageForPlatform(plat.ID, query); err != ErrLeaseCursorInvalid || ok {
+		t.Fatalf("rotated-secret cursor = ok=%v err=%v, want invalid cursor", ok, err)
+	}
+}

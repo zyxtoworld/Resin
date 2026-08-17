@@ -14,6 +14,7 @@ import {
   validateResponseRules,
 } from "./responseRulesModel.ts";
 import type { PlatformResponseRule } from "./types.ts";
+import { shouldResetLeaseCursorOnError } from "./routeStatePagination.ts";
 
 const assert = {
   equal(actual: unknown, expected: unknown, message?: string) {
@@ -36,6 +37,10 @@ const assert = {
     if (!pattern.test(actual)) throw new Error(message ?? `value ${actual} does not match ${pattern}`);
   },
 };
+
+assert.equal(shouldResetLeaseCursorOnError(400, "stale-cursor"), true, "stale cursor should reset to page one");
+assert.equal(shouldResetLeaseCursorOnError(400, ""), false, "first page 400 should not loop-reset");
+assert.equal(shouldResetLeaseCursorOnError(500, "stale-cursor"), false, "server errors should remain visible");
 
 const validRule: PlatformResponseRule = {
   id: "first",

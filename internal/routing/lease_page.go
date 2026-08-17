@@ -230,6 +230,12 @@ func leaseMatchesQuery(account string, query LeasePageQuery) bool {
 	return account == needle
 }
 
+// Resin is currently a stateful single-process/single-container deployment:
+// the router and SQLite-backed state are local, not shared across replicas.
+// The cursor signing key is therefore intentionally process-local. A restart
+// invalidates old cursors; the API returns ErrLeaseCursorInvalid (HTTP 400),
+// and the WebUI resets the affected view to its first page.
+//
 // SnapshotLeasePageForPlatform performs filtering, exact counting, and
 // bounded cursor selection before releasing the Router lifecycle read owner.
 // It never materializes every lease or exposes routing internals to the

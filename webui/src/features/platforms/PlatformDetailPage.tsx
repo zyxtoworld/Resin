@@ -17,6 +17,7 @@ import { Textarea } from "../../components/ui/Textarea";
 import { ToastContainer } from "../../components/ui/Toast";
 import { useToast } from "../../hooks/useToast";
 import { useI18n } from "../../i18n";
+import { ApiError } from "../../lib/api-client";
 import { formatApiErrorMessage } from "../../lib/error-message";
 import { formatDateTime, formatGoDuration, formatRelativeTime } from "../../lib/time";
 import {
@@ -48,6 +49,7 @@ import { PlatformAccessPanel } from "./PlatformAccessPanel";
 import { PlatformMonitorPanel } from "./PlatformMonitorPanel";
 import { parseResponseRulesEditorText } from "./responseRulesModel";
 import { ResponseRulesEditor } from "./ResponseRulesEditor";
+import { shouldResetLeaseCursorOnError } from "./routeStatePagination";
 import type { PlatformLease, PlatformRouteNode } from "./types";
 
 type PlatformDetailTab = "monitor" | "access" | "strategy" | "route-state" | "dangerous";
@@ -136,6 +138,15 @@ export function PlatformDetailPage() {
   const detailEmptyAccountBehavior = editForm.watch("reverse_proxy_empty_account_behavior");
   const detailResponseRulesText = editForm.watch("response_rules_text");
   const detailResponseRules = parseResponseRulesEditorText(detailResponseRulesText);
+
+  useEffect(() => {
+    const error = routeStateQuery.error;
+    if (!(error instanceof ApiError) || !shouldResetLeaseCursorOnError(error.status, leaseCursor)) {
+      return;
+    }
+    setLeasePage(0);
+    setLeaseCursorStack([""]);
+  }, [leaseCursor, routeStateQuery.error]);
 
   useEffect(() => {
     if (!platform) {
