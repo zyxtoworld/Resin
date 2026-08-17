@@ -4,17 +4,36 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // captureRequestHeaders serializes headers to canonical wire format for
-// request-log payload capture.
+// request-log payload capture. It operates on a clone so redaction never
+// changes the headers sent to the upstream request.
 func captureRequestHeaders(header http.Header) []byte {
 	if header == nil {
 		return nil
 	}
+	clone := header.Clone()
+	for name := range clone {
+		if !isSensitiveCapturedHeader(name) {
+			continue
+		}
+		clone[name] = []string{"[REDACTED]"}
+	}
 	var buf bytes.Buffer
-	_ = header.Clone().Write(&buf)
+	_ = clone.Write(&buf)
 	return buf.Bytes()
+}
+
+func isSensitiveCapturedHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie",
+		"x-api-key", "x-auth-token", "x-access-token", "x-csrf-token":
+		return true
+	default:
+		return false
+	}
 }
 
 // headerWireLen returns canonical wire-format header bytes length.

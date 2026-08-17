@@ -3,6 +3,7 @@ package proxy
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 
@@ -146,7 +147,22 @@ func (l *requestLifecycle) setAccount(account string) {
 
 func (l *requestLifecycle) setTarget(host, rawURL string) {
 	l.log.TargetHost = host
-	l.log.TargetURL = rawURL
+	l.log.TargetURL = sanitizeLoggedTargetURL(rawURL)
+}
+
+// sanitizeLoggedTargetURL keeps request-log diagnostics useful without
+// persisting credentials embedded in a proxy target URL. The URL is still
+// forwarded unchanged; this only affects the observability projection.
+func sanitizeLoggedTargetURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	target, err := url.Parse(rawURL)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return "[redacted-url]"
+	}
+	target.User = nil
+	return target.String()
 }
 
 func (l *requestLifecycle) setReqHeadersCaptured(reqHeaders []byte, totalLen int, truncated bool) {

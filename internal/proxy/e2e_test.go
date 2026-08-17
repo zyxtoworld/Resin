@@ -1246,6 +1246,47 @@ func TestForwardProxy_E2EHTTPSuccess(t *testing.T) {
 	}
 }
 
+func TestForwardProxy_RequestLogDoesNotExposeTargetURLUserinfo(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	emitter := newMockEventEmitter()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	target, err := url.Parse(upstream.URL + "/private?trace=1")
+	if err != nil {
+		t.Fatalf("parse target: %v", err)
+	}
+	target.User = url.UserPassword("alice", "secret-target-password")
+
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     &mockHealthRecorder{},
+		Events:     emitter,
+	})
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, body=%q", w.Code, w.Body.String())
+	}
+
+	select {
+	case logEv := <-emitter.logCh:
+		if strings.Contains(logEv.TargetURL, "alice") || strings.Contains(logEv.TargetURL, "secret-target-password") {
+			t.Fatalf("request log exposed target URL credentials: %q", logEv.TargetURL)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected forward log event")
+	}
+}
+
 func TestForwardProxy_E2EHTTPBypassDialsDirect(t *testing.T) {
 	emitter := newMockEventEmitter()
 
@@ -2031,6 +2072,67 @@ func TestReverseProxy_E2ECapturesDetailPayloads(t *testing.T) {
 		}
 		if logEv.IngressBytes < int64(len(upstreamBody)) {
 			t.Fatalf("IngressBytes: got %d, want >= %d", logEv.IngressBytes, len(upstreamBody))
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected reverse log event")
+	}
+}
+
+func TestReverseProxy_E2EDetailCaptureRedactsCredentialHeaders(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	emitter := newMockEventEmitter()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer request-secret" {
+			t.Errorf("upstream Authorization: got %q, want original credential", got)
+		}
+		if got := r.Header.Get("Cookie"); got != "session=request-secret" {
+			t.Errorf("upstream Cookie: got %q, want original credential", got)
+		}
+		w.Header().Set("Set-Cookie", "session=upstream-secret; Secure")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	path := fmt.Sprintf("/tok/plat:acct/http/%s/secure", host)
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:     "tok",
+		Router:         env.router,
+		Pool:           env.pool,
+		PlatformLookup: env.pool,
+		Health:         &mockHealthRecorder{},
+		Events: ConfigAwareEventEmitter{
+			Base: emitter,
+			RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+				return RequestLogRuntimeConfig{
+					Enabled:             true,
+					DetailEnabled:       true,
+					ReqHeadersMaxBytes:  -1,
+					ReqBodyMaxBytes:     -1,
+					RespHeadersMaxBytes: -1,
+					RespBodyMaxBytes:    -1,
+				}
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer request-secret")
+	req.Header.Set("Cookie", "session=request-secret")
+	w := httptest.NewRecorder()
+	rp.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, body=%q", w.Code, w.Body.String())
+	}
+
+	select {
+	case logEv := <-emitter.logCh:
+		payload := string(logEv.ReqHeaders) + string(logEv.RespHeaders)
+		for _, secret := range []string{"request-secret", "upstream-secret", "Bearer"} {
+			if strings.Contains(payload, secret) {
+				t.Fatalf("request log exposed credential header value %q in %q", secret, payload)
+			}
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected reverse log event")
