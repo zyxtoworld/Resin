@@ -80,6 +80,7 @@ const (
 	MaxRequestLogFlushBatchSize = 1 << 16
 	defaultRequestLogQueueSize  = 8192
 	defaultRequestLogBatchSize  = 4096
+	defaultResourceFetchTimeout = 60 * time.Second
 )
 
 // DefaultNodeDNSUpstreams returns the default node DNS upstream URI list.
@@ -132,7 +133,7 @@ func LoadEnvConfig() (*EnvConfig, error) {
 		string(platform.AllocationPolicyBalanced),
 	)
 	cfg.ProbeTimeout = envDuration("RESIN_PROBE_TIMEOUT", 15*time.Second, &errs)
-	cfg.ResourceFetchTimeout = envDuration("RESIN_RESOURCE_FETCH_TIMEOUT", 30*time.Second, &errs)
+	cfg.ResourceFetchTimeout = envDuration("RESIN_RESOURCE_FETCH_TIMEOUT", defaultResourceFetchTimeout, &errs)
 	cfg.NodeDNSUpstreams = envStringSlice("RESIN_NODE_DNS_UPSTREAMS", DefaultNodeDNSUpstreams(), &errs)
 	cfg.ProxyTransportMaxIdleConns = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS", 1024, &errs)
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)

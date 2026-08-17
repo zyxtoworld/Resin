@@ -67,7 +67,7 @@ func TestLoadEnvConfig_Defaults(t *testing.T) {
 	)
 	assertEqual(t, "DefaultPlatformAllocationPolicy", cfg.DefaultPlatformAllocationPolicy, "BALANCED")
 	assertEqual(t, "ProbeTimeout", cfg.ProbeTimeout, 15*time.Second)
-	assertEqual(t, "ResourceFetchTimeout", cfg.ResourceFetchTimeout, 30*time.Second)
+	assertEqual(t, "ResourceFetchTimeout", cfg.ResourceFetchTimeout, defaultResourceFetchTimeout)
 	assertEqual(t, "NodeDNSUpstreamsLength", len(cfg.NodeDNSUpstreams), 4)
 	assertEqual(t, "NodeDNSUpstreams[0]", cfg.NodeDNSUpstreams[0], "https://doh.pub/dns-query")
 	assertEqual(t, "NodeDNSUpstreams[1]", cfg.NodeDNSUpstreams[1], "https://dns.alidns.com/dns-query")
@@ -97,6 +97,18 @@ func TestLoadEnvConfig_Defaults(t *testing.T) {
 	assertEqual(t, "MetricLeasesRetentionSeconds", cfg.MetricLeasesRetentionSeconds, 18000)
 	assertEqual(t, "MetricLatencyBinWidthMS", cfg.MetricLatencyBinWidthMS, 100)
 	assertEqual(t, "MetricLatencyBinOverflowMS", cfg.MetricLatencyBinOverflowMS, 3000)
+}
+
+func TestLoadEnvConfig_DefaultResourceFetchTimeoutProvidesSlowDownloadHeadroom(t *testing.T) {
+	setEnvs(t, requiredEnvs())
+
+	cfg, err := LoadEnvConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ResourceFetchTimeout != 60*time.Second {
+		t.Fatalf("default ResourceFetchTimeout = %s, want 60s for slow large subscriptions", cfg.ResourceFetchTimeout)
+	}
 }
 
 func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
