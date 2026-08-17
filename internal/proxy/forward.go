@@ -346,6 +346,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var pending *routedOutbound
 	finalResponseAccepted := true
 	for attempt := 0; attempt < retryBudget; attempt++ {
+		upstreamAttemptTrace := upstreamTrace.newAttempt()
 		var transport *http.Transport
 		var routed routedOutbound
 		if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
@@ -395,7 +396,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			outReq = cloneForwardRequestForRetry(baseReq, bodyCapture.Bytes())
 		}
-		outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamTrace.clientTrace()))
+		outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamAttemptTrace.clientTrace()))
 		pendingEgressHeaderBytes := headerWireLen(outReq.Header)
 		var egressBodyCounter *countingReadCloser
 		if outReq.Body != nil && outReq.Body != http.NoBody {
@@ -407,7 +408,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// any response bytes are written to the downstream client.
 		var roundTripErr error
 		resp, roundTripErr = transport.RoundTrip(outReq)
-		if upstreamTrace.shouldCommitEgress() {
+		if upstreamAttemptTrace.shouldCommitEgress() {
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 			if egressBodyCounter != nil {
 				lifecycle.addEgressBytes(egressBodyCounter.Total())

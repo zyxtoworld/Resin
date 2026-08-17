@@ -9,6 +9,10 @@ import (
 // net/http transport so request-log egress bytes can be committed only when
 // the request has actually been written to upstream.
 type upstreamRequestTrace struct {
+	gotFirstResponseByte func()
+}
+
+type upstreamRequestAttemptTrace struct {
 	gotConn              atomic.Bool
 	wroteRequest         atomic.Bool
 	gotFirstResponseByte func()
@@ -22,26 +26,40 @@ func newUpstreamRequestTrace(gotFirstResponseByte ...func()) *upstreamRequestTra
 	return trace
 }
 
-func (t *upstreamRequestTrace) clientTrace() *httptrace.ClientTrace {
+func (t *upstreamRequestTrace) newAttempt() *upstreamRequestAttemptTrace {
+	if t == nil {
+		return &upstreamRequestAttemptTrace{}
+	}
+	return &upstreamRequestAttemptTrace{gotFirstResponseByte: t.gotFirstResponseByte}
+}
+
+func (t *upstreamRequestAttemptTrace) clientTrace() *httptrace.ClientTrace {
+	if t == nil {
+		return &httptrace.ClientTrace{}
+	}
+	return clientTraceFor(&t.gotConn, &t.wroteRequest, t.gotFirstResponseByte)
+}
+
+func clientTraceFor(gotConn, wroteRequest *atomic.Bool, gotFirstResponseByte func()) *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) {
-			t.gotConn.Store(true)
+			gotConn.Store(true)
 		},
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
 			// Only mark as written when transport reports write success.
 			// WroteRequest can also fire with Err!=nil for failed write attempts.
 			if info.Err == nil {
-				t.wroteRequest.Store(true)
+				wroteRequest.Store(true)
 			}
 		},
 		GotFirstResponseByte: func() {
-			if t.gotFirstResponseByte != nil {
-				t.gotFirstResponseByte()
+			if gotFirstResponseByte != nil {
+				gotFirstResponseByte()
 			}
 		},
 	}
 }
 
-func (t *upstreamRequestTrace) shouldCommitEgress() bool {
+func (t *upstreamRequestAttemptTrace) shouldCommitEgress() bool {
 	return t.gotConn.Load() && t.wroteRequest.Load()
 }

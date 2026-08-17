@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -120,6 +121,13 @@ func setProxyE2EEntryDialTarget(t *testing.T, entry *node.NodeEntry, target stri
 	ob := &mockOutbound{dialFunc: func(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, target)
 	}}
+	var wrapped adapter.Outbound = ob
+	entry.Outbound.Store(&wrapped)
+}
+
+func setProxyE2EEntryDialFunc(t *testing.T, entry *node.NodeEntry, dialFunc func(context.Context, string, M.Socksaddr) (net.Conn, error)) {
+	t.Helper()
+	ob := &mockOutbound{dialFunc: dialFunc}
 	var wrapped adapter.Outbound = ob
 	entry.Outbound.Store(&wrapped)
 }
@@ -353,6 +361,87 @@ func TestForwardProxy_ResponsePolicyRetryOnlyUsesNextEntryAndPromotesSticky(t *t
 	mu.Unlock()
 	if lastLabel != firstLabels[1] {
 		t.Fatalf("retry-only success did not become sticky: first=%q second=%q", firstLabels[1], lastLabel)
+	}
+}
+
+func TestForwardProxy_RetryEgressBytesIgnoreAttemptThatWasNotWritten(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retry-only", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "retryable"},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var firstHeaderLen atomic.Int64
+	firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		firstHeaderLen.Store(headerWireLen(req.Header))
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("retryable"))
+	}))
+	defer firstUpstream.Close()
+
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	otherRaw := `{"type":"stub","server":"127.0.0.2","server_port":2}`
+	otherEntry := setupResponseRetryNode(t, env, otherRaw, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/retry")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	firstEntry := initial.SelectedEntry()
+	if firstEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+	setProxyE2EEntryDialTarget(t, firstEntry, firstUpstream.Listener.Addr().String())
+
+	if otherEntry == firstEntry {
+		otherEntry = baseEntry
+	}
+	setProxyE2EEntryDialFunc(t, otherEntry, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return nil, errors.New("retry fixture: dial before request write")
+	})
+
+	emitter := newMockEventEmitter()
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Events:     emitter,
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/retry", nil)
+	req.Header.Set("X-Test-Header", "retry-trace")
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	wantEgressBytes := headerWireLen(prepareForwardOutboundRequest(req).Header)
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want %d; body=%q", w.Code, http.StatusBadGateway, w.Body.String())
+	}
+	select {
+	case logEv := <-emitter.logCh:
+		if firstHeaderLen.Load() <= 0 || wantEgressBytes <= 0 {
+			t.Fatal("first upstream did not observe request headers")
+		}
+		if logEv.EgressBytes != wantEgressBytes {
+			t.Fatalf("EgressBytes: got %d, want %d for the only written attempt", logEv.EgressBytes, wantEgressBytes)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected forward log event")
 	}
 }
 
@@ -1596,6 +1685,126 @@ func TestReverseProxy_ResponsePolicyRetryOnlyUsesNextEntryAndPromotesSticky(t *t
 		if got != "first:"+payload && got != "second:"+payload {
 			t.Fatalf("upstream body: got %q, want %q", got, payload)
 		}
+	}
+}
+
+func TestReverseProxy_RetryEgressBytesCountOnlyWrittenAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		secondWrites bool
+		wantAttempts int64
+		wantStatus   int
+	}{
+		{name: "second dial fails before write", secondWrites: false, wantAttempts: 1, wantStatus: http.StatusBadGateway},
+		{name: "both attempts write", secondWrites: true, wantAttempts: 2, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+				ID: "retry-only", Enabled: true,
+				Match: model.PlatformResponseRuleMatch{
+					StatusCodes: []int{http.StatusBadGateway},
+					Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "retryable"},
+				},
+				Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			plat.ResponseRules = rules
+
+			var retryMode atomic.Bool
+			firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if !retryMode.Load() {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("baseline"))
+					return
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("retryable"))
+			}))
+			defer firstUpstream.Close()
+			secondUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ok"))
+			}))
+			defer secondUpstream.Close()
+
+			baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+			baseEntry, ok := env.pool.GetEntry(baseHash)
+			if !ok {
+				t.Fatal("base node not found")
+			}
+			otherEntry := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", secondUpstream.Listener.Addr().String())
+			initial, err := env.router.RouteRequest("plat", "account", "https://example.com/retry")
+			if err != nil {
+				t.Fatalf("initial route: %v", err)
+			}
+			firstEntry := initial.SelectedEntry()
+			if firstEntry == nil {
+				t.Fatal("initial route did not expose selected entry")
+			}
+			setProxyE2EEntryDialTarget(t, firstEntry, firstUpstream.Listener.Addr().String())
+			if otherEntry == firstEntry {
+				otherEntry = baseEntry
+			}
+			setProxyE2EEntryDialTarget(t, otherEntry, secondUpstream.Listener.Addr().String())
+			if !tc.secondWrites {
+				setProxyE2EEntryDialFunc(t, otherEntry, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+					return nil, errors.New("reverse retry fixture: dial before request write")
+				})
+			}
+
+			emitter := newMockEventEmitter()
+			rp := NewReverseProxy(ReverseProxyConfig{
+				ProxyToken:     "tok",
+				Router:         env.router,
+				Pool:           env.pool,
+				PlatformLookup: env.pool,
+				Events:         emitter,
+			})
+			targetHost := strings.TrimPrefix(firstUpstream.URL, "http://")
+			makeRequest := func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodGet, "/tok/plat:account/http/"+targetHost+"/retry", nil)
+				req.Header.Set("X-Test-Header", "reverse-retry-trace")
+				w := httptest.NewRecorder()
+				rp.ServeHTTP(w, req)
+				return w
+			}
+
+			baseline := makeRequest()
+			if baseline.Code != http.StatusOK {
+				t.Fatalf("baseline status: got %d, want %d; body=%q", baseline.Code, http.StatusOK, baseline.Body.String())
+			}
+			var baselineLog RequestLogEntry
+			select {
+			case baselineLog = <-emitter.logCh:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("expected baseline reverse log event")
+			}
+			if baselineLog.EgressBytes <= 0 {
+				t.Fatalf("baseline EgressBytes: got %d, want > 0", baselineLog.EgressBytes)
+			}
+			retryMode.Store(true)
+			w := makeRequest()
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status: got %d, want %d; body=%q", w.Code, tc.wantStatus, w.Body.String())
+			}
+			select {
+			case logEv := <-emitter.logCh:
+				want := baselineLog.EgressBytes * tc.wantAttempts
+				if logEv.EgressBytes != want {
+					t.Fatalf("EgressBytes: got %d, want %d", logEv.EgressBytes, want)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("expected reverse log event")
+			}
+		})
 	}
 }
 

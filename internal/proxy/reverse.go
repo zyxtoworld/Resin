@@ -247,6 +247,23 @@ func buildReverseTargetURL(parsed *parsedPath, rawQuery string) (*url.URL, *Prox
 	return target, nil
 }
 
+func decorateReverseUpstreamAttempt(
+	req *http.Request,
+	candidate routedOutbound,
+	traceOwner *upstreamRequestTrace,
+	health HealthRecorder,
+	protocol string,
+	domain string,
+) (*http.Request, *upstreamRequestAttemptTrace) {
+	attemptTrace := traceOwner.newAttempt()
+	reqCtx := httptrace.WithClientTrace(req.Context(), attemptTrace.clientTrace())
+	if protocol == "https" && health != nil {
+		reporter := newReverseLatencyReporter(health, candidate.Route.NodeHash, candidate.Entry, domain)
+		reqCtx = httptrace.WithClientTrace(reqCtx, reporter.clientTrace())
+	}
+	return req.WithContext(reqCtx), attemptTrace
+}
+
 func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	detailCfg := reverseDetailCaptureConfig{
 		Enabled:             false,
@@ -303,6 +320,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var hasRoute bool
 	var transport http.RoundTripper
 	var retryTransport *reverseRetryRoundTripper
+	var directAttemptTrace *upstreamRequestAttemptTrace
 	domain := netutil.ExtractDomain(parsed.Host)
 	resolve := func(plat *platform.Platform, generationBound bool) {
 		account, _, extractionFailed = p.resolveReverseProxyAccount(parsed, r, plat)
@@ -357,20 +375,25 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if target == nil {
 		return
 	}
-	var nodeHashRaw = route.NodeHash
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
 	} else {
 		transport = p.outboundHTTPTransport(routed)
 		retryTransport = &reverseRetryRoundTripper{
 			router: p.router, pool: p.pool, initial: routed, account: account,
+			decorateAttempt: func(req *http.Request, candidate routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+				return decorateReverseUpstreamAttempt(req, candidate, upstreamTrace, p.health, parsed.Protocol, domain)
+			},
+			onAttemptEgress: func(headerBytes, bodyBytes int64) {
+				lifecycle.addEgressBytes(headerBytes)
+				lifecycle.addEgressBytes(bodyBytes)
+			},
 			transportFor: func(candidate routedOutbound) http.RoundTripper {
 				return p.outboundHTTPTransport(candidate)
 			},
 			onRoute: func(candidate routing.RouteResult, entry *node.NodeEntry) {
 				route = candidate
 				routeEntry = entry
-				nodeHashRaw = candidate.NodeHash
 				routed.Route = candidate
 				routed.Entry = entry
 				lifecycle.setRouteResult(candidate)
@@ -386,14 +409,16 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			stripForwardingIdentityHeaders(req.Header)
 			pendingEgressHeaderBytes = headerWireLen(req.Header)
 
-			// Compose request-progress trace first so egress commit logic can
-			// observe whether the upstream request was actually written.
-			reqCtx := httptrace.WithClientTrace(req.Context(), upstreamTrace.clientTrace())
-
-			// Add httptrace for TLS latency measurement on HTTPS.
-			if parsed.Protocol == "https" && hasRoute && p.health != nil {
-				reporter := newReverseLatencyReporter(p.health, nodeHashRaw, routeEntry, domain)
-				reqCtx = httptrace.WithClientTrace(reqCtx, reporter.clientTrace())
+			reqCtx := req.Context()
+			if retryTransport == nil {
+				// Retry transport owns per-attempt tracing. Bypass/direct requests
+				// have one attempt and attach their trace here.
+				directAttemptTrace = upstreamTrace.newAttempt()
+				reqCtx = httptrace.WithClientTrace(reqCtx, directAttemptTrace.clientTrace())
+				if parsed.Protocol == "https" && hasRoute && p.health != nil {
+					reporter := newReverseLatencyReporter(p.health, route.NodeHash, routeEntry, domain)
+					reqCtx = httptrace.WithClientTrace(reqCtx, reporter.clientTrace())
+				}
 			}
 			*req = *req.WithContext(reqCtx)
 		},
@@ -478,7 +503,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, r)
-	if upstreamTrace.shouldCommitEgress() {
+	if retryTransport == nil && directAttemptTrace != nil && directAttemptTrace.shouldCommitEgress() {
 		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 		if egressBodyCounter != nil {
 			lifecycle.addEgressBytes(egressBodyCounter.Total())

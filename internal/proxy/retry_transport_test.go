@@ -6,13 +6,140 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 )
+
+type retryLatencyIdentityRecorder struct {
+	mu      sync.Mutex
+	entries []*node.NodeEntry
+	hashes  []node.Hash
+}
+
+func (r *retryLatencyIdentityRecorder) submit(fn func()) {
+	fn()
+}
+
+func (r *retryLatencyIdentityRecorder) RecordResultForEntry(node.Hash, *node.NodeEntry, bool) bool {
+	return true
+}
+
+func (r *retryLatencyIdentityRecorder) RecordLatencyForEntry(hash node.Hash, entry *node.NodeEntry, _ string, _ *time.Duration) bool {
+	r.mu.Lock()
+	r.hashes = append(r.hashes, hash)
+	r.entries = append(r.entries, entry)
+	r.mu.Unlock()
+	return true
+}
+
+func (r *retryLatencyIdentityRecorder) RecordPassiveResultForEntry(string, node.Hash, *node.NodeEntry, bool) bool {
+	return true
+}
+
+func (r *retryLatencyIdentityRecorder) snapshot() ([]node.Hash, []*node.NodeEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]node.Hash(nil), r.hashes...), append([]*node.NodeEntry(nil), r.entries...)
+}
+
+func TestReverseRetryRoundTripper_LatencyReporterUsesCurrentAttemptEntry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retryable", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "retryable"},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	secondEntry := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/retry")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	firstEntry := initial.SelectedEntry()
+	if firstEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+	if firstEntry == secondEntry {
+		baseHash := node.HashFromRawOptions([]byte(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+		var found bool
+		secondEntry, found = env.pool.GetEntry(baseHash)
+		if !found {
+			t.Fatal("base entry not found")
+		}
+	}
+
+	health := &retryLatencyIdentityRecorder{}
+	traceOwner := newUpstreamRequestTrace()
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: firstEntry},
+		decorateAttempt: func(req *http.Request, candidate routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			return decorateReverseUpstreamAttempt(req, candidate, traceOwner, health, "https", "example.com")
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotFirstResponseByte == nil {
+					t.Fatal("retry attempt missing client latency trace")
+				}
+				trace.GotFirstResponseByte()
+				if attempts.Add(1) == 1 {
+					return &http.Response{
+						StatusCode: http.StatusBadGateway,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader("retryable")),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+				}, nil
+			})
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/retry", nil))
+	if err != nil {
+		t.Fatalf("retry RoundTrip: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+
+	hashes, entries := health.snapshot()
+	if len(entries) != 2 || len(hashes) != 2 {
+		t.Fatalf("latency samples: hashes=%d entries=%d, want 2", len(hashes), len(entries))
+	}
+	if entries[0] != firstEntry || entries[1] != secondEntry {
+		t.Fatalf("latency entry attribution: got [%p %p], want [%p %p]", entries[0], entries[1], firstEntry, secondEntry)
+	}
+	if hashes[0] != initial.NodeHash || hashes[1] != secondEntry.Hash {
+		t.Fatalf("latency hash attribution: got [%s %s], want [%s %s]", hashes[0].Hex(), hashes[1].Hex(), initial.NodeHash.Hex(), secondEntry.Hash.Hex())
+	}
+}
 
 func TestReverseRetryRoundTripper_CancelAfterResponseBodyDoesNotReplay(t *testing.T) {
 	env := newProxyE2EEnv(t)

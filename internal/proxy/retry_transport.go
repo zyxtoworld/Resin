@@ -16,12 +16,14 @@ import (
 // retried only after their body is fully captured and before ReverseProxy has
 // committed any downstream response bytes.
 type reverseRetryRoundTripper struct {
-	router       *routing.Router
-	pool         outbound.PoolAccessor
-	initial      routedOutbound
-	account      string
-	transportFor func(routedOutbound) http.RoundTripper
-	onRoute      func(routing.RouteResult, *node.NodeEntry)
+	router          *routing.Router
+	pool            outbound.PoolAccessor
+	initial         routedOutbound
+	account         string
+	transportFor    func(routedOutbound) http.RoundTripper
+	onRoute         func(routing.RouteResult, *node.NodeEntry)
+	decorateAttempt func(*http.Request, routedOutbound) (*http.Request, *upstreamRequestAttemptTrace)
+	onAttemptEgress func(headerBytes, bodyBytes int64)
 
 	promotable bool
 }
@@ -54,7 +56,24 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		if attempt > 0 {
 			outReq = cloneForwardRequestForRetry(baseReq, capture.Bytes())
 		}
+		var attemptTrace *upstreamRequestAttemptTrace
+		if t.decorateAttempt != nil {
+			outReq, attemptTrace = t.decorateAttempt(outReq, current)
+		}
+		pendingHeaderBytes := headerWireLen(outReq.Header)
+		var bodyCounter *countingReadCloser
+		if outReq.Body != nil && outReq.Body != http.NoBody {
+			bodyCounter = newCountingReadCloser(outReq.Body)
+			outReq.Body = bodyCounter
+		}
 		resp, err := t.transportFor(current).RoundTrip(outReq)
+		if attemptTrace != nil && attemptTrace.shouldCommitEgress() && t.onAttemptEgress != nil {
+			bodyBytes := int64(0)
+			if bodyCounter != nil {
+				bodyBytes = bodyCounter.Total()
+			}
+			t.onAttemptEgress(pendingHeaderBytes, bodyBytes)
+		}
 		if err != nil {
 			return nil, err
 		}
