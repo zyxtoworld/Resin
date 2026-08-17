@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 type proxyE2EEnv struct {
 	pool   *topology.GlobalNodePool
 	router *routing.Router
+	sub    *subscription.Subscription
 }
 
 func newProxyE2EEnv(t *testing.T) *proxyE2EEnv {
@@ -91,6 +93,7 @@ func newProxyE2EEnv(t *testing.T) *proxyE2EEnv {
 	return &proxyE2EEnv{
 		pool:   pool,
 		router: router,
+		sub:    sub,
 	}
 }
 
@@ -110,6 +113,804 @@ func setProxyE2EOutboundDialFunc(
 	ob := &mockOutbound{dialFunc: dialFunc}
 	var wrapped adapter.Outbound = ob
 	entry.Outbound.Store(&wrapped)
+}
+
+func setProxyE2EEntryDialTarget(t *testing.T, entry *node.NodeEntry, target string) {
+	t.Helper()
+	ob := &mockOutbound{dialFunc: func(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, target)
+	}}
+	var wrapped adapter.Outbound = ob
+	entry.Outbound.Store(&wrapped)
+}
+
+func setupResponseRetryNode(t *testing.T, env *proxyE2EEnv, raw, ip, target string) *node.NodeEntry {
+	t.Helper()
+	rawOptions := json.RawMessage(raw)
+	hash := node.HashFromRawOptions(rawOptions)
+	env.sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+	env.pool.AddNodeFromSub(hash, rawOptions, "sub-1")
+	entry, ok := env.pool.GetEntry(hash)
+	if !ok {
+		t.Fatalf("response retry node %s not found", hash.Hex())
+	}
+	entry.SetEgressIP(netip.MustParseAddr(ip))
+	entry.LatencyTable.Update("example.com", 20*time.Millisecond, 10*time.Minute)
+	setProxyE2EEntryDialTarget(t, entry, target)
+	env.pool.RecordResult(hash, true)
+	env.pool.NotifyNodeDirty(hash)
+	return entry
+}
+
+func TestForwardProxy_ResponsePolicyCooldownThenRetryPromotesStickyOwner(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	compiledRules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusTooManyRequests},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "quota-limited"},
+		},
+		Action: model.PlatformResponseRuleAction{
+			Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "next_utc_midnight",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = compiledRules
+
+	var requests atomic.Int32
+	var bodyMu sync.Mutex
+	var attempts []struct{ label, body string }
+	makeUpstream := func(label string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			body, readErr := io.ReadAll(req.Body)
+			if readErr != nil {
+				http.Error(w, "body read failed", http.StatusBadRequest)
+				return
+			}
+			bodyMu.Lock()
+			attempts = append(attempts, struct{ label, body string }{label: label, body: string(body)})
+			bodyMu.Unlock()
+			if requests.Add(1) <= 2 {
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"type":"quota-limited"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}))
+	}
+	upstreams := []*httptest.Server{makeUpstream("base"), makeUpstream("second"), makeUpstream("third")}
+	defer func() {
+		for _, upstream := range upstreams {
+			upstream.Close()
+		}
+	}()
+
+	baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+	baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstreams[0].Listener.Addr().String())
+	second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstreams[1].Listener.Addr().String())
+	third := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstreams[2].Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+	})
+	initialRoute, err := env.router.RouteRequest("plat", "account", "https://example.com/api")
+	if err != nil {
+		t.Fatalf("initial sticky route: %v", err)
+	}
+	payload := `{"model":"generic","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("upstream requests: got %d, want 3", got)
+	}
+	bodyMu.Lock()
+	gotAttempts := append([]struct{ label, body string }(nil), attempts...)
+	bodyMu.Unlock()
+	if len(gotAttempts) != 3 {
+		t.Fatalf("attempts: got %#v", gotAttempts)
+	}
+	seenLabels := make(map[string]struct{}, len(gotAttempts))
+	for _, attempt := range gotAttempts {
+		if attempt.body != payload {
+			t.Fatalf("replayed POST body: got %q, want %q", attempt.body, payload)
+		}
+		seenLabels[attempt.label] = struct{}{}
+	}
+	if len(seenLabels) != 3 {
+		t.Fatalf("retry reused an egress: attempts=%#v", gotAttempts)
+	}
+	if gotAttempts[0].label == gotAttempts[2].label || gotAttempts[1].label == gotAttempts[2].label {
+		t.Fatalf("successful retry did not use a third distinct egress: %#v", gotAttempts)
+	}
+
+	// Change non-sticky latency/order inputs. A real second proxy request must
+	// still use the third successful entry, not merely happen to select it.
+	baseEntry.LatencyTable.Update("example.com", 2*time.Second, time.Minute)
+	second.LatencyTable.Update("example.com", time.Nanosecond, time.Minute)
+	third.LatencyTable.Update("example.com", 2*time.Second, time.Minute)
+	env.pool.NotifyNodeDirty(baseHash)
+	env.pool.NotifyNodeDirty(second.Hash)
+	env.pool.NotifyNodeDirty(third.Hash)
+	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(payload))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	secondWriter := httptest.NewRecorder()
+	fp.ServeHTTP(secondWriter, secondReq)
+	if secondWriter.Code != http.StatusOK {
+		t.Fatalf("sticky second request status: got %d body=%s", secondWriter.Code, secondWriter.Body.String())
+	}
+	bodyMu.Lock()
+	finalAttempt := attempts[len(attempts)-1]
+	bodyMu.Unlock()
+	if finalAttempt.label != gotAttempts[2].label {
+		t.Fatalf("successful IP was not sticky: first success=%q second request=%q", gotAttempts[2].label, finalAttempt.label)
+	}
+	_ = initialRoute
+}
+
+func TestForwardProxy_ResponsePolicyRetryOnlyUsesNextEntryAndPromotesSticky(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retry-only", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var requestCount atomic.Int32
+	var mu sync.Mutex
+	var labels []string
+	makeUpstream := func(label string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			_, _ = io.ReadAll(req.Body)
+			mu.Lock()
+			labels = append(labels, label)
+			mu.Unlock()
+			if requestCount.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":"retryable"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}))
+	}
+	baseUpstream := makeUpstream("base")
+	secondUpstream := makeUpstream("second")
+	defer baseUpstream.Close()
+	defer secondUpstream.Close()
+
+	baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+	baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, baseUpstream.Listener.Addr().String())
+	second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", secondUpstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	payload := `{"safe":true}`
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+		writer := httptest.NewRecorder()
+		fp.ServeHTTP(writer, req)
+		return writer
+	}
+	first := request()
+	if first.Code != http.StatusOK || first.Body.String() != "ok" {
+		t.Fatalf("retry-only first response: status=%d body=%q", first.Code, first.Body.String())
+	}
+	mu.Lock()
+	firstLabels := append([]string(nil), labels...)
+	mu.Unlock()
+	if len(firstLabels) != 2 || firstLabels[0] == firstLabels[1] {
+		t.Fatalf("retry-only did not switch exact entry: %#v", firstLabels)
+	}
+	if baseEntry.IsCircuitOpen() || second.IsCircuitOpen() {
+		t.Fatal("retry-only polluted global health circuit")
+	}
+	secondResponse := request()
+	if secondResponse.Code != http.StatusOK {
+		t.Fatalf("sticky retry-only response: status=%d body=%q", secondResponse.Code, secondResponse.Body.String())
+	}
+	mu.Lock()
+	lastLabel := labels[len(labels)-1]
+	mu.Unlock()
+	if lastLabel != firstLabels[1] {
+		t.Fatalf("retry-only success did not become sticky: first=%q second=%q", firstLabels[1], lastLabel)
+	}
+}
+
+func TestForwardProxy_ResponsePolicyAll429ExhaustsFixedSnapshot(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}, Body: &model.PlatformResponseBodyMatch{Op: "contains", Value: "quota-limited"}},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "next_utc_midnight"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var requests atomic.Int32
+	var mu sync.Mutex
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, readErr := io.ReadAll(req.Body)
+		if readErr != nil {
+			t.Errorf("upstream body read: %v", readErr)
+			return
+		}
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		requests.Add(1)
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"quota-limited"}`))
+	}))
+	defer upstream.Close()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	payload := `{"safe":true}`
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	writer := httptest.NewRecorder()
+	fp.ServeHTTP(writer, req)
+	if writer.Code != http.StatusTooManyRequests {
+		t.Fatalf("all-429 status: got %d, want 429", writer.Code)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("all-429 attempts: got %d, want exactly 3", got)
+	}
+	mu.Lock()
+	gotBodies := append([]string(nil), bodies...)
+	mu.Unlock()
+	if len(gotBodies) != 3 || gotBodies[0] != payload || gotBodies[1] != payload || gotBodies[2] != payload {
+		t.Fatalf("all-429 request bodies: %#v", gotBodies)
+	}
+}
+
+func TestForwardProxy_ResponsePolicyAllFailuresDoNotCommitSticky(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "new account", existing: false},
+		{name: "existing owner", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+				ID: "retry-only", Enabled: true,
+				Match: model.PlatformResponseRuleMatch{
+					StatusCodes: []int{http.StatusBadGateway},
+					Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+				},
+				Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			plat.ResponseRules = rules
+
+			var requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Errorf("upstream body read: %v", err)
+				}
+				requests.Add(1)
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":"retryable"}`))
+			}))
+			defer upstream.Close()
+
+			baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+			baseEntry, ok := env.pool.GetEntry(baseHash)
+			if !ok {
+				t.Fatal("base node not found")
+			}
+			setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+			setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+			setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstream.Listener.Addr().String())
+
+			account := "all-fail-new"
+			var before *model.Lease
+			if tc.existing {
+				account = "all-fail-existing"
+				if _, err := env.router.RouteRequest("plat", account, "https://example.com/api"); err != nil {
+					t.Fatalf("create existing sticky owner: %v", err)
+				}
+				before = env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: account})
+				if before == nil {
+					t.Fatal("existing sticky owner was not created")
+				}
+			}
+
+			fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(`{"safe":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Proxy-Authorization", basicAuth("plat."+account, "tok"))
+			writer := httptest.NewRecorder()
+			fp.ServeHTTP(writer, req)
+			if writer.Code != http.StatusBadGateway {
+				t.Fatalf("all-failure status: got %d body=%q", writer.Code, writer.Body.String())
+			}
+			if got := requests.Load(); got != 3 {
+				t.Fatalf("all-failure attempts: got %d, want exactly 3", got)
+			}
+
+			after := env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: account})
+			if !tc.existing {
+				if after != nil {
+					t.Fatalf("failed new-account chain committed sticky owner: %+v", after)
+				}
+				return
+			}
+			if after == nil {
+				t.Fatal("failed chain deleted the existing sticky owner")
+			}
+			if *after != *before {
+				t.Fatalf("failed chain overwrote existing sticky owner: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestForwardProxy_ResponsePolicyConcurrentFailuresDoNotChainProvisionalSticky(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retry-only", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	requestAEntered := make(chan struct{})
+	requestBEntered := make(chan struct{})
+	allowResponseA := make(chan struct{})
+	allowResponseB := make(chan struct{})
+	var requestAOnce, requestBOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if _, err := io.ReadAll(req.Body); err != nil {
+			t.Errorf("upstream body read: %v", err)
+		}
+		switch req.Header.Get("X-Test-Request") {
+		case "A":
+			requestAOnce.Do(func() { close(requestAEntered); <-allowResponseA })
+		case "B":
+			requestBOnce.Do(func() { close(requestBEntered); <-allowResponseB })
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"retryable"}`))
+	}))
+	defer upstream.Close()
+
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	run := func(id string) <-chan *httptest.ResponseRecorder {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(`{"safe":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Test-Request", id)
+			req.Header.Set("Proxy-Authorization", basicAuth("plat.concurrent", "tok"))
+			writer := httptest.NewRecorder()
+			fp.ServeHTTP(writer, req)
+			done <- writer
+		}()
+		return done
+	}
+
+	doneA := run("A")
+	select {
+	case <-requestAEntered:
+	case <-time.After(time.Second):
+		t.Fatal("request A did not reach upstream")
+	}
+
+	doneB := run("B")
+	select {
+	case <-requestBEntered:
+	case <-time.After(time.Second):
+		t.Fatal("request B did not reach upstream")
+	}
+
+	close(allowResponseA)
+	select {
+	case response := <-doneA:
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("request A status: got %d", response.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request A did not finish")
+	}
+	close(allowResponseB)
+	select {
+	case response := <-doneB:
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("request B status: got %d", response.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request B did not finish")
+	}
+
+	if lease := env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: "concurrent"}); lease != nil {
+		t.Fatalf("concurrent failed requests left provisional sticky lease: %+v", lease)
+	}
+}
+
+func TestForwardProxy_ResponsePolicyConcurrentSuccessAndFailureOnlySuccessCommits(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		failureCompletesFirst bool
+	}{
+		{name: "failure completes first", failureCompletesFirst: true},
+		{name: "success completes first", failureCompletesFirst: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+				ID: "retry-only", Enabled: true,
+				Match: model.PlatformResponseRuleMatch{
+					StatusCodes: []int{http.StatusBadGateway},
+					Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+				},
+				Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			plat.ResponseRules = rules
+
+			requestAEntered := make(chan struct{})
+			requestBEntered := make(chan struct{})
+			allowResponseA := make(chan struct{})
+			allowResponseB := make(chan struct{})
+			var requestAOnce, requestBOnce sync.Once
+			var labelsMu sync.Mutex
+			var successfulLabel string
+			servers := make([]*httptest.Server, 0, 3)
+			labels := []string{"base", "second", "third"}
+			for _, label := range labels {
+				label := label
+				servers = append(servers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					if _, err := io.ReadAll(req.Body); err != nil {
+						t.Errorf("upstream body read: %v", err)
+					}
+					switch req.Header.Get("X-Test-Request") {
+					case "A":
+						requestAOnce.Do(func() { close(requestAEntered); <-allowResponseA })
+						labelsMu.Lock()
+						successfulLabel = label
+						labelsMu.Unlock()
+						w.WriteHeader(http.StatusOK)
+						_, _ = w.Write([]byte("success"))
+					case "B":
+						requestBOnce.Do(func() { close(requestBEntered); <-allowResponseB })
+						w.WriteHeader(http.StatusBadGateway)
+						_, _ = w.Write([]byte(`{"error":"retryable"}`))
+					default:
+						http.Error(w, "unexpected request", http.StatusBadRequest)
+					}
+				})))
+			}
+			defer func() {
+				for _, server := range servers {
+					server.Close()
+				}
+			}()
+
+			baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+			baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+			baseEntry, ok := env.pool.GetEntry(baseHash)
+			if !ok {
+				t.Fatal("base node not found")
+			}
+			setProxyE2EEntryDialTarget(t, baseEntry, servers[0].Listener.Addr().String())
+			second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", servers[1].Listener.Addr().String())
+			third := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", servers[2].Listener.Addr().String())
+
+			fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+			run := func(id string) <-chan *httptest.ResponseRecorder {
+				done := make(chan *httptest.ResponseRecorder, 1)
+				go func() {
+					req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(`{"safe":true}`))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set("X-Test-Request", id)
+					req.Header.Set("Proxy-Authorization", basicAuth("plat.concurrent-success", "tok"))
+					writer := httptest.NewRecorder()
+					fp.ServeHTTP(writer, req)
+					done <- writer
+				}()
+				return done
+			}
+
+			doneA := run("A")
+			select {
+			case <-requestAEntered:
+			case <-time.After(time.Second):
+				t.Fatal("successful request did not reach upstream")
+			}
+			doneB := run("B")
+			select {
+			case <-requestBEntered:
+			case <-time.After(time.Second):
+				t.Fatal("failing request did not reach upstream")
+			}
+
+			wait := func(done <-chan *httptest.ResponseRecorder, want int, name string) {
+				t.Helper()
+				select {
+				case response := <-done:
+					if response.Code != want {
+						t.Fatalf("%s status: got %d, want %d", name, response.Code, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("%s did not finish", name)
+				}
+			}
+			if tc.failureCompletesFirst {
+				close(allowResponseB)
+				wait(doneB, http.StatusBadGateway, "failing request")
+				close(allowResponseA)
+				wait(doneA, http.StatusOK, "successful request")
+			} else {
+				close(allowResponseA)
+				wait(doneA, http.StatusOK, "successful request")
+				close(allowResponseB)
+				wait(doneB, http.StatusBadGateway, "failing request")
+			}
+
+			labelsMu.Lock()
+			gotLabel := successfulLabel
+			labelsMu.Unlock()
+			wantIP := map[string]netip.Addr{
+				"base":   baseEntry.GetEgressIP(),
+				"second": second.GetEgressIP(),
+				"third":  third.GetEgressIP(),
+			}[gotLabel]
+			if !wantIP.IsValid() {
+				t.Fatalf("successful upstream label was not captured: %q", gotLabel)
+			}
+			lease := env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: "concurrent-success"})
+			if lease == nil {
+				t.Fatal("successful request did not commit a sticky owner")
+			}
+			if lease.EgressIP != wantIP.String() {
+				t.Fatalf("failed request changed sticky owner: label=%q lease=%+v", gotLabel, lease)
+			}
+		})
+	}
+}
+
+func TestForwardProxy_ResponsePolicyCommitsStickyBeforeStreamingBody(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+	baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+
+	releaseFirstBody := make(chan struct{})
+	firstBodyReleased := false
+	labels := []string{"base", "second"}
+	servers := make([]*httptest.Server, 0, len(labels))
+	for _, label := range labels {
+		label := label
+		servers = append(servers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Upstream-Label", label)
+			w.WriteHeader(http.StatusOK)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Errorf("upstream %s does not support flushing", label)
+				return
+			}
+			_, _ = io.WriteString(w, "data: first\n\n")
+			_, _ = io.WriteString(w, strings.Repeat("x", 32*1024))
+			flusher.Flush()
+			if req.Header.Get("X-Test-Stream") == "first" {
+				<-releaseFirstBody
+				return
+			}
+			_, _ = io.WriteString(w, "data: complete\n\n")
+			flusher.Flush()
+		})))
+	}
+	defer func() {
+		if !firstBodyReleased {
+			close(releaseFirstBody)
+		}
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+
+	setProxyE2EEntryDialTarget(t, baseEntry, servers[0].Listener.Addr().String())
+	secondEntry := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", servers[1].Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	proxyServer := httptest.NewServer(fp)
+	defer proxyServer.Close()
+	proxyURL, err := url.Parse(proxyServer.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	newRequest := func(stream string) *http.Request {
+		req, err := http.NewRequest(http.MethodGet, "http://example.com/api", nil)
+		if err != nil {
+			t.Fatalf("build streaming request: %v", err)
+		}
+		req.Host = "example.com"
+		req.Header.Set("Proxy-Authorization", basicAuth("plat.stream", "tok"))
+		req.Header.Set("X-Test-Stream", stream)
+		return req
+	}
+
+	firstResp, err := client.Do(newRequest("first"))
+	if err != nil {
+		t.Fatalf("first streaming request: %v", err)
+	}
+	defer firstResp.Body.Close()
+	if firstResp.StatusCode != http.StatusOK {
+		t.Fatalf("first streaming status: got %d", firstResp.StatusCode)
+	}
+	firstLabel := firstResp.Header.Get("X-Upstream-Label")
+	if firstLabel != "base" && firstLabel != "second" {
+		t.Fatalf("first upstream label: %q", firstLabel)
+	}
+	firstEntry := map[string]*node.NodeEntry{"base": baseEntry, "second": secondEntry}[firstLabel]
+	otherEntry := secondEntry
+	if firstEntry == secondEntry {
+		otherEntry = baseEntry
+	}
+	// Make a non-sticky selection prefer the other entry. A sticky hit must
+	// still use firstEntry while its response body remains open.
+	firstEntry.LatencyTable.Update("example.com", 2*time.Second, time.Hour)
+	otherEntry.LatencyTable.Update("example.com", time.Nanosecond, time.Hour)
+	env.pool.NotifyNodeDirty(firstEntry.Hash)
+	env.pool.NotifyNodeDirty(otherEntry.Hash)
+
+	secondResp, err := client.Do(newRequest("second"))
+	if err != nil {
+		t.Fatalf("second streaming request: %v", err)
+	}
+	secondBody, readErr := io.ReadAll(secondResp.Body)
+	_ = secondResp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read second streaming response: %v", readErr)
+	}
+	if secondResp.StatusCode != http.StatusOK || len(secondBody) == 0 {
+		t.Fatalf("second streaming response: status=%d body=%q", secondResp.StatusCode, string(secondBody))
+	}
+	if got := secondResp.Header.Get("X-Upstream-Label"); got != firstLabel {
+		t.Fatalf("sticky owner not committed at response headers: first=%q second=%q", firstLabel, got)
+	}
+	close(releaseFirstBody)
+	firstBodyReleased = true
+	_, _ = io.ReadAll(firstResp.Body)
+}
+
+func TestForwardProxy_ResponsePolicyOversizedBodyDoesNotReplay(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}, Body: &model.PlatformResponseBodyMatch{Op: "contains", Value: "quota-limited"}},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "next_utc_midnight"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.Copy(io.Discard, req.Body)
+		requests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"quota-limited"}`))
+	}))
+	defer upstream.Close()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/api", strings.NewReader(strings.Repeat("x", responseRuleRetryBodyLimit+1)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	writer := httptest.NewRecorder()
+	fp.ServeHTTP(writer, req)
+	if writer.Code != http.StatusTooManyRequests {
+		t.Fatalf("oversized body status: got %d, want 429", writer.Code)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("oversized body was replayed: upstream requests=%d", got)
+	}
 }
 
 type replacingHealthRecorder struct {
@@ -622,6 +1423,402 @@ func TestReverseProxy_E2ESuccess(t *testing.T) {
 	}
 }
 
+func TestReverseProxy_ResponsePolicyRetryOnlyUsesNextEntryAndPromotesSticky(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retryable-upstream", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var firstHits, secondHits atomic.Int32
+	var bodyMu sync.Mutex
+	var bodies []string
+	newUpstream := func(label string, hits *atomic.Int32, status int, responseBody string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			body, readErr := io.ReadAll(req.Body)
+			if readErr != nil {
+				http.Error(w, "body read failed", http.StatusBadRequest)
+				return
+			}
+			hits.Add(1)
+			bodyMu.Lock()
+			bodies = append(bodies, label+":"+string(body))
+			bodyMu.Unlock()
+			w.Header().Set("X-Upstream-Attempt", label)
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(responseBody))
+		}))
+	}
+	firstUpstream := newUpstream("first", &firstHits, http.StatusBadGateway, "retryable failure")
+	secondUpstream := newUpstream("second", &secondHits, http.StatusOK, "reverse-retry-ok")
+	defer firstUpstream.Close()
+	defer secondUpstream.Close()
+
+	second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", secondUpstream.Listener.Addr().String())
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	base, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/api")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	firstEntry := initial.SelectedEntry()
+	if firstEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+	setProxyE2EEntryDialTarget(t, firstEntry, firstUpstream.Listener.Addr().String())
+	if firstEntry == base {
+		setProxyE2EEntryDialTarget(t, second, secondUpstream.Listener.Addr().String())
+	} else {
+		setProxyE2EEntryDialTarget(t, base, secondUpstream.Listener.Addr().String())
+	}
+
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:     "tok",
+		Router:         env.router,
+		Pool:           env.pool,
+		PlatformLookup: env.pool,
+		Health:         &mockHealthRecorder{},
+		Events:         NoOpEventEmitter{},
+	})
+	reverseSrv := httptest.NewServer(rp)
+	defer reverseSrv.Close()
+
+	targetHost := strings.TrimPrefix(firstUpstream.URL, "http://")
+	requestURL := reverseSrv.URL + "/tok/plat:account/http/" + targetHost + "/v1/retry"
+	payload := `{"model":"generic","stream":true}`
+	doRequest := func() *http.Response {
+		req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("build reverse request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("reverse request: %v", err)
+		}
+		return resp
+	}
+
+	firstResp := doRequest()
+	firstBody, err := io.ReadAll(firstResp.Body)
+	_ = firstResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read first response: %v", err)
+	}
+	if firstResp.StatusCode != http.StatusOK || string(firstBody) != "reverse-retry-ok" {
+		t.Fatalf("first response: status=%d body=%q", firstResp.StatusCode, string(firstBody))
+	}
+	if got := firstResp.Header.Get("X-Upstream-Attempt"); got != "second" {
+		t.Fatalf("first response header: got %q, want second", got)
+	}
+
+	secondResp := doRequest()
+	secondBody, err := io.ReadAll(secondResp.Body)
+	_ = secondResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if secondResp.StatusCode != http.StatusOK || string(secondBody) != "reverse-retry-ok" {
+		t.Fatalf("second response: status=%d body=%q", secondResp.StatusCode, string(secondBody))
+	}
+	if got := secondResp.Header.Get("X-Upstream-Attempt"); got != "second" {
+		t.Fatalf("second response header: got %q, want second", got)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("first upstream requests: got %d, want 1", got)
+	}
+	if got := secondHits.Load(); got != 2 {
+		t.Fatalf("second upstream requests: got %d, want 2", got)
+	}
+	if firstEntry.IsCircuitOpen() {
+		t.Fatal("retry-only must not globally cool down the first entry")
+	}
+	bodyMu.Lock()
+	gotBodies := append([]string(nil), bodies...)
+	bodyMu.Unlock()
+	for _, got := range gotBodies {
+		if got != "first:"+payload && got != "second:"+payload {
+			t.Fatalf("upstream body: got %q, want %q", got, payload)
+		}
+	}
+}
+
+func TestReverseProxy_ResponsePolicyAllFailuresDoNotCommitSticky(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "new account", existing: false},
+		{name: "existing owner", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+				ID: "retry-only", Enabled: true,
+				Match: model.PlatformResponseRuleMatch{
+					StatusCodes: []int{http.StatusBadGateway},
+					Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `retryable`},
+				},
+				Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			plat.ResponseRules = rules
+
+			var requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Errorf("upstream body read: %v", err)
+				}
+				requests.Add(1)
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":"retryable"}`))
+			}))
+			defer upstream.Close()
+
+			baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+			baseEntry, ok := env.pool.GetEntry(baseHash)
+			if !ok {
+				t.Fatal("base node not found")
+			}
+			setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+			setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+			setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstream.Listener.Addr().String())
+
+			account := "reverse-new"
+			var before *model.Lease
+			if tc.existing {
+				account = "reverse-existing"
+				if _, err := env.router.RouteRequest("plat", account, "https://example.com/api"); err != nil {
+					t.Fatalf("create existing sticky owner: %v", err)
+				}
+				before = env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: account})
+				if before == nil {
+					t.Fatal("existing sticky owner was not created")
+				}
+			}
+
+			rp := NewReverseProxy(ReverseProxyConfig{
+				ProxyToken:     "tok",
+				Router:         env.router,
+				Pool:           env.pool,
+				PlatformLookup: env.pool,
+				Health:         &mockHealthRecorder{},
+				Events:         NoOpEventEmitter{},
+			})
+			reverseSrv := httptest.NewServer(rp)
+			defer reverseSrv.Close()
+			targetHost := strings.TrimPrefix(upstream.URL, "http://")
+			requestURL := reverseSrv.URL + "/tok/plat:" + account + "/http/" + targetHost + "/v1/all-fail"
+			req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(`{"stream":true}`))
+			if err != nil {
+				t.Fatalf("build reverse request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("reverse request: %v", err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				t.Fatalf("read reverse response: %v", readErr)
+			}
+			if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "retryable") {
+				t.Fatalf("all-failure response: status=%d body=%q", resp.StatusCode, string(body))
+			}
+			if got := requests.Load(); got != 3 {
+				t.Fatalf("all-failure attempts: got %d, want exactly 3", got)
+			}
+
+			after := env.router.ReadLease(model.LeaseKey{PlatformID: "plat-id", Account: account})
+			if !tc.existing {
+				if after != nil {
+					t.Fatalf("failed new-account chain committed sticky owner: %+v", after)
+				}
+				return
+			}
+			if after == nil || *after != *before {
+				t.Fatalf("failed chain changed existing sticky owner: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestReverseProxy_ResponsePolicyCooldownThenRetryUsesThreeEntrySnapshot(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "quota-window", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusTooManyRequests},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "quota-limited"},
+		},
+		Action: model.PlatformResponseRuleAction{
+			Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "next_utc_midnight",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var attempts atomic.Int32
+	var bodyMu sync.Mutex
+	var labels []string
+	var bodies []string
+	newUpstream := func(label string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			body, readErr := io.ReadAll(req.Body)
+			if readErr != nil {
+				http.Error(w, "body read failed", http.StatusBadRequest)
+				return
+			}
+			attempt := attempts.Add(1)
+			bodyMu.Lock()
+			labels = append(labels, label)
+			bodies = append(bodies, string(body))
+			bodyMu.Unlock()
+			w.Header().Set("X-Upstream-Attempt", label)
+			if attempt < 3 {
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":"quota-limited"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("reverse-three-entry-ok"))
+		}))
+	}
+	upstreams := []*httptest.Server{newUpstream("ip-1"), newUpstream("ip-2"), newUpstream("ip-3")}
+	defer func() {
+		for _, upstream := range upstreams {
+			upstream.Close()
+		}
+	}()
+
+	second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstreams[1].Listener.Addr().String())
+	third := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstreams[2].Listener.Addr().String())
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	base, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/api")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	firstEntry := initial.SelectedEntry()
+	if firstEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+	setProxyE2EEntryDialTarget(t, firstEntry, upstreams[0].Listener.Addr().String())
+	remaining := make([]*node.NodeEntry, 0, 2)
+	for _, entry := range []*node.NodeEntry{base, second, third} {
+		if entry != firstEntry {
+			remaining = append(remaining, entry)
+		}
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("initial route entry was not one of the three candidates: %p", firstEntry)
+	}
+	setProxyE2EEntryDialTarget(t, remaining[0], upstreams[1].Listener.Addr().String())
+	setProxyE2EEntryDialTarget(t, remaining[1], upstreams[2].Listener.Addr().String())
+
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:     "tok",
+		Router:         env.router,
+		Pool:           env.pool,
+		PlatformLookup: env.pool,
+		Health:         &mockHealthRecorder{},
+		Events:         NoOpEventEmitter{},
+	})
+	reverseSrv := httptest.NewServer(rp)
+	defer reverseSrv.Close()
+	targetHost := strings.TrimPrefix(upstreams[0].URL, "http://")
+	requestURL := reverseSrv.URL + "/tok/plat:account/http/" + targetHost + "/v1/three-entry"
+	payload := `{"model":"generic","stream":true}`
+	doRequest := func() *http.Response {
+		req, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("build reverse request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("reverse request: %v", err)
+		}
+		return resp
+	}
+
+	firstResp := doRequest()
+	firstBody, err := io.ReadAll(firstResp.Body)
+	_ = firstResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read first response: %v", err)
+	}
+	if firstResp.StatusCode != http.StatusOK || string(firstBody) != "reverse-three-entry-ok" {
+		t.Fatalf("first response: status=%d body=%q", firstResp.StatusCode, string(firstBody))
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("first request attempts: got %d, want 3", got)
+	}
+	bodyMu.Lock()
+	firstLabels := append([]string(nil), labels...)
+	firstBodies := append([]string(nil), bodies...)
+	bodyMu.Unlock()
+	if len(firstLabels) != 3 || firstLabels[0] == firstLabels[1] || firstLabels[0] == firstLabels[2] || firstLabels[1] == firstLabels[2] {
+		t.Fatalf("retry candidates were not distinct: %#v", firstLabels)
+	}
+	for _, body := range firstBodies {
+		if body != payload {
+			t.Fatalf("replayed body: got %q, want %q", body, payload)
+		}
+	}
+	if got := firstResp.Header.Get("X-Upstream-Attempt"); got != firstLabels[2] {
+		t.Fatalf("final response header: got %q, want %q", got, firstLabels[2])
+	}
+
+	secondResp := doRequest()
+	secondBody, err := io.ReadAll(secondResp.Body)
+	_ = secondResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if secondResp.StatusCode != http.StatusOK || string(secondBody) != "reverse-three-entry-ok" {
+		t.Fatalf("second response: status=%d body=%q", secondResp.StatusCode, string(secondBody))
+	}
+	bodyMu.Lock()
+	secondLabel := labels[len(labels)-1]
+	bodyMu.Unlock()
+	if secondLabel != firstLabels[2] {
+		t.Fatalf("successful retry was not sticky: first success=%q second request=%q", firstLabels[2], secondLabel)
+	}
+}
+
 func TestReverseProxy_E2EHTTPBypassDialsDirect(t *testing.T) {
 	emitter := newMockEventEmitter()
 
@@ -837,6 +2034,129 @@ func TestReverseProxy_E2ECapturesDetailPayloads(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected reverse log event")
+	}
+}
+
+func TestReverseProxy_ResponsePolicyCommitsStickyForUpgradeBeforeTunnel(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+	baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+
+	releaseUpgrade := make(chan struct{})
+	labels := []string{"base", "second"}
+	servers := make([]*httptest.Server, 0, len(labels))
+	for _, label := range labels {
+		label := label
+		servers = append(servers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("upstream %s does not support hijacking", label)
+				return
+			}
+			conn, brw, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("upstream %s hijack: %v", label, err)
+				return
+			}
+			defer conn.Close()
+			_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+			_, _ = brw.WriteString("Connection: Upgrade\r\n")
+			_, _ = brw.WriteString("Upgrade: websocket\r\n")
+			_, _ = brw.WriteString("X-Upstream-Label: " + label + "\r\n\r\n")
+			if err := brw.Flush(); err != nil {
+				t.Errorf("upstream %s flush upgrade response: %v", label, err)
+				return
+			}
+			<-releaseUpgrade
+		})))
+	}
+	defer func() {
+		close(releaseUpgrade)
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+
+	setProxyE2EEntryDialTarget(t, baseEntry, servers[0].Listener.Addr().String())
+	secondEntry := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", servers[1].Listener.Addr().String())
+
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:     "tok",
+		Router:         env.router,
+		Pool:           env.pool,
+		PlatformLookup: env.pool,
+		Health:         &mockHealthRecorder{},
+		Events:         NoOpEventEmitter{},
+	})
+	reverseServer := httptest.NewServer(rp)
+	defer reverseServer.Close()
+	reverseAddr := strings.TrimPrefix(reverseServer.URL, "http://")
+	upstreamHost := strings.TrimPrefix(servers[0].URL, "http://")
+	openUpgrade := func() (net.Conn, string) {
+		t.Helper()
+		conn, err := net.Dial("tcp", reverseAddr)
+		if err != nil {
+			t.Fatalf("dial reverse proxy: %v", err)
+		}
+		request := fmt.Sprintf(
+			"GET /tok/plat:acct/http/%s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+			upstreamHost,
+			reverseAddr,
+		)
+		if _, err := conn.Write([]byte(request)); err != nil {
+			_ = conn.Close()
+			t.Fatalf("write upgrade request: %v", err)
+		}
+		reader := bufio.NewReader(conn)
+		statusLine, err := reader.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			t.Fatalf("read upgrade status: %v", err)
+		}
+		if !strings.Contains(statusLine, "101 Switching Protocols") {
+			_ = conn.Close()
+			t.Fatalf("unexpected upgrade status: %q", statusLine)
+		}
+		label := ""
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				_ = conn.Close()
+				t.Fatalf("read upgrade headers: %v", err)
+			}
+			if strings.HasPrefix(strings.ToLower(line), "x-upstream-label:") {
+				label = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		return conn, label
+	}
+
+	firstConn, firstLabel := openUpgrade()
+	defer firstConn.Close()
+	if firstLabel != "base" && firstLabel != "second" {
+		t.Fatalf("first upgrade upstream label: %q", firstLabel)
+	}
+	firstEntry := map[string]*node.NodeEntry{"base": baseEntry, "second": secondEntry}[firstLabel]
+	otherEntry := secondEntry
+	if firstEntry == secondEntry {
+		otherEntry = baseEntry
+	}
+	firstEntry.LatencyTable.Update("example.com", 2*time.Second, time.Hour)
+	otherEntry.LatencyTable.Update("example.com", time.Nanosecond, time.Hour)
+	env.pool.NotifyNodeDirty(firstEntry.Hash)
+	env.pool.NotifyNodeDirty(otherEntry.Hash)
+
+	secondConn, secondLabel := openUpgrade()
+	defer secondConn.Close()
+	if secondLabel != firstLabel {
+		t.Fatalf("upgrade sticky owner was not committed at 101 headers: first=%q second=%q", firstLabel, secondLabel)
 	}
 }
 

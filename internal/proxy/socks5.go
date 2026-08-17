@@ -148,6 +148,9 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		lifecycle.setNetOK(false)
 		return
 	}
+	if prepare.route.PlatformID != "" {
+		s.tunnel.router.CommitRouteForAccount(prepare.route, handshake.account)
+	}
 
 	relay := pumpPreparedTunnel(conn, reader, prepare.session, tunnelPumpOptions{
 		ctx:                baseCtx,

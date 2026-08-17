@@ -295,14 +295,14 @@ export function PlatformPage() {
                   id="create-response-rules"
                   rows={8}
                   invalid={Boolean(createForm.formState.errors.response_rules_text)}
-                  placeholder={t('[{"name":"OpenCode 免费额度","status_codes":[429],"response_regex":"FreeUsageLimitError","scope":"egress_ip"}]')}
+                  placeholder={t('[{"id":"quota-window","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown_then_retry_next","cooldown_scope":"egress_ip","fallback":"next_utc_midnight"}}]')}
                   {...createForm.register("response_rules_text")}
                 />
                 {createForm.formState.errors.response_rules_text?.message ? (
                   <p className="field-error">{t(createForm.formState.errors.response_rules_text.message)}</p>
                 ) : null}
                 <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-                  {t("期限只取响应的 Retry-After，或 expiry_regex + expiry_layout（rfc3339、unix_seconds、unix_milliseconds、duration）；未读到期限不会猜测 24 小时。cooldown 仅用于明确的固定窗口。scope 可填 node 或 egress_ip。")}
+                  {t("规则按列表顺序 first-match-wins；支持状态码、header 和有界响应体匹配。动作可选 passthrough、retry_next、cooldown、cooldown_then_retry_next；冷却期限可按 Retry-After、指定 header、JSON Pointer 或响应体正则捕获组读取，格式需明确且有界；无可信期限时可使用 next_utc_midnight、fixed_duration 或 none。")}
                 </p>
               </div>
 

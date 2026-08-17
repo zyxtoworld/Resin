@@ -85,9 +85,10 @@ func (c *ResponseCooldowns) markAt(
 	c.markAtEntry(scope, hash, nil, egressIP, until, now)
 }
 
-// markForEntry records a node-scope cooldown for the exact entry that
-// produced the response. Egress-IP cooldowns intentionally remain keyed only
-// by IP: their contract applies to every node sharing that egress address.
+// markForEntry records a cooldown for the response's exact route generation.
+// The entry is validated by Router/ExactEntryExecutor before this method is
+// called. Once published, an egress-IP cooldown is intentionally keyed by the
+// stable public IP and survives an entry rebuild with that same IP.
 func (c *ResponseCooldowns) markForEntry(
 	scope platform.ResponseRuleScope,
 	hash node.Hash,
@@ -168,10 +169,8 @@ func (c *ResponseCooldowns) isCooling(
 		}
 	}
 	if egressIP.IsValid() {
-		if until, ok := c.byEgress[egressIP]; ok {
-			if until.After(now) {
-				cooling = true
-			}
+		if until, ok := c.byEgress[egressIP]; ok && until.After(now) {
+			cooling = true
 		}
 	}
 	return cooling

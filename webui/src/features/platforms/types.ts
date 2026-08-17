@@ -3,13 +3,35 @@ export type PlatformEmptyAccountBehavior = "RANDOM" | "FIXED_HEADER" | "ACCOUNT_
 export type PlatformAllocationPolicy = "BALANCED" | "PREFER_LOW_LATENCY" | "PREFER_IDLE_IP";
 
 export type PlatformResponseRule = {
-  name?: string;
-  status_codes: number[];
-  response_regex?: string;
-  expiry_regex?: string;
-  expiry_layout?: "rfc3339" | "rfc3339nano" | "unix_seconds" | "unix_milliseconds" | "duration";
-  cooldown?: string;
-  scope?: "node" | "egress_ip";
+  id: string;
+  enabled: boolean;
+  match: {
+    status_codes?: number[];
+    status_range?: Array<{ min: number; max: number }>;
+    headers?: Array<{
+      name: string;
+      op: "exists" | "absent" | "regex" | "not_regex" | "contains" | "not_contains";
+      value?: string;
+    }>;
+    body?: {
+      op: "regex" | "not_regex" | "contains" | "not_contains";
+      value: string;
+    };
+  };
+  action: {
+    type: "passthrough" | "retry_next" | "cooldown" | "cooldown_then_retry_next";
+    cooldown_scope?: "egress_ip" | "route_entry";
+    expiry_sources?: Array<{
+      type: "retry_after" | "header" | "json_pointer" | "body_regex";
+      header?: string;
+      json_pointer?: string;
+      regex?: string;
+      capture?: number;
+      format?: "rfc3339_utc" | "unix_seconds" | "unix_millis" | "delta_seconds";
+    }>;
+    fallback?: "next_utc_midnight" | "fixed_duration" | "none";
+    fixed_duration?: string;
+  };
 };
 
 export type Platform = {

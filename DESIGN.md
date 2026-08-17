@@ -1190,10 +1190,15 @@ Body（partial patch 示例）：
   "regex_filters": ["*^sub1/.*", ".*hk.*", "!过期"],
   "region_filters": ["hk","us"],
   "response_rules": [{
-    "name": "OpenCode free quota",
-    "status_codes": [429],
-    "response_regex": "FreeUsageLimitError",
-    "scope": "egress_ip"
+    "id": "quota-window",
+    "enabled": true,
+    "match": {"status_codes": [429]},
+    "action": {
+      "type": "cooldown_then_retry_next",
+      "cooldown_scope": "egress_ip",
+      "expiry_sources": [{"type": "retry_after", "format": "delta_seconds"}],
+      "fallback": "next_utc_midnight"
+    }
   }],
   "routable_node_count": 123,
   "reverse_proxy_miss_action": "TREAT_AS_EMPTY|REJECT",
@@ -1247,7 +1252,7 @@ Body：
 * `region_filters`：每项为 ISO 3166-1 alpha-2 小写代码。
 * 枚举字段：`reverse_proxy_miss_action` 仅 `TREAT_AS_EMPTY|REJECT`；`reverse_proxy_empty_account_behavior` 仅 `RANDOM|FIXED_HEADER|ACCOUNT_HEADER_RULE`；`allocation_policy` 仅 `BALANCED|PREFER_LOW_LATENCY|PREFER_IDLE_IP`。
 * `passive_circuit_breaker_disabled`：布尔值。设为 `true` 后，此 Platform 的用户代理请求失败不会增加节点熔断计数；主动探测不受影响。成功请求仍会清除节点连续失败计数并可恢复熔断节点。
-* `response_rules`：上游 HTTP 响应隔离规则数组。每条规则至少包含 `status_codes`；可选 `response_regex` 匹配响应体；`scope` 为 `node` 或 `egress_ip`，默认 `egress_ip`。冷却期限优先取响应头 `Retry-After`，否则取 `expiry_regex` 第一个捕获组，支持 `rfc3339`、`rfc3339nano`、`unix_seconds`、`unix_milliseconds`、`duration`；显式配置 `cooldown` 时才使用固定期限。未配置固定期限且响应没有提供可解析期限时不隔离节点，避免臆测上游额度窗口。冷却只在内存中存在，期限到达后自动恢复；随机路由和粘性租约都会跳过冷却对象。
+* `response_rules`：上游 HTTP 响应策略数组，按列表顺序 first-match-wins。每条规则包含稳定 `id`、`enabled`、`match` 与 `action`；`match` 支持状态码/范围、header 谓词和有界响应体谓词，`action` 仅支持 `passthrough`、`retry_next`、`cooldown`、`cooldown_then_retry_next`。冷却范围为 `egress_ip` 或 `route_entry`；期限来源按配置顺序取可信的 `Retry-After`、指定 header、JSON Pointer 或响应体正则捕获组，格式仅支持 `rfc3339_utc`、`unix_seconds`、`unix_millis`、`delta_seconds`。无可信期限时可选择 `next_utc_midnight`、`fixed_duration` 或 `none`。发布时全部规则一次性校验/编译，任一规则非法则整个平台更新失败并保留旧运行态。规则只在请求尚未提交响应且请求体已完整有界捕获时允许重试；每个固定路由代次的稳定出口最多尝试一次，成功出口继续作为粘性 owner。
 * 组合约束：当 `reverse_proxy_empty_account_behavior=FIXED_HEADER` 时，`reverse_proxy_fixed_account_header` 必填；其值支持多行，每行一个合法 HTTP Header 字段名（会按顺序尝试提取）。
 
 错误码映射（最小集）：

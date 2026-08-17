@@ -76,6 +76,7 @@ type Router struct {
 	p2cWindow              func() time.Duration
 	onLeaseEvent           LeaseEventFunc
 	nodeTagResolver        func(node.Hash, *node.NodeEntry) string
+	clock                  func() time.Time
 
 	// Package-private seam for deterministic lifecycle tests. It runs after
 	// RouteRequest has entered lifecycleMu's read section and resolved a
@@ -133,6 +134,13 @@ func NewRouter(cfg RouterConfig) *Router {
 	}
 	r.leaseEventsCond = sync.NewCond(&r.leaseEventsMu)
 	return r
+}
+
+func (r *Router) now() time.Time {
+	if r != nil && r.clock != nil {
+		return r.clock()
+	}
+	return time.Now()
 }
 
 // Stop closes route and lease mutation admission. It waits for any operation
@@ -224,10 +232,15 @@ func (r *Router) deleteLeaseWithEvent(
 }
 
 type RouteResult struct {
-	PlatformID                    string
-	PlatformName                  string
-	NodeHash                      node.Hash
-	EgressIP                      netip.Addr
+	PlatformID   string
+	PlatformName string
+	NodeHash     node.Hash
+	EgressIP     netip.Addr
+	// RetryBudget is the upper bound of routable candidates captured from the
+	// platform view for this route generation. Callers may retry only within
+	// this fixed budget; later platform changes must not enlarge one request's
+	// attempt set.
+	RetryBudget                   int
 	NodeTag                       string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
 	LeaseCreated                  bool
 	PassiveCircuitBreakerDisabled bool
@@ -236,6 +249,8 @@ type RouteResult struct {
 	// route selection time. Consumers must re-read the pool and compare pointer
 	// identity before using the current entry; this is not a resource lease.
 	selectedEntry *node.NodeEntry
+	platform      *platform.Platform
+	retrySnapshot *RouteRetrySnapshot
 }
 
 // SelectedEntry returns the entry identity captured during route selection.
@@ -243,6 +258,34 @@ type RouteResult struct {
 // mutable or closable resource owned by the entry.
 func (r RouteResult) SelectedEntry() *node.NodeEntry {
 	return r.selectedEntry
+}
+
+// RouteRetryExclusions is the per-request attempted set for retry selection.
+// RouteRequestNext copies these slices before using them.
+type RouteRetryExclusions struct {
+	Entries   []*node.NodeEntry
+	EgressIPs []netip.Addr
+}
+
+type routeRetryCandidate struct {
+	hash  node.Hash
+	entry *node.NodeEntry
+	ip    netip.Addr
+}
+
+// RouteRetrySnapshot is captured by the initial route generation. It cannot
+// grow when the platform is hot-reloaded.
+type RouteRetrySnapshot struct {
+	platformID string
+	platform   *platform.Platform
+	candidates []routeRetryCandidate
+	budget     int
+}
+
+// RetrySnapshot returns the immutable retry candidate generation captured by
+// this route result.
+func (r RouteResult) RetrySnapshot() *RouteRetrySnapshot {
+	return r.retrySnapshot
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -260,7 +303,7 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 		var result RouteResult
 		var err error
 		if !tryReader.TryWithRuntimeRead(func() {
-			result, err = r.routeRequest(platName, account, target)
+			result, err = r.routeRequest(platName, account, target, true)
 		}) {
 			return RouteResult{}, ErrRuntimeGenerationBusy
 		}
@@ -270,11 +313,133 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 		var result RouteResult
 		var err error
 		reader.WithRuntimeRead(func() {
-			result, err = r.routeRequest(platName, account, target)
+			result, err = r.routeRequest(platName, account, target, true)
 		})
 		return result, err
 	}
-	return r.routeRequest(platName, account, target)
+	return r.routeRequest(platName, account, target, true)
+}
+
+// RouteRequestForProxy selects a route without mutating the account's sticky
+// lease. Proxy response policy commits exactly one route only after the final
+// response is accepted, so concurrent failed requests cannot create a
+// provisional lease chain that later rollback attempts can corrupt.
+func (r *Router) RouteRequestForProxy(platName, account, target string) (RouteResult, error) {
+	if tryReader, ok := r.pool.(RuntimeGenerationTryReader); ok {
+		var result RouteResult
+		var err error
+		if !tryReader.TryWithRuntimeRead(func() {
+			result, err = r.routeRequest(platName, account, target, false)
+		}) {
+			return RouteResult{}, ErrRuntimeGenerationBusy
+		}
+		return result, err
+	}
+	if reader, ok := r.pool.(RuntimeGenerationReader); ok {
+		var result RouteResult
+		var err error
+		reader.WithRuntimeRead(func() {
+			result, err = r.routeRequest(platName, account, target, false)
+		})
+		return result, err
+	}
+	return r.routeRequest(platName, account, target, false)
+}
+
+// RouteRequestNext selects one never-attempted candidate from the immutable
+// snapshot carried by previous. It does not mutate the sticky lease; callers
+// promote only the route that ultimately succeeds.
+func (r *Router) RouteRequestNext(previous RouteResult, exclusions RouteRetryExclusions) (RouteResult, error) {
+	snapshot := previous.retrySnapshot
+	if r == nil || snapshot == nil || snapshot.platform == nil {
+		return RouteResult{}, ErrNoAvailableNodes
+	}
+	entrySet := make(map[*node.NodeEntry]struct{}, len(exclusions.Entries))
+	for _, entry := range exclusions.Entries {
+		if entry != nil {
+			entrySet[entry] = struct{}{}
+		}
+	}
+	ipSet := make(map[netip.Addr]struct{}, len(exclusions.EgressIPs))
+	for _, ip := range exclusions.EgressIPs {
+		if ip.IsValid() {
+			ipSet[ip] = struct{}{}
+		}
+	}
+
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped || r.pool == nil {
+		return RouteResult{}, ErrRouterStopped
+	}
+	currentPlatform, ok := r.pool.GetPlatform(snapshot.platformID)
+	if !ok || currentPlatform != snapshot.platform {
+		return RouteResult{}, ErrNoAvailableNodes
+	}
+	cooldowns := r.responseCooldowns(snapshot.platformID)
+	now := r.now()
+	for _, candidate := range snapshot.candidates {
+		if _, ok := entrySet[candidate.entry]; ok {
+			continue
+		}
+		if _, ok := ipSet[candidate.ip]; ok {
+			continue
+		}
+		current, ok := r.pool.GetEntry(candidate.hash)
+		if !ok || current != candidate.entry || current.GetEgressIP() != candidate.ip || !current.IsHealthy() || r.pool.IsNodeDisabled(candidate.hash) || !snapshot.platform.ContainsViewEntry(candidate.hash, candidate.entry) {
+			continue
+		}
+		if cooldowns.IsCoolingForEntry(candidate.hash, candidate.entry, candidate.ip, now) {
+			continue
+		}
+		result := RouteResult{
+			PlatformID: snapshot.platform.ID, PlatformName: snapshot.platform.Name,
+			NodeHash: candidate.hash, EgressIP: candidate.ip,
+			RetryBudget: snapshot.budget, ResponseRules: snapshot.platform.ResponseRules,
+			selectedEntry: candidate.entry, platform: snapshot.platform, retrySnapshot: snapshot,
+		}
+		result = withPlatformContext(snapshot.platform, result)
+		if r.nodeTagResolver != nil {
+			result.NodeTag = r.nodeTagResolver(result.NodeHash, result.selectedEntry)
+		}
+		return result, nil
+	}
+	return RouteResult{}, ErrNoAvailableNodes
+}
+
+// CommitRouteForAccount publishes an accepted proxy route as the sticky owner.
+// It is exact-entry guarded so a late response cannot write a new generation's
+// lease.
+func (r *Router) CommitRouteForAccount(route RouteResult, account string) bool {
+	if r == nil || account == "" || route.platform == nil || route.selectedEntry == nil {
+		return false
+	}
+	now := r.now()
+	expiry, err := platform.StickyLeaseExpiryUnixNano(now, route.platform.StickyTTLNs)
+	if err != nil {
+		return false
+	}
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped || r.pool == nil {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false
+	}
+	currentPlatform, platformOK := r.pool.GetPlatform(route.platform.ID)
+	currentEntry, entryOK := r.pool.GetEntry(route.NodeHash)
+	if !platformOK || currentPlatform != route.platform || !entryOK || currentEntry != route.selectedEntry || !currentEntry.IsHealthy() || r.pool.IsNodeDisabled(route.NodeHash) || !route.platform.ContainsViewEntry(route.NodeHash, route.selectedEntry) {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false
+	}
+	r.upsertLeaseUnlocked(route.platform.ID, account, Lease{
+		NodeHash: route.NodeHash, EgressIP: route.EgressIP,
+		CreatedAtNs: now.UnixNano(), LastAccessedNs: now.UnixNano(), ExpiryNs: expiry,
+	}, events)
+	r.lifecycleMu.RUnlock()
+	events.finish()
+	return true
 }
 
 // RouteRequestForPlatform routes with an already captured platform generation.
@@ -293,7 +458,7 @@ func (r *Router) RouteRequestForPlatform(
 		var result RouteResult
 		var err error
 		if !tryReader.TryWithRuntimeRead(func() {
-			result, err = r.routeRequestForPlatform(plat, account, target)
+			result, err = r.routeRequestForPlatform(plat, account, target, true)
 		}) {
 			return RouteResult{}, ErrRuntimeGenerationBusy
 		}
@@ -303,16 +468,43 @@ func (r *Router) RouteRequestForPlatform(
 		var result RouteResult
 		var err error
 		reader.WithRuntimeRead(func() {
-			result, err = r.routeRequestForPlatform(plat, account, target)
+			result, err = r.routeRequestForPlatform(plat, account, target, true)
 		})
 		return result, err
 	}
-	return r.routeRequestForPlatform(plat, account, target)
+	return r.routeRequestForPlatform(plat, account, target, true)
 }
 
-func (r *Router) routeRequest(platName, account, target string) (RouteResult, error) {
+// RouteRequestForProxyForPlatform is the no-side-effect counterpart used by
+// reverse proxy requests after they captured a platform generation.
+func (r *Router) RouteRequestForProxyForPlatform(plat *platform.Platform, account, target string) (RouteResult, error) {
+	if r == nil || plat == nil {
+		return RouteResult{}, ErrPlatformNotFound
+	}
+	if tryReader, ok := r.pool.(RuntimeGenerationTryReader); ok {
+		var result RouteResult
+		var err error
+		if !tryReader.TryWithRuntimeRead(func() {
+			result, err = r.routeRequestForPlatform(plat, account, target, false)
+		}) {
+			return RouteResult{}, ErrRuntimeGenerationBusy
+		}
+		return result, err
+	}
+	if reader, ok := r.pool.(RuntimeGenerationReader); ok {
+		var result RouteResult
+		var err error
+		reader.WithRuntimeRead(func() {
+			result, err = r.routeRequestForPlatform(plat, account, target, false)
+		})
+		return result, err
+	}
+	return r.routeRequestForPlatform(plat, account, target, false)
+}
+
+func (r *Router) routeRequest(platName, account, target string, commitLease bool) (RouteResult, error) {
 	var events *leaseEventBatch
-	if account != "" {
+	if commitLease && account != "" {
 		events = r.newLeaseEventBatch()
 	}
 	r.lifecycleMu.RLock()
@@ -328,12 +520,12 @@ func (r *Router) routeRequest(platName, account, target string) (RouteResult, er
 		events.finish()
 		return RouteResult{}, err
 	}
-	return r.routeRequestLocked(plat, account, target, events)
+	return r.routeRequestLocked(plat, account, target, events, commitLease)
 }
 
-func (r *Router) routeRequestForPlatform(plat *platform.Platform, account, target string) (RouteResult, error) {
+func (r *Router) routeRequestForPlatform(plat *platform.Platform, account, target string, commitLease bool) (RouteResult, error) {
 	var events *leaseEventBatch
-	if account != "" {
+	if commitLease && account != "" {
 		events = r.newLeaseEventBatch()
 	}
 	r.lifecycleMu.RLock()
@@ -342,7 +534,7 @@ func (r *Router) routeRequestForPlatform(plat *platform.Platform, account, targe
 		events.finish()
 		return RouteResult{}, ErrRouterStopped
 	}
-	return r.routeRequestLocked(plat, account, target, events)
+	return r.routeRequestLocked(plat, account, target, events, commitLease)
 }
 
 func (r *Router) routeRequestLocked(
@@ -350,6 +542,7 @@ func (r *Router) routeRequestLocked(
 	account string,
 	target string,
 	events *leaseEventBatch,
+	commitLease bool,
 ) (RouteResult, error) {
 	if hook := r.afterPlatformResolveHook; hook != nil {
 		hook(plat)
@@ -357,23 +550,55 @@ func (r *Router) routeRequestLocked(
 
 	targetDomain := netutil.ExtractDomain(target)
 	state := r.ensurePlatformState(plat.ID)
+	snapshot := r.captureRetrySnapshot(plat, state.ResponseCooldowns, r.now())
+	retryBudget := snapshot.budget
 	var result RouteResult
 	var err error
 	if account == "" {
 		result, err = r.routeRandom(plat, state, targetDomain)
+	} else if commitLease {
+		result, err = r.routeSticky(plat, state, account, targetDomain, r.now(), events)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now(), events)
+		result, err = r.routeStickyReadOnly(plat, state, account, targetDomain, r.now())
 	}
 	r.lifecycleMu.RUnlock()
 	events.finish()
 	if err != nil {
 		return RouteResult{}, err
 	}
+	result.RetryBudget = retryBudget
+	result.platform = plat
+	result.retrySnapshot = snapshot
 	result = withPlatformContext(plat, result)
 	if r.nodeTagResolver != nil {
 		result.NodeTag = r.nodeTagResolver(result.NodeHash, result.selectedEntry)
 	}
 	return result, nil
+}
+
+func (r *Router) captureRetrySnapshot(plat *platform.Platform, cooldowns *ResponseCooldowns, now time.Time) *RouteRetrySnapshot {
+	snapshot := &RouteRetrySnapshot{platform: plat}
+	if plat == nil || r.pool == nil {
+		snapshot.budget = 1
+		return snapshot
+	}
+	snapshot.platformID = plat.ID
+	plat.RangeViewEntries(func(hash node.Hash, published *node.NodeEntry) bool {
+		if published == nil || !published.IsHealthy() || r.pool.IsNodeDisabled(hash) {
+			return true
+		}
+		ip := published.GetEgressIP()
+		if !ip.IsValid() || (cooldowns != nil && cooldowns.IsCoolingForEntry(hash, published, ip, now)) {
+			return true
+		}
+		snapshot.candidates = append(snapshot.candidates, routeRetryCandidate{hash: hash, entry: published, ip: ip})
+		return true
+	})
+	snapshot.budget = len(snapshot.candidates)
+	if snapshot.budget < 1 {
+		snapshot.budget = 1
+	}
+	return snapshot
 }
 
 func withPlatformContext(plat *platform.Platform, res RouteResult) RouteResult {
@@ -468,6 +693,71 @@ func (r *Router) routeSticky(
 	})
 
 	return result, routeErr
+}
+
+func (r *Router) routeStickyReadOnly(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	account string,
+	targetDomain string,
+	now time.Time,
+) (RouteResult, error) {
+	current, loaded := state.Leases.GetLease(account)
+	if loaded && !current.IsExpired(now) {
+		if result, ok := r.tryLeaseHitReadOnly(plat, state, current, now); ok {
+			return result, nil
+		}
+		if result, ok := r.tryLeaseSameIPRotationReadOnly(plat, state, current, targetDomain, now); ok {
+			return result, nil
+		}
+	}
+	return r.routeRandom(plat, state, targetDomain)
+}
+
+func (r *Router) tryLeaseHitReadOnly(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	current Lease,
+	now time.Time,
+) (RouteResult, bool) {
+	entry, ok := r.pool.GetEntry(current.NodeHash)
+	if !ok || entry == nil || !entry.IsHealthy() || r.pool.IsNodeDisabled(current.NodeHash) || !plat.ContainsViewEntry(current.NodeHash, entry) || entry.GetEgressIP() != current.EgressIP || state.ResponseCooldowns.IsCoolingForEntry(current.NodeHash, entry, current.EgressIP, now) {
+		return RouteResult{}, false
+	}
+	return RouteResult{
+		NodeHash:      current.NodeHash,
+		EgressIP:      current.EgressIP,
+		LeaseCreated:  false,
+		selectedEntry: entry,
+	}, true
+}
+
+func (r *Router) tryLeaseSameIPRotationReadOnly(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	current Lease,
+	targetDomain string,
+	now time.Time,
+) (RouteResult, bool) {
+	bestHash, bestEntry, ok := chooseSameIPRotationCandidateWithCooldownEntryAt(
+		plat,
+		r.pool,
+		current.EgressIP,
+		targetDomain,
+		r.authorities(),
+		r.p2cWindow(),
+		state.ResponseCooldowns,
+		now,
+	)
+	if !ok {
+		return RouteResult{}, false
+	}
+	return RouteResult{
+		NodeHash:      bestHash,
+		EgressIP:      current.EgressIP,
+		LeaseCreated:  false,
+		selectedEntry: bestEntry,
+	}, true
 }
 
 func (r *Router) decideStickyLease(
@@ -571,7 +861,7 @@ func (r *Router) tryLeaseHit(
 ) (Lease, RouteResult, bool) {
 	entry, ok := r.pool.GetEntry(current.NodeHash)
 	if !ok || entry == nil || !entry.IsHealthy() || r.pool.IsNodeDisabled(current.NodeHash) || !plat.ContainsViewEntry(current.NodeHash, entry) || entry.GetEgressIP() != current.EgressIP ||
-		state.ResponseCooldowns.IsCoolingForEntry(current.NodeHash, entry, current.EgressIP, time.Now()) {
+		state.ResponseCooldowns.IsCoolingForEntry(current.NodeHash, entry, current.EgressIP, r.now()) {
 		return Lease{}, RouteResult{}, false
 	}
 
@@ -603,7 +893,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	nowNs int64,
 	events leaseEventSink,
 ) (Lease, RouteResult, bool) {
-	bestHash, bestEntry, ok := chooseSameIPRotationCandidateWithCooldownEntry(
+	bestHash, bestEntry, ok := chooseSameIPRotationCandidateWithCooldownEntryAt(
 		plat,
 		r.pool,
 		current.EgressIP,
@@ -611,6 +901,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		r.authorities(),
 		r.p2cWindow(),
 		state.ResponseCooldowns,
+		r.now(),
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -728,7 +1019,7 @@ func (r *Router) selectLiveRandomRoute(
 			if !ok || entry == nil || !entry.IsHealthy() || r.pool.IsNodeDisabled(hash) || !plat.ContainsViewEntry(hash, entry) {
 				return false
 			}
-			return !r.responseCooldowns(plat.ID).IsCoolingForEntry(hash, entry, entry.GetEgressIP(), time.Now())
+			return !r.responseCooldowns(plat.ID).IsCoolingForEntry(hash, entry, entry.GetEgressIP(), r.now())
 		})
 		if err != nil {
 			return node.Zero, nil, err
@@ -779,6 +1070,28 @@ func chooseSameIPRotationCandidateWithCooldownEntry(
 	window time.Duration,
 	cooldowns *ResponseCooldowns,
 ) (node.Hash, *node.NodeEntry, bool) {
+	return chooseSameIPRotationCandidateWithCooldownEntryAt(
+		plat,
+		pool,
+		targetIP,
+		targetDomain,
+		authorities,
+		window,
+		cooldowns,
+		time.Now(),
+	)
+}
+
+func chooseSameIPRotationCandidateWithCooldownEntryAt(
+	plat *platform.Platform,
+	pool PoolAccessor,
+	targetIP netip.Addr,
+	targetDomain string,
+	authorities []string,
+	window time.Duration,
+	cooldowns *ResponseCooldowns,
+	now time.Time,
+) (node.Hash, *node.NodeEntry, bool) {
 	bestKnownHash := node.Zero
 	var bestKnownEntry *node.NodeEntry
 	bestKnownLatency := time.Duration(math.MaxInt64)
@@ -787,7 +1100,7 @@ func chooseSameIPRotationCandidateWithCooldownEntry(
 
 	plat.RangeViewEntries(func(h node.Hash, publishedEntry *node.NodeEntry) bool {
 		entry, ok := pool.GetEntry(h)
-		if !ok || entry == nil || entry != publishedEntry || !entry.IsHealthy() || pool.IsNodeDisabled(h) || entry.GetEgressIP() != targetIP || (cooldowns != nil && cooldowns.IsCoolingForEntry(h, entry, targetIP, time.Now())) {
+		if !ok || entry == nil || entry != publishedEntry || !entry.IsHealthy() || pool.IsNodeDisabled(h) || entry.GetEgressIP() != targetIP || (cooldowns != nil && cooldowns.IsCoolingForEntry(h, entry, targetIP, now)) {
 			return true
 		}
 		if fallbackHash == node.Zero {
@@ -845,7 +1158,7 @@ func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleS
 		hook()
 	}
 	mark := func() {
-		r.responseCooldowns(route.PlatformID).markForEntry(scope, route.NodeHash, route.selectedEntry, route.EgressIP, until, time.Now())
+		r.responseCooldowns(route.PlatformID).markForEntry(scope, route.NodeHash, route.selectedEntry, route.EgressIP, until, r.now())
 	}
 	if executor, ok := r.pool.(ExactEntryExecutor); ok {
 		executor.WithCurrentEntry(route.NodeHash, route.selectedEntry, mark)

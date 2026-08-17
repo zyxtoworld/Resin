@@ -1028,11 +1028,17 @@ func TestAPIContract_PlatformResponseRules(t *testing.T) {
 	rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms", map[string]any{
 		"name": "response-rules",
 		"response_rules": []map[string]any{{
-			"name":           "OpenCode free quota",
-			"status_codes":   []int{429},
-			"response_regex": "FreeUsageLimitError",
-			"scope":          "egress_ip",
-			"cooldown":       "24h",
+			"id":      "quota",
+			"enabled": true,
+			"match": map[string]any{
+				"status_codes": []int{429},
+			},
+			"action": map[string]any{
+				"type":           "cooldown",
+				"cooldown_scope": "egress_ip",
+				"fallback":       "fixed_duration",
+				"fixed_duration": "24h",
+			},
 		}},
 	}, true)
 	if rec.Code != http.StatusCreated {
@@ -1047,10 +1053,16 @@ func TestAPIContract_PlatformResponseRules(t *testing.T) {
 
 	rec = doJSONRequest(t, srv, http.MethodPatch, "/api/v1/platforms/"+platformID, map[string]any{
 		"response_rules": []map[string]any{{
-			"status_codes":  []int{429},
-			"expiry_regex":  "reset_at=([^ ]+)",
-			"expiry_layout": "rfc3339",
-			"scope":         "node",
+			"id":      "quota",
+			"enabled": true,
+			"match": map[string]any{
+				"status_codes": []int{429},
+			},
+			"action": map[string]any{
+				"type":           "cooldown",
+				"cooldown_scope": "route_entry",
+				"fallback":       "next_utc_midnight",
+			},
 		}},
 	}, true)
 	if rec.Code != http.StatusOK {
@@ -1062,17 +1074,60 @@ func TestAPIContract_PlatformResponseRules(t *testing.T) {
 		t.Fatalf("patched response_rules: got %#v", body["response_rules"])
 	}
 	patched, ok := rules[0].(map[string]any)
-	if !ok || patched["scope"] != "node" {
+	if !ok {
 		t.Fatalf("patched response rule: got %#v", rules[0])
+	}
+	if match, ok := patched["match"].(map[string]any); !ok || match["status_codes"].([]any)[0] != float64(429) {
+		t.Fatalf("patched response rule match: got %#v", patched["match"])
 	}
 
 	rec = doJSONRequest(t, srv, http.MethodPatch, "/api/v1/platforms/"+platformID, map[string]any{
-		"response_rules": []map[string]any{{"status_codes": []int{99}, "cooldown": "1h"}},
+		"response_rules": []map[string]any{{
+			"id": "bad", "enabled": true,
+			"match":  map[string]any{"status_codes": []int{99}},
+			"action": map[string]any{"type": "passthrough"},
+		}},
 	}, true)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid response rule status: got %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 	assertErrorCode(t, rec, "INVALID_ARGUMENT")
+
+	for name, rule := range map[string]map[string]any{
+		"old flat schema": {
+			"id": "bad-flat", "enabled": true, "status_codes": []int{429},
+			"action": map[string]any{"type": "passthrough"},
+		},
+		"unknown nested field": {
+			"id": "bad-unknown", "enabled": true,
+			"match":  map[string]any{"status_codes": []int{429}},
+			"action": map[string]any{"type": "passthrough", "unexpected": true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := doJSONRequest(t, srv, http.MethodPatch, "/api/v1/platforms/"+platformID, map[string]any{
+				"response_rules": []map[string]any{rule},
+			}, true)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("invalid schema status: got %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			assertErrorCode(t, rec, "INVALID_ARGUMENT")
+		})
+	}
+
+	rec = doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get after rejected rules: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	body = decodeJSONMap(t, rec)
+	rules, ok = body["response_rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("rejected rule update replaced published rules: %#v", body["response_rules"])
+	}
+	published, ok := rules[0].(map[string]any)
+	if !ok || published["id"] != "quota" {
+		t.Fatalf("published rule changed after rejected update: %#v", rules[0])
+	}
 }
 
 func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {

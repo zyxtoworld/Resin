@@ -1,390 +1,268 @@
 package platform
 
 import (
+	"encoding/json"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
 )
 
-func TestCompileResponseRules_MatchesBodyAndRetryAfter(t *testing.T) {
+func TestResponseRules_GenericActionsAndFirstMatchWins(t *testing.T) {
+	cooldown := model.PlatformResponseRuleAction{
+		Type:          "cooldown",
+		CooldownScope: "egress_ip",
+		Fallback:      "fixed_duration",
+		FixedDuration: "5m",
+	}
+	retry := model.PlatformResponseRuleAction{Type: "retry_next"}
 	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
 		{
-			Name:          "OpenCode free quota",
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			Scope:         "egress_ip",
+			ID: "header-policy", Enabled: true,
+			Match: model.PlatformResponseRuleMatch{
+				StatusCodes: []int{http.StatusForbidden},
+				Headers:     []model.PlatformResponseHeaderMatch{{Name: "X-Quota", Op: "contains", Value: "limited"}},
+			},
+			Action: cooldown,
+		},
+		{
+			ID: "body-policy", Enabled: true,
+			Match:  model.PlatformResponseRuleMatch{StatusRange: []model.PlatformResponseStatusRange{{Min: 500, Max: 599}}, Body: &model.PlatformResponseBodyMatch{Op: "regex", Value: `temporary`}},
+			Action: retry,
 		},
 	})
 	if err != nil {
 		t.Fatalf("CompileResponseRules: %v", err)
 	}
-
 	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	match, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`{"type":"FreeUsageLimitError"}`),
-		http.Header{"Retry-After": []string{"30"}},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected response rule to match")
+	decision, ok := rules.Match(http.StatusForbidden, nil, true, http.Header{"X-Quota": []string{"limited-now"}}, now)
+	if !ok || decision.RuleID != "header-policy" || decision.Action != ResponseRuleActionCooldown || !decision.Cooldown || !decision.Until.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("header decision: %+v, matched=%v", decision, ok)
 	}
-	if match.Scope != ResponseRuleScopeEgressIP {
-		t.Fatalf("scope: got %q, want %q", match.Scope, ResponseRuleScopeEgressIP)
-	}
-	want := now.Add(30 * time.Second)
-	if !match.Until.Equal(want) {
-		t.Fatalf("until: got %s, want %s", match.Until, want)
+	decision, ok = rules.Match(http.StatusBadGateway, []byte("temporary upstream"), true, nil, now)
+	if !ok || decision.RuleID != "body-policy" || !decision.RetryNext() || decision.Cooldown {
+		t.Fatalf("body retry decision: %+v, matched=%v", decision, ok)
 	}
 }
 
-func TestResponseRules_MatchLargeRetryAfterUsesExactDeltaSeconds(t *testing.T) {
+func TestResponseRules_HeaderAndBodyNegativesRequirePresenceAndCompleteBody(t *testing.T) {
 	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
 		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			Scope:         "egress_ip",
+			ID: "negative", Enabled: true,
+			Match: model.PlatformResponseRuleMatch{
+				StatusCodes: []int{http.StatusBadGateway},
+				Headers:     []model.PlatformResponseHeaderMatch{{Name: "X-Mode", Op: "not_contains", Value: "blocked"}},
+				Body:        &model.PlatformResponseBodyMatch{Op: "not_contains", Value: "known-error"},
+			},
+			Action: model.PlatformResponseRuleAction{Type: "retry_next"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("CompileResponseRules: %v", err)
 	}
-
 	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	const seconds int64 = 18_446_744_074
-	match, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`{"type":"FreeUsageLimitError"}`),
-		http.Header{"Retry-After": []string{"18446744074"}},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected response rule to match")
+	if _, ok := rules.Match(http.StatusBadGateway, []byte("safe prefix"), false, http.Header{"X-Mode": []string{"normal"}}, now); ok {
+		t.Fatal("negative body predicate matched an incomplete bounded prefix")
 	}
-	if got, want := match.Until.Unix(), now.Unix()+seconds; got != want {
-		t.Fatalf("until unix seconds: got %d, want %d", got, want)
+	decision, ok := rules.Match(http.StatusBadGateway, []byte("safe complete"), true, http.Header{"X-Mode": []string{"normal"}}, now)
+	if !ok || !decision.RetryNext() {
+		t.Fatalf("complete negative match: %+v, matched=%v", decision, ok)
 	}
-	if got, want := match.Until.Nanosecond(), now.Nanosecond(); got != want {
-		t.Fatalf("until nanoseconds: got %d, want %d", got, want)
+	if _, ok := rules.Match(http.StatusBadGateway, []byte("safe complete"), true, nil, now); ok {
+		t.Fatal("negative header predicate treated absence as a match")
 	}
 }
 
-func TestResponseRules_RetryAfterDeltaSecondBoundaries(t *testing.T) {
-	const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
-	tests := []struct {
-		name      string
-		seconds   int64
-		wantMatch bool
-	}{
-		{
-			name:      "maximum whole duration seconds",
-			seconds:   maxDurationSeconds,
-			wantMatch: true,
-		},
-		{
-			name:      "first value beyond duration range",
-			seconds:   maxDurationSeconds + 1,
-			wantMatch: true,
-		},
-		{
-			name:      "unix deadline overflow",
-			seconds:   math.MaxInt64,
-			wantMatch: false,
-		},
+func TestResponseRules_StatusRangesAndDisabledRules(t *testing.T) {
+	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
+		{ID: "disabled", Enabled: false, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "retry_next"}},
+		{ID: "range", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusRange: []model.PlatformResponseStatusRange{{Min: 404, Max: 499}}}, Action: model.PlatformResponseRuleAction{Type: "retry_next"}},
+	})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
 	}
+	if _, ok := rules.Match(403, nil, true, nil, time.Now()); ok {
+		t.Fatal("disabled rule unexpectedly matched")
+	}
+	if decision, ok := rules.Match(404, nil, true, nil, time.Now()); !ok || decision.RuleID != "range" {
+		t.Fatalf("range decision: %+v, matched=%v", decision, ok)
+	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-				{
-					StatusCodes:   []int{http.StatusTooManyRequests},
-					ResponseRegex: `FreeUsageLimitError`,
-					Scope:         "egress_ip",
+func TestResponseRules_ExpirySourceChainAndUTCFallback(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
+		{
+			ID: "expiry", Enabled: true,
+			Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
+			Action: model.PlatformResponseRuleAction{
+				Type: "cooldown", CooldownScope: "route_entry", Fallback: "next_utc_midnight",
+				ExpirySources: []model.PlatformResponseExpirySource{
+					{Type: "retry_after"},
+					{Type: "header", Header: "X-Reset", Format: "rfc3339_utc"},
+					{Type: "json_pointer", JSONPointer: "/reset", Format: "unix_seconds"},
+					{Type: "body_regex", Regex: `delta=([0-9]+)`, Capture: 1, Format: "delta_seconds"},
 				},
-			})
-			if err != nil {
-				t.Fatalf("CompileResponseRules: %v", err)
-			}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	decision, ok := rules.Match(429, []byte(`{"reset":"bad","delta=30"}`), true, http.Header{"Retry-After": []string{"60"}, "X-Reset": []string{"bad"}}, now)
+	if !ok || !decision.Until.Equal(now.Add(time.Minute)) {
+		t.Fatalf("Retry-After priority: %+v, matched=%v", decision, ok)
+	}
+	reset := now.Add(2 * time.Minute).Unix()
+	decision, ok = rules.Match(429, []byte(`{"reset":0,"delta=30"}`), true, http.Header{"X-Reset": []string{"bad"}}, now)
+	if !ok || !decision.Until.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("body regex fallback: %+v, matched=%v", decision, ok)
+	}
+	decision, ok = rules.Match(429, []byte(`{"reset":`+strconv.FormatInt(reset, 10)+`}`), true, http.Header{"X-Reset": []string{"bad"}}, now)
+	if !ok || !decision.Until.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("JSON pointer source: %+v, matched=%v", decision, ok)
+	}
+	for _, body := range []string{
+		`{"reset":` + strconv.FormatInt(reset, 10) + `} trailing`,
+		`{"reset":` + strconv.FormatInt(reset, 10) + `} {"second":1}`,
+	} {
+		decision, ok = rules.Match(429, []byte(body), true, http.Header{"X-Reset": []string{"bad"}}, now)
+		if !ok || !decision.Until.Equal(wantMidnightForTest(now)) {
+			t.Fatalf("non-single JSON body was trusted: body=%q decision=%+v matched=%v", body, decision, ok)
+		}
+	}
+	decision, ok = rules.Match(429, []byte(`{"reset":0,"delta=bad"}`), true, http.Header{"X-Reset": []string{"bad"}}, now)
+	wantMidnight := wantMidnightForTest(now)
+	if !ok || !decision.Until.Equal(wantMidnight) {
+		t.Fatalf("UTC fallback: %+v, matched=%v", decision, ok)
+	}
+}
 
-			now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-			match, ok := rules.Match(
-				http.StatusTooManyRequests,
-				[]byte(`{"type":"FreeUsageLimitError"}`),
-				http.Header{"Retry-After": []string{strconv.FormatInt(tt.seconds, 10)}},
-				now,
-			)
-			if ok != tt.wantMatch {
-				t.Fatalf("match: got %v, want %v", ok, tt.wantMatch)
-			}
-			if !ok {
-				return
-			}
-			if got, want := match.Until.Unix(), now.Unix()+tt.seconds; got != want {
-				t.Fatalf("until unix seconds: got %d, want %d", got, want)
-			}
-			if got, want := match.Until.Nanosecond(), now.Nanosecond(); got != want {
-				t.Fatalf("until nanoseconds: got %d, want %d", got, want)
+func wantMidnightForTest(now time.Time) time.Time {
+	utc := now.UTC()
+	return time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+func TestResponseRules_ExpirySourcesOnlyUseConfiguredOrder(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	headerUntil := now.Add(2 * time.Minute)
+	header := headerUntil.Format(time.RFC3339)
+
+	makeRules := func(sources []model.PlatformResponseExpirySource) ResponseRules {
+		rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{{
+			ID: "ordered", Enabled: true,
+			Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
+			Action: model.PlatformResponseRuleAction{
+				Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none", ExpirySources: sources,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("CompileResponseRules: %v", err)
+		}
+		return rules
+	}
+
+	decision, ok := makeRules([]model.PlatformResponseExpirySource{{
+		Type: "header", Header: "X-Reset", Format: "rfc3339_utc",
+	}}).Match(429, nil, true, http.Header{
+		"Retry-After": []string{"60"},
+		"X-Reset":     []string{header},
+	}, now)
+	if !ok || !decision.Until.Equal(headerUntil) {
+		t.Fatalf("unconfigured Retry-After overrode configured header: %+v, matched=%v", decision, ok)
+	}
+
+	decision, ok = makeRules([]model.PlatformResponseExpirySource{
+		{Type: "header", Header: "X-Reset", Format: "rfc3339_utc"},
+		{Type: "retry_after"},
+	}).Match(429, nil, true, http.Header{
+		"Retry-After": []string{"60"},
+		"X-Reset":     []string{header},
+	}, now)
+	if !ok || !decision.Until.Equal(headerUntil) {
+		t.Fatalf("header did not win when configured first: %+v, matched=%v", decision, ok)
+	}
+
+	decision, ok = makeRules([]model.PlatformResponseExpirySource{
+		{Type: "retry_after"},
+		{Type: "header", Header: "X-Reset", Format: "rfc3339_utc"},
+	}).Match(429, nil, true, http.Header{
+		"Retry-After": []string{"60"},
+		"X-Reset":     []string{header},
+	}, now)
+	if !ok || !decision.Until.Equal(now.Add(time.Minute)) {
+		t.Fatalf("Retry-After did not win when configured first: %+v, matched=%v", decision, ok)
+	}
+}
+
+func TestResponseRules_ExpiryRejectsPastAndFarFuture(t *testing.T) {
+	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{{
+		ID: "expiry", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown", CooldownScope: "egress_ip", Fallback: "next_utc_midnight", ExpirySources: []model.PlatformResponseExpirySource{{Type: "header", Header: "X-Reset", Format: "unix_seconds"}}},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	for _, raw := range []string{"0", strconv.FormatInt(now.Unix()-1, 10), strconv.FormatInt(now.Add(367*24*time.Hour).Unix(), 10), strconv.FormatInt(math.MaxInt64, 10)} {
+		decision, ok := rules.Match(429, nil, true, http.Header{"X-Reset": []string{raw}}, now)
+		want := time.Date(2026, time.August, 14, 0, 0, 0, 0, time.UTC)
+		if !ok || !decision.Until.Equal(want) {
+			t.Fatalf("reset %q did not use UTC fallback: %+v, matched=%v", raw, decision, ok)
+		}
+	}
+}
+
+func TestCompileResponseRules_RejectsInvalidSchemaAtomically(t *testing.T) {
+	valid := model.PlatformResponseRule{ID: "valid", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}
+	for name, rules := range map[string][]model.PlatformResponseRule{
+		"duplicate id":        {valid, valid},
+		"invalid regex":       {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "regex", Value: "("}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"unknown action":      {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "unknown"}}},
+		"bad range":           {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusRange: []model.PlatformResponseStatusRange{{Min: 500, Max: 400}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"invalid header name": {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Headers: []model.PlatformResponseHeaderMatch{{Name: "X Bad", Op: "exists"}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"body value too long": {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "contains", Value: strings.Repeat("x", responseRuleMaxValueBytes+1)}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := CompileResponseRules("plat-1", rules); err == nil {
+				t.Fatal("expected schema rejection")
 			}
 		})
 	}
-}
 
-func TestResponseRules_MatchRetryAfterHTTPDate(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			Scope:         "egress_ip",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
+	var oldShape model.PlatformResponseRule
+	if err := json.Unmarshal([]byte(`{"id":"x","enabled":true,"status_codes":[429]}`), &oldShape); err == nil {
+		t.Fatal("old flat fields were silently accepted")
 	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	want := now.Add(5 * time.Minute)
-	match, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`{"type":"FreeUsageLimitError"}`),
-		http.Header{"Retry-After": []string{want.Format(http.TimeFormat)}},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected HTTP-date Retry-After to match")
+	for _, raw := range []string{
+		`{"id":"x","enabled":true,"match":{"status_codes":[429],"unknown":true},"action":{"type":"passthrough"}}`,
+		`{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"passthrough"}} trailing`,
+		`{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"passthrough"}} {"another":1}`,
+	} {
+		var rule model.PlatformResponseRule
+		if err := json.Unmarshal([]byte(raw), &rule); err == nil {
+			t.Fatalf("invalid JSON/schema was accepted: %s", raw)
+		}
 	}
-	if !match.Until.Equal(want) {
-		t.Fatalf("until: got %s, want %s", match.Until, want)
+	tooManyHeaders := valid
+	tooManyHeaders.Match.Headers = make([]model.PlatformResponseHeaderMatch, responseRuleMaxHeaders+1)
+	tooManyHeaders.Match.Headers[0] = model.PlatformResponseHeaderMatch{Name: "X-Test", Op: "exists"}
+	if _, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{tooManyHeaders}); err == nil {
+		t.Fatal("too many header predicates were accepted")
 	}
-}
-
-func TestResponseRules_InvalidRetryAfterFallsBackToExpiryRegex(t *testing.T) {
-	for _, retryAfter := range []string{"not-a-date", strconv.FormatInt(math.MaxInt64, 10)} {
-		t.Run(retryAfter, func(t *testing.T) {
-			rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-				{
-					StatusCodes:   []int{http.StatusTooManyRequests},
-					ResponseRegex: `FreeUsageLimitError`,
-					ExpiryRegex:   `reset_at=([^ ]+)`,
-					ExpiryLayout:  "rfc3339",
-					Scope:         "egress_ip",
-				},
-			})
-			if err != nil {
-				t.Fatalf("CompileResponseRules: %v", err)
-			}
-
-			now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-			match, ok := rules.Match(
-				http.StatusTooManyRequests,
-				[]byte(`FreeUsageLimitError reset_at=2026-08-13T12:05:00Z`),
-				http.Header{"Retry-After": []string{retryAfter}},
-				now,
-			)
-			if !ok {
-				t.Fatal("expected expiry_regex fallback to match")
-			}
-			if want := now.Add(5 * time.Minute); !match.Until.Equal(want) {
-				t.Fatalf("until: got %s, want %s", match.Until, want)
-			}
-		})
+	tooManySources := valid
+	tooManySources.Action = model.PlatformResponseRuleAction{
+		Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none",
+		ExpirySources: make([]model.PlatformResponseExpirySource, responseRuleMaxExpirySources+1),
 	}
-}
-
-func TestResponseRules_InvalidRetryAfterFallsBackToCooldown(t *testing.T) {
-	for _, retryAfter := range []string{"not-a-date", strconv.FormatInt(math.MaxInt64, 10)} {
-		t.Run(retryAfter, func(t *testing.T) {
-			rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-				{
-					StatusCodes:   []int{http.StatusServiceUnavailable},
-					ResponseRegex: `temporary outage`,
-					Cooldown:      "2h",
-					Scope:         "node",
-				},
-			})
-			if err != nil {
-				t.Fatalf("CompileResponseRules: %v", err)
-			}
-
-			now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-			match, ok := rules.Match(
-				http.StatusServiceUnavailable,
-				[]byte(`temporary outage`),
-				http.Header{"Retry-After": []string{retryAfter}},
-				now,
-			)
-			if !ok {
-				t.Fatal("expected cooldown fallback to match")
-			}
-			if want := now.Add(2 * time.Hour); !match.Until.Equal(want) {
-				t.Fatalf("until: got %s, want %s", match.Until, want)
-			}
-		})
+	for i := range tooManySources.Action.ExpirySources {
+		tooManySources.Action.ExpirySources[i] = model.PlatformResponseExpirySource{Type: "header", Header: "X-Reset", Format: "unix_seconds"}
 	}
-}
-
-func TestResponseRules_DeadlinePriorityIsHeaderThenExpiryThenCooldown(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			ExpiryRegex:   `reset_at=([^ ]+)`,
-			ExpiryLayout:  "rfc3339",
-			Cooldown:      "2h",
-			Scope:         "egress_ip",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
-	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	body := []byte(`FreeUsageLimitError reset_at=2026-08-13T12:05:00Z`)
-
-	match, ok := rules.Match(
-		http.StatusTooManyRequests,
-		body,
-		http.Header{"Retry-After": []string{"30"}},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected valid Retry-After to match")
-	}
-	if want := now.Add(30 * time.Second); !match.Until.Equal(want) {
-		t.Fatalf("header priority: got %s, want %s", match.Until, want)
-	}
-
-	match, ok = rules.Match(http.StatusTooManyRequests, body, http.Header{}, now)
-	if !ok {
-		t.Fatal("expected expiry_regex to match")
-	}
-	if want := now.Add(5 * time.Minute); !match.Until.Equal(want) {
-		t.Fatalf("expiry priority: got %s, want %s", match.Until, want)
-	}
-
-	match, ok = rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`FreeUsageLimitError reset_at=not-a-date`),
-		http.Header{},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected cooldown fallback to match")
-	}
-	if want := now.Add(2 * time.Hour); !match.Until.Equal(want) {
-		t.Fatalf("cooldown fallback: got %s, want %s", match.Until, want)
-	}
-}
-
-func TestResponseRules_ExpiredRetryAfterRemainsAuthoritative(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			ExpiryRegex:   `reset_at=([^ ]+)`,
-			ExpiryLayout:  "rfc3339",
-			Cooldown:      "2h",
-			Scope:         "egress_ip",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
-	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	if _, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`FreeUsageLimitError reset_at=2026-08-13T12:05:00Z`),
-		http.Header{"Retry-After": []string{"0"}},
-		now,
-	); ok {
-		t.Fatal("expired Retry-After must not fall back to a later body/cooldown deadline")
-	}
-}
-
-func TestCompileResponseRules_WithoutResponseDeadlineDoesNotQuarantine(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			Scope:         "egress_ip",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
-	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	if _, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`{"type":"FreeUsageLimitError"}`),
-		http.Header{},
-		now,
-	); ok {
-		t.Fatal("response without a deadline must not quarantine the route")
-	}
-}
-
-func TestCompileResponseRules_UsesExplicitCooldownAsFallback(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusServiceUnavailable},
-			ResponseRegex: `temporary outage`,
-			Cooldown:      "2h",
-			Scope:         "node",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
-	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	match, ok := rules.Match(
-		http.StatusServiceUnavailable,
-		[]byte(`temporary outage`),
-		http.Header{},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected explicit cooldown to match")
-	}
-	if want := now.Add(2 * time.Hour); !match.Until.Equal(want) {
-		t.Fatalf("until: got %s, want %s", match.Until, want)
-	}
-}
-
-func TestCompileResponseRules_ParsesExpiryFromResponseBody(t *testing.T) {
-	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{
-		{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: `FreeUsageLimitError`,
-			ExpiryRegex:   `reset_at=([^ ]+)`,
-			ExpiryLayout:  "rfc3339",
-			Scope:         "node",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CompileResponseRules: %v", err)
-	}
-
-	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
-	match, ok := rules.Match(
-		http.StatusTooManyRequests,
-		[]byte(`FreeUsageLimitError reset_at=2026-08-13T12:05:00Z`),
-		http.Header{},
-		now,
-	)
-	if !ok {
-		t.Fatal("expected response rule to match")
-	}
-	if match.Scope != ResponseRuleScopeNode {
-		t.Fatalf("scope: got %q, want %q", match.Scope, ResponseRuleScopeNode)
-	}
-	want := now.Add(5 * time.Minute)
-	if !match.Until.Equal(want) {
-		t.Fatalf("until: got %s, want %s", match.Until, want)
+	if _, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{tooManySources}); err == nil {
+		t.Fatal("too many expiry sources were accepted")
 	}
 }

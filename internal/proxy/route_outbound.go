@@ -21,7 +21,7 @@ func resolveRoutedOutbound(
 	account string,
 	target string,
 ) (routedOutbound, *ProxyError) {
-	result, err := router.RouteRequest(platformName, account, target)
+	result, err := router.RouteRequestForProxy(platformName, account, target)
 	if err != nil {
 		return routedOutbound{}, mapRouteError(err)
 	}
@@ -35,7 +35,7 @@ func resolveRoutedOutboundForPlatform(
 	account string,
 	target string,
 ) (routedOutbound, *ProxyError) {
-	result, err := router.RouteRequestForPlatform(plat, account, target)
+	result, err := router.RouteRequestForProxyForPlatform(plat, account, target)
 	if err != nil {
 		return routedOutbound{}, mapRouteError(err)
 	}

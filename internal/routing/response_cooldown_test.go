@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"net/netip"
 	"sync"
 	"testing"
@@ -39,6 +40,28 @@ func TestResponseCooldownsScopesUseIndependentKeys(t *testing.T) {
 	if cooldowns.IsCooling(nodeA, ipA, until) {
 		t.Fatal("cooldown remained active at its exact deadline")
 	}
+}
+
+func TestResponseCooldowns_EgressCooldownSurvivesEntryRebuild(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	hash := node.HashFromRawOptions([]byte(`{"id":"egress-generation"}`))
+	oldEntry := &node.NodeEntry{}
+	newEntry := &node.NodeEntry{}
+	ip := netip.MustParseAddr("198.51.100.60")
+	now := time.Unix(1234, 0)
+	until := now.Add(time.Hour)
+
+	cooldowns.markForEntry(platform.ResponseRuleScopeEgressIP, hash, oldEntry, ip, until, now)
+	if !cooldowns.IsCoolingForEntry(hash, oldEntry, ip, now) {
+		t.Fatal("old entry was not cooled")
+	}
+	if !cooldowns.IsCoolingForEntry(hash, newEntry, ip, now) {
+		t.Fatal("published IP cooldown did not survive entry rebuild")
+	}
+	if !cooldowns.IsCooling(hash, ip, now) {
+		t.Fatal("generic inspection lost the active exact egress cooldown")
+	}
+
 }
 
 func TestResponseCooldowns_IsCoolingRemovesExpiredEntries(t *testing.T) {
@@ -138,13 +161,15 @@ func TestRouter_ResponseCooldownSkipsEgressIPAndRestoresAfterExpiry(t *testing.T
 	pool.rebuildPlatformView(plat)
 
 	router := newTestRouter(pool, nil)
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
 	route := RouteResult{
 		PlatformID:    plat.ID,
 		NodeHash:      blockedHash,
 		EgressIP:      blockedEntry.GetEgressIP(),
 		selectedEntry: blockedEntry,
 	}
-	until := time.Now().Add(100 * time.Millisecond)
+	until := now.Add(time.Minute)
 	router.QuarantineRoute(route, platform.ResponseRuleScopeEgressIP, until)
 
 	for i := 0; i < 20; i++ {
@@ -160,7 +185,7 @@ func TestRouter_ResponseCooldownSkipsEgressIPAndRestoresAfterExpiry(t *testing.T
 	if blockedEntry.GetEgressIP() != netip.MustParseAddr("198.51.100.10") {
 		t.Fatal("test setup unexpectedly changed blocked egress IP")
 	}
-	time.Sleep(120 * time.Millisecond)
+	now = until
 	seenBlocked := false
 	for i := 0; i < 100; i++ {
 		got, err := router.RouteRequest(plat.Name, "", "https://example.com")
@@ -174,6 +199,142 @@ func TestRouter_ResponseCooldownSkipsEgressIPAndRestoresAfterExpiry(t *testing.T
 	}
 	if !seenBlocked {
 		t.Fatal("cooled node did not become eligible after expiry")
+	}
+}
+
+func TestRouter_RouteRequestNextDoesNotCreateCooldown(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-retry-only", "Plat-Retry-Only", nil, nil)
+	plat.PassiveCircuitBreakerDisabled = true
+	pool.addPlatform(plat)
+
+	firstHash, firstEntry := newRoutableEntry(t, `{"id":"retry-only-first"}`, "198.51.100.80")
+	secondHash, secondEntry := newRoutableEntry(t, `{"id":"retry-only-second"}`, "198.51.100.81")
+	pool.addEntry(firstHash, firstEntry)
+	pool.addEntry(secondHash, secondEntry)
+	pool.rebuildPlatformView(plat)
+
+	router := newTestRouter(pool, nil)
+	router.nodeTagResolver = func(hash node.Hash, _ *node.NodeEntry) string {
+		return "tag:" + hash.Hex()
+	}
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+	initial, err := router.RouteRequest(plat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	next, err := router.RouteRequestNext(initial, RouteRetryExclusions{
+		Entries:   []*node.NodeEntry{initial.selectedEntry},
+		EgressIPs: []netip.Addr{initial.EgressIP},
+	})
+	if err != nil {
+		t.Fatalf("retry-only next route: %v", err)
+	}
+	if next.NodeHash == initial.NodeHash || next.EgressIP == initial.EgressIP {
+		t.Fatalf("retry-only selected an attempted candidate: initial=%+v next=%+v", initial, next)
+	}
+	if !next.PassiveCircuitBreakerDisabled {
+		t.Fatal("retry-only route lost platform passive-circuit-breaker setting")
+	}
+	if want := "tag:" + next.NodeHash.Hex(); next.NodeTag != want {
+		t.Fatalf("retry-only route lost exact node tag: got %q want %q", next.NodeTag, want)
+	}
+	cooldowns := router.responseCooldowns(plat.ID)
+	if cooldowns.IsCoolingForEntry(initial.NodeHash, initial.selectedEntry, initial.EgressIP, now) {
+		t.Fatal("retry-only route selection created a cooldown for the attempted entry")
+	}
+}
+
+func TestRouter_ResponseCooldownPersistsAcrossSameIPEndpointRebuild(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-egress-rebuild", "Plat-Egress-Rebuild", nil, nil)
+	pool.addPlatform(plat)
+
+	const raw = `{"id":"egress-rebuild"}`
+	hash, oldEntry := newRoutableEntry(t, raw, "198.51.100.70")
+	pool.addEntry(hash, oldEntry)
+	pool.rebuildPlatformView(plat)
+	router := newTestRouter(pool, nil)
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+
+	initial, err := router.RouteRequest(plat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	until := now.Add(time.Minute)
+	router.QuarantineRoute(initial, platform.ResponseRuleScopeEgressIP, until)
+
+	newEntry := newHealthyEntryForHash(t, hash, []byte(raw), "198.51.100.70")
+	pool.addEntry(hash, newEntry)
+	pool.rebuildPlatformView(plat)
+	if _, err := router.RouteRequest(plat.Name, "", "https://example.com"); !errors.Is(err, ErrNoAvailableNodes) {
+		t.Fatalf("same-IP replacement ignored published cooldown: %v", err)
+	}
+
+	now = until
+	got, err := router.RouteRequest(plat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("route after cooldown expiry: %v", err)
+	}
+	if got.selectedEntry != newEntry {
+		t.Fatalf("route after expiry used entry %p, want rebuilt entry %p", got.selectedEntry, newEntry)
+	}
+}
+
+func TestRouter_LateOldEgressResponseCannotCoolRebuiltEntry(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-late-egress", "Plat-Late-Egress", nil, nil)
+	pool.addPlatform(plat)
+
+	const raw = `{"id":"late-egress"}`
+	hash, oldEntry := newRoutableEntry(t, raw, "198.51.100.71")
+	pool.addEntry(hash, oldEntry)
+	pool.rebuildPlatformView(plat)
+	router := newTestRouter(pool, nil)
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+
+	oldRoute, err := router.RouteRequest(plat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	checked := make(chan struct{})
+	allow := make(chan struct{})
+	router.beforeResponseCooldownMarkHook = func() {
+		close(checked)
+		<-allow
+	}
+	defer func() { router.beforeResponseCooldownMarkHook = nil }()
+
+	quarantineDone := make(chan struct{})
+	go func() {
+		router.QuarantineRoute(oldRoute, platform.ResponseRuleScopeEgressIP, now.Add(time.Minute))
+		close(quarantineDone)
+	}()
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("old response did not reach the publication barrier")
+	}
+
+	newEntry := newHealthyEntryForHash(t, hash, []byte(raw), "198.51.100.71")
+	pool.addEntry(hash, newEntry)
+	pool.rebuildPlatformView(plat)
+	close(allow)
+	select {
+	case <-quarantineDone:
+	case <-time.After(time.Second):
+		t.Fatal("late old response did not finish")
+	}
+
+	got, err := router.RouteRequest(plat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("late old response cooled rebuilt entry: %v", err)
+	}
+	if got.selectedEntry != newEntry {
+		t.Fatalf("late response route used entry %p, want rebuilt entry %p", got.selectedEntry, newEntry)
 	}
 }
 

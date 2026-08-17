@@ -301,7 +301,8 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routing.RouteResult
 	var routeEntry *node.NodeEntry
 	var hasRoute bool
-	var transport *http.Transport
+	var transport http.RoundTripper
+	var retryTransport *reverseRetryRoundTripper
 	domain := netutil.ExtractDomain(parsed.Host)
 	resolve := func(plat *platform.Platform, generationBound bool) {
 		account, _, extractionFailed = p.resolveReverseProxyAccount(parsed, r, plat)
@@ -356,12 +357,27 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if target == nil {
 		return
 	}
+	var nodeHashRaw = route.NodeHash
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
 	} else {
 		transport = p.outboundHTTPTransport(routed)
+		retryTransport = &reverseRetryRoundTripper{
+			router: p.router, pool: p.pool, initial: routed, account: account,
+			transportFor: func(candidate routedOutbound) http.RoundTripper {
+				return p.outboundHTTPTransport(candidate)
+			},
+			onRoute: func(candidate routing.RouteResult, entry *node.NodeEntry) {
+				route = candidate
+				routeEntry = entry
+				nodeHashRaw = candidate.NodeHash
+				routed.Route = candidate
+				routed.Entry = entry
+				lifecycle.setRouteResult(candidate)
+			},
+		}
+		transport = retryTransport
 	}
-	var nodeHashRaw = route.NodeHash
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -422,10 +438,13 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				lifecycle.setNetOK(true)
 				if hasRoute {
 					recordPassiveResultAsync(p.health, route, routeEntry, true)
+					if retryTransport != nil && retryTransport.promotable {
+						p.router.CommitRouteForAccount(route, account)
+						retryTransport.promotable = false
+					}
 				}
 				return nil
 			}
-			applyResponseRules(p.router, route, resp)
 			if resp.Body != nil && resp.Body != http.NoBody {
 				body := resp.Body
 				if detailCfg.Enabled {
@@ -449,6 +468,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setNetOK(true)
 			if hasRoute {
 				recordPassiveResultAsync(p.health, route, routeEntry, true)
+				if retryTransport != nil && retryTransport.promotable {
+					p.router.CommitRouteForAccount(route, account)
+					retryTransport.promotable = false
+				}
 			}
 			return nil
 		},

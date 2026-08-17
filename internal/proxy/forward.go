@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,7 @@ import (
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 )
 
@@ -227,6 +230,92 @@ func prepareForwardOutboundRequest(in *http.Request) *http.Request {
 	return req
 }
 
+const responseRuleRetryBodyLimit = 8 << 20
+
+// replayBodyCapture records a request body while the first upstream attempt
+// consumes it. A retry is allowed only when the entire body was read without
+// an error and stayed within the bounded memory limit.
+type replayBodyCapture struct {
+	src      io.ReadCloser
+	data     bytes.Buffer
+	limit    int
+	overflow bool
+	complete bool
+	failed   bool
+}
+
+func newReplayBodyCapture(src io.ReadCloser) *replayBodyCapture {
+	return &replayBodyCapture{src: src, limit: responseRuleRetryBodyLimit}
+}
+
+func (c *replayBodyCapture) Read(p []byte) (int, error) {
+	n, err := c.src.Read(p)
+	if n > 0 && !c.overflow {
+		remaining := c.limit - c.data.Len()
+		if n > remaining {
+			if remaining > 0 {
+				_, _ = c.data.Write(p[:remaining])
+			}
+			c.overflow = true
+		} else {
+			_, _ = c.data.Write(p[:n])
+		}
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			c.complete = true
+		} else {
+			c.failed = true
+		}
+	}
+	return n, err
+}
+
+func (c *replayBodyCapture) Close() error {
+	if c == nil || c.src == nil {
+		return nil
+	}
+	return c.src.Close()
+}
+
+func (c *replayBodyCapture) Replayable() bool {
+	return c != nil && c.complete && !c.failed && !c.overflow
+}
+
+func (c *replayBodyCapture) Bytes() []byte {
+	if c == nil {
+		return nil
+	}
+	return append([]byte(nil), c.data.Bytes()...)
+}
+
+func requestCanBeReplayed(req *http.Request, capture *replayBodyCapture) bool {
+	if req == nil || req.Method == http.MethodConnect {
+		return false
+	}
+	if capture == nil {
+		return req.Body == nil || req.Body == http.NoBody
+	}
+	return capture.Replayable()
+}
+
+func cloneForwardRequestForRetry(base *http.Request, body []byte) *http.Request {
+	retry := base.Clone(base.Context())
+	retry.RequestURI = ""
+	if len(body) == 0 {
+		retry.Body = http.NoBody
+		retry.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+		retry.ContentLength = 0
+		return retry
+	}
+	retry.Body = io.NopCloser(bytes.NewReader(body))
+	retry.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	retry.ContentLength = int64(len(body))
+	return retry
+}
+
 func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	platName, account, authErr := p.authenticate(r)
 	if authErr != nil {
@@ -239,71 +328,165 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	defer lifecycle.finish()
 	lifecycle.setAccount(account)
 
+	baseReq := prepareForwardOutboundRequest(r)
+	var bodyCapture *replayBodyCapture
+	if baseReq.Body != nil && baseReq.Body != http.NoBody {
+		bodyCapture = newReplayBodyCapture(baseReq.Body)
+		baseReq.Body = bodyCapture
+	}
+	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
+
 	var route routing.RouteResult
 	var routeEntry *node.NodeEntry
 	var hasRoute bool
-	var transport *http.Transport
-	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
-		transport = p.directHTTPTransport()
-	} else {
-		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)
-		if routeErr != nil {
-			lifecycle.setProxyError(routeErr)
-			lifecycle.setHTTPStatus(routeErr.HTTPCode)
-			writeProxyError(w, routeErr)
-			return
+	var resp *http.Response
+	retryBudget := 1
+	attemptedIPs := make(map[string]struct{})
+	attemptedEntries := make(map[*node.NodeEntry]struct{})
+	var pending *routedOutbound
+	finalResponseAccepted := true
+	for attempt := 0; attempt < retryBudget; attempt++ {
+		var transport *http.Transport
+		var routed routedOutbound
+		if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
+			transport = p.directHTTPTransport()
+			hasRoute = false
+		} else {
+			if pending != nil {
+				routed = *pending
+				pending = nil
+			} else {
+				var routeErr *ProxyError
+				routed, routeErr = resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)
+				if routeErr != nil {
+					lifecycle.setProxyError(routeErr)
+					lifecycle.setHTTPStatus(routeErr.HTTPCode)
+					writeProxyError(w, routeErr)
+					return
+				}
+			}
+			if attempt == 0 {
+				retryBudget = routed.Route.RetryBudget
+				if retryBudget < 1 {
+					retryBudget = 1
+				}
+			}
+			if _, duplicateIP := attemptedIPs[routed.Route.EgressIP.String()]; duplicateIP {
+				break
+			}
+			if _, duplicateEntry := attemptedEntries[routed.Entry]; duplicateEntry {
+				break
+			}
+			attemptedIPs[routed.Route.EgressIP.String()] = struct{}{}
+			attemptedEntries[routed.Entry] = struct{}{}
+			route = routed.Route
+			routeEntry = routed.Entry
+			hasRoute = true
+			lifecycle.setRouteResult(route)
+			if p.health != nil {
+				recordLatencyAsync(p.health, route.NodeHash, routeEntry, netutil.ExtractDomain(r.Host), nil)
+			}
+			transport = p.outboundHTTPTransport(routed)
 		}
-		route = routed.Route
-		routeEntry = routed.Entry
-		hasRoute = true
-		lifecycle.setRouteResult(route)
-		if p.health != nil {
-			recordLatencyAsync(p.health, route.NodeHash, routeEntry, netutil.ExtractDomain(r.Host), nil)
-		}
-		transport = p.outboundHTTPTransport(routed)
-	}
-	outReq := prepareForwardOutboundRequest(r)
-	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
-	outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamTrace.clientTrace()))
-	pendingEgressHeaderBytes := headerWireLen(outReq.Header)
-	var egressBodyCounter *countingReadCloser
-	if outReq.Body != nil && outReq.Body != http.NoBody {
-		egressBodyCounter = newCountingReadCloser(outReq.Body)
-		outReq.Body = egressBodyCounter
-	}
 
-	// Forward the request.
-	resp, err := transport.RoundTrip(outReq)
-	if upstreamTrace.shouldCommitEgress() {
-		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
-		if egressBodyCounter != nil {
-			lifecycle.addEgressBytes(egressBodyCounter.Total())
+		var outReq *http.Request
+		if attempt == 0 {
+			outReq = baseReq
+		} else {
+			outReq = cloneForwardRequestForRetry(baseReq, bodyCapture.Bytes())
 		}
-	}
-	if err != nil {
-		proxyErr := classifyUpstreamError(err)
-		if proxyErr == nil {
-			// context.Canceled — skip health recording, close silently.
-			// Request ended due to client-side cancellation before upstream
-			// response; treat as net-ok in request log semantics.
-			lifecycle.setNetOK(true)
+		outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamTrace.clientTrace()))
+		pendingEgressHeaderBytes := headerWireLen(outReq.Header)
+		var egressBodyCounter *countingReadCloser
+		if outReq.Body != nil && outReq.Body != http.NoBody {
+			egressBodyCounter = newCountingReadCloser(outReq.Body)
+			outReq.Body = egressBodyCounter
+		}
+
+		// Forward the request. A response-rule retry is considered only before
+		// any response bytes are written to the downstream client.
+		var roundTripErr error
+		resp, roundTripErr = transport.RoundTrip(outReq)
+		if upstreamTrace.shouldCommitEgress() {
+			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
+			if egressBodyCounter != nil {
+				lifecycle.addEgressBytes(egressBodyCounter.Total())
+			}
+		}
+		if roundTripErr != nil {
+			proxyErr := classifyUpstreamError(roundTripErr)
+			if proxyErr == nil {
+				// context.Canceled — skip health recording, close silently.
+				lifecycle.setNetOK(true)
+				return
+			}
+			lifecycle.setProxyError(proxyErr)
+			lifecycle.setUpstreamError("forward_roundtrip", roundTripErr)
+			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
+			if hasRoute {
+				recordPassiveResultAsync(p.health, route, routeEntry, false)
+			}
+			writeProxyError(w, proxyErr)
 			return
 		}
-		lifecycle.setProxyError(proxyErr)
-		lifecycle.setUpstreamError("forward_roundtrip", err)
-		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
+
+		var responseMatch platform.ResponseRuleMatch
+		matchedRule := false
 		if hasRoute {
-			recordPassiveResultAsync(p.health, route, routeEntry, false)
+			responseMatch, matchedRule = applyResponseRules(p.router, route, resp)
 		}
-		writeProxyError(w, proxyErr)
+		finalResponseAccepted = !matchedRule || responseMatch.Action == platform.ResponseRuleActionPassthrough
+		if matchedRule && responseMatch.RetryNext() && requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget {
+			if r.Context().Err() != nil {
+				_ = resp.Body.Close()
+				lifecycle.setNetOK(true)
+				return
+			}
+			exclusions := routing.RouteRetryExclusions{
+				Entries:   make([]*node.NodeEntry, 0, len(attemptedEntries)),
+				EgressIPs: make([]netip.Addr, 0, len(attemptedIPs)),
+			}
+			for entry := range attemptedEntries {
+				exclusions.Entries = append(exclusions.Entries, entry)
+			}
+			for rawIP := range attemptedIPs {
+				if ip, err := netip.ParseAddr(rawIP); err == nil {
+					exclusions.EgressIPs = append(exclusions.EgressIPs, ip)
+				}
+			}
+			nextRoute, nextErr := p.router.RouteRequestNext(route, exclusions)
+			if nextErr == nil {
+				next, bindErr := bindRoutedOutbound(nextRoute, p.pool)
+				if bindErr != nil {
+					break
+				}
+				if _, duplicateIP := attemptedIPs[next.Route.EgressIP.String()]; duplicateIP {
+					break
+				}
+				if _, duplicateEntry := attemptedEntries[next.Entry]; duplicateEntry {
+					break
+				}
+				_ = resp.Body.Close()
+				pending = &next
+				continue
+			}
+		}
+		break
+	}
+	if resp == nil {
 		return
 	}
 	defer resp.Body.Close()
 
-	lifecycle.setHTTPStatus(resp.StatusCode)
-	if hasRoute {
-		applyResponseRules(p.router, route, resp)
+	// Response headers have been accepted by the response policy and no
+	// downstream bytes have been committed yet. Publish the sticky owner at
+	// this boundary so an open SSE/long-lived body does not leave later
+	// requests without the successful route.
+	if hasRoute && finalResponseAccepted {
+		p.router.CommitRouteForAccount(route, account)
 	}
+
+	lifecycle.setHTTPStatus(resp.StatusCode)
 	lifecycle.setNetOK(true)
 
 	// Copy end-to-end response headers and body.
@@ -409,6 +592,11 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError("connect_client_response_flush", err)
 		lifecycle.setNetOK(false)
 		return
+	}
+	// The CONNECT success response is the acceptance boundary for a tunnel;
+	// publish its sticky owner before relay bytes can flow downstream.
+	if prepare.route.PlatformID != "" {
+		p.router.CommitRouteForAccount(prepare.route, account)
 	}
 	lifecycle.setHTTPStatus(http.StatusOK)
 	relay := pumpPreparedTunnel(clientConn, clientBuf.Reader, prepare.session, tunnelPumpOptions{

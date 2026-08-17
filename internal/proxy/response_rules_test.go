@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"regexp"
 	"testing"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 )
@@ -15,7 +15,7 @@ import (
 func TestInspectResponseRuleBodyRestoresReadError(t *testing.T) {
 	wantErr := errors.New("upstream body reset")
 	resp := &http.Response{Body: &errorBody{
-		data: []byte(`{"type":"FreeUsageLimitError"}`),
+		data: []byte(`{"error":"quota-limited"}`),
 		err:  wantErr,
 	}}
 
@@ -41,18 +41,49 @@ func TestApplyResponseRulesDoesNotReadBodyForNonMatchingStatus(t *testing.T) {
 		Header:     make(http.Header),
 		Body:       body,
 	}
-	route := routing.RouteResult{
-		ResponseRules: platform.ResponseRules{{
-			StatusCodes:   []int{http.StatusTooManyRequests},
-			ResponseRegex: regexp.MustCompile(`quota`),
-			Scope:         platform.ResponseRuleScopeNode,
-		}},
+	rules, err := platform.CompileResponseRules("plat-1", []model.PlatformResponseRule{{
+		ID: "quota", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusTooManyRequests},
+			Body:        &model.PlatformResponseBodyMatch{Op: "regex", Value: `quota`},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown", CooldownScope: "route_entry", Fallback: "next_utc_midnight"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
 	}
+	route := routing.RouteResult{ResponseRules: rules}
 
 	applyResponseRules(routing.NewRouter(routing.RouterConfig{}), route, resp)
 
 	if body.readBytes != 0 {
 		t.Fatalf("body bytes read for non-matching status: got %d, want 0", body.readBytes)
+	}
+}
+
+func TestApplyResponseRules_OversizedBodyNegativePredicateDoesNotMatch(t *testing.T) {
+	payload := append(bytes.Repeat([]byte("safe-"), responseRuleBodyInspectLimit/5+1), []byte("retryable")...)
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(payload)),
+	}
+	rules, err := platform.CompileResponseRules("plat-1", []model.PlatformResponseRule{{
+		ID: "not-retryable", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusBadGateway},
+			Body:        &model.PlatformResponseBodyMatch{Op: "not_contains", Value: "retryable"},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	if _, matched := applyResponseRules(routing.NewRouter(routing.RouterConfig{}), routing.RouteResult{ResponseRules: rules}, resp); matched {
+		t.Fatal("negative body predicate matched an incomplete oversized body")
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close restored body: %v", err)
 	}
 }
 
@@ -126,7 +157,7 @@ func readResponseBodyInChunks(r io.Reader, chunkSize int) ([]byte, error) {
 }
 
 func respBodyBytes(resp *http.Response) []byte {
-	return []byte(`{"type":"FreeUsageLimitError"}`)
+	return []byte(`{"error":"quota-limited"}`)
 }
 
 type errorBody struct {

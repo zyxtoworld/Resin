@@ -1,7 +1,11 @@
 // Package model defines domain structs shared across the persistence layer.
 package model
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+)
 
 // Platform represents a routing platform.
 type Platform struct {
@@ -19,19 +23,75 @@ type Platform struct {
 	UpdatedAtNs                      int64                  `json:"updated_at_ns"`
 }
 
-// PlatformResponseRule describes an upstream HTTP response that should
-// temporarily quarantine the route that produced it. Regexes are matched
-// against the response body; expiry_regex must contain the value to parse in
-// its first capture group. If cooldown is omitted, the response must provide
-// Retry-After or a matching expiry_regex value or the route is not quarantined.
+// PlatformResponseRule describes one ordered, first-match response policy.
+// Match predicates are ANDed and exactly one action is selected. The rule is
+// compiled atomically with the containing platform.
 type PlatformResponseRule struct {
-	Name          string `json:"name,omitempty"`
-	StatusCodes   []int  `json:"status_codes"`
-	ResponseRegex string `json:"response_regex,omitempty"`
-	ExpiryRegex   string `json:"expiry_regex,omitempty"`
-	ExpiryLayout  string `json:"expiry_layout,omitempty"`
-	Cooldown      string `json:"cooldown,omitempty"`
-	Scope         string `json:"scope,omitempty"`
+	ID      string                     `json:"id"`
+	Enabled bool                       `json:"enabled"`
+	Match   PlatformResponseRuleMatch  `json:"match"`
+	Action  PlatformResponseRuleAction `json:"action"`
+}
+
+type PlatformResponseRuleMatch struct {
+	StatusCodes []int                         `json:"status_codes,omitempty"`
+	StatusRange []PlatformResponseStatusRange `json:"status_range,omitempty"`
+	Headers     []PlatformResponseHeaderMatch `json:"headers,omitempty"`
+	Body        *PlatformResponseBodyMatch    `json:"body,omitempty"`
+}
+
+type PlatformResponseStatusRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
+type PlatformResponseHeaderMatch struct {
+	Name  string `json:"name"`
+	Op    string `json:"op"`
+	Value string `json:"value,omitempty"`
+}
+
+type PlatformResponseBodyMatch struct {
+	Op    string `json:"op"`
+	Value string `json:"value"`
+}
+
+type PlatformResponseRuleAction struct {
+	Type          string                         `json:"type"`
+	CooldownScope string                         `json:"cooldown_scope,omitempty"`
+	ExpirySources []PlatformResponseExpirySource `json:"expiry_sources,omitempty"`
+	Fallback      string                         `json:"fallback,omitempty"`
+	FixedDuration string                         `json:"fixed_duration,omitempty"`
+}
+
+type PlatformResponseExpirySource struct {
+	Type        string `json:"type"`
+	Header      string `json:"header,omitempty"`
+	JSONPointer string `json:"json_pointer,omitempty"`
+	Regex       string `json:"regex,omitempty"`
+	Capture     int    `json:"capture,omitempty"`
+	Format      string `json:"format,omitempty"`
+}
+
+// UnmarshalJSON makes response-rule schema drift fail closed. In particular,
+// old flat rule fields must not be silently ignored and become an empty rule.
+func (r *PlatformResponseRule) UnmarshalJSON(data []byte) error {
+	type plain PlatformResponseRule
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	*r = PlatformResponseRule(decoded)
+	return nil
 }
 
 // Subscription represents a node subscription source.

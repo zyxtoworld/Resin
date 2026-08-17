@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 )
 
@@ -14,24 +15,36 @@ const responseRuleBodyInspectLimit = 1 << 20
 // applyResponseRules inspects only responses for which the platform has
 // configured a body rule, then quarantines the route until the parsed deadline.
 // The response body is restored before the caller forwards it to the client.
-func applyResponseRules(router *routing.Router, route routing.RouteResult, resp *http.Response) {
+// It returns whether a rule matched; callers may use that fact to make a
+// bounded, replay-safe retry before writing any response bytes downstream.
+func applyResponseRules(router *routing.Router, route routing.RouteResult, resp *http.Response) (platform.ResponseRuleMatch, bool) {
 	if router == nil || resp == nil || len(route.ResponseRules) == 0 {
-		return
+		return platform.ResponseRuleMatch{}, false
 	}
 
-	var body []byte
+	var inspection responseRuleBodyInspection
 	if route.ResponseRules.NeedsBodyForStatus(resp.StatusCode) {
-		body = inspectResponseRuleBody(resp)
+		inspection = inspectResponseRuleBodyDetailed(resp)
 	}
-	match, ok := route.ResponseRules.Match(resp.StatusCode, body, resp.Header, time.Now())
-	if ok {
+	match, ok := route.ResponseRules.Match(resp.StatusCode, inspection.prefix, inspection.complete, resp.Header, time.Now())
+	if ok && match.Cooldown {
 		router.QuarantineRoute(route, match.Scope, match.Until)
 	}
+	return match, ok
 }
 
 func inspectResponseRuleBody(resp *http.Response) []byte {
+	return inspectResponseRuleBodyDetailed(resp).prefix
+}
+
+type responseRuleBodyInspection struct {
+	prefix   []byte
+	complete bool
+}
+
+func inspectResponseRuleBodyDetailed(resp *http.Response) responseRuleBodyInspection {
 	if resp == nil || resp.Body == nil || resp.Body == http.NoBody {
-		return nil
+		return responseRuleBodyInspection{complete: true}
 	}
 
 	original := resp.Body
@@ -47,7 +60,7 @@ func inspectResponseRuleBody(resp *http.Response) []byte {
 				closer:   original,
 			}
 		}
-		return data
+		return responseRuleBodyInspection{prefix: data, complete: readErr == nil}
 	}
 
 	prefix := append([]byte(nil), data[:responseRuleBodyInspectLimit]...)
@@ -61,7 +74,7 @@ func inspectResponseRuleBody(resp *http.Response) []byte {
 		terminal: readErr,
 		closer:   original,
 	}
-	return prefix
+	return responseRuleBodyInspection{prefix: prefix, complete: false}
 }
 
 type replayReadCloser struct {

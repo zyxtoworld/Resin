@@ -815,8 +815,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 		ID: "plat-1", Name: "Default", StickyTTLNs: 1000,
 		RegexFilters: []string{}, RegionFilters: []string{},
 		ResponseRules: []model.PlatformResponseRule{{
-			Name: "OpenCode quota", StatusCodes: []int{429},
-			ResponseRegex: "FreeUsageLimitError", Scope: "egress_ip", Cooldown: "24h",
+			ID: "quota", Enabled: true,
+			Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
+			Action: model.PlatformResponseRuleAction{Type: "cooldown", CooldownScope: "egress_ip", Fallback: "fixed_duration", FixedDuration: "24h"},
 		}},
 		ReverseProxyMissAction: "TREAT_AS_EMPTY", AllocationPolicy: "BALANCED",
 		PassiveCircuitBreakerDisabled: true,
@@ -843,7 +844,7 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	if !got.PassiveCircuitBreakerDisabled {
 		t.Fatal("expected passive_circuit_breaker_disabled to round-trip true")
 	}
-	if len(got.ResponseRules) != 1 || got.ResponseRules[0].Scope != "egress_ip" || got.ResponseRules[0].Cooldown != "24h" {
+	if len(got.ResponseRules) != 1 || got.ResponseRules[0].ID != "quota" || !got.ResponseRules[0].Enabled || got.ResponseRules[0].Action.CooldownScope != "egress_ip" || got.ResponseRules[0].Action.FixedDuration != "24h" {
 		t.Fatalf("response_rules did not round-trip: %+v", got.ResponseRules)
 	}
 
