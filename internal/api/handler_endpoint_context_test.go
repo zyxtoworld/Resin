@@ -5,13 +5,160 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/service"
 	"github.com/Resinat/Resin/internal/state"
 )
+
+type blockingEndpointRemovalRuntime struct {
+	entered   chan struct{}
+	allow     chan struct{}
+	enterOnce sync.Once
+	allowOnce sync.Once
+}
+
+func (r *blockingEndpointRemovalRuntime) PrepareEndpoint(model.Endpoint) (service.EndpointRuntimeStage, error) {
+	return nil, nil
+}
+
+func (r *blockingEndpointRemovalRuntime) RemoveEndpoint(string) {
+	r.enterOnce.Do(func() { close(r.entered) })
+	<-r.allow
+}
+
+func (r *blockingEndpointRemovalRuntime) EndpointStatus(string) service.EndpointRuntimeStatus {
+	return service.EndpointRuntimeStatus{State: "inactive"}
+}
+
+func (r *blockingEndpointRemovalRuntime) release() {
+	r.allowOnce.Do(func() { close(r.allow) })
+}
+
+func TestListEndpointsHandlerStopsOnCanceledRequestWhileDeleteOwnsEndpointLock(t *testing.T) {
+	_, cp, _ := newControlPlaneTestServer(t)
+	created, err := cp.CreateEndpoint(service.CreateEndpointRequest{
+		Port:    32601,
+		Enabled: func() *bool { value := false; return &value }(),
+	})
+	if err != nil {
+		t.Fatalf("CreateEndpoint: %v", err)
+	}
+	runtime := &blockingEndpointRemovalRuntime{
+		entered: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+	cp.EndpointRuntime = runtime
+	t.Cleanup(runtime.release)
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- cp.DeleteEndpoint(created.ID) }()
+	select {
+	case <-runtime.entered:
+	case <-time.After(time.Second):
+		t.Fatal("delete did not reach runtime removal while holding endpoint lock")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/endpoints", nil).WithContext(requestCtx)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleListEndpoints(cp).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+	cancel()
+
+	returnedBeforeRelease := false
+	select {
+	case <-handlerDone:
+		returnedBeforeRelease = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	runtime.release()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("list handler did not finish after endpoint removal released")
+	}
+	if !returnedBeforeRelease {
+		t.Fatal("canceled list handler remained blocked behind endpoint mutation")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled list handler status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteEndpoint: %v", err)
+	}
+}
+
+func TestGetEndpointHandlerStopsOnCanceledRequestWhileDeleteOwnsEndpointLock(t *testing.T) {
+	_, cp, _ := newControlPlaneTestServer(t)
+	created, err := cp.CreateEndpoint(service.CreateEndpointRequest{
+		Port:    32602,
+		Enabled: func() *bool { value := false; return &value }(),
+	})
+	if err != nil {
+		t.Fatalf("CreateEndpoint: %v", err)
+	}
+	runtime := &blockingEndpointRemovalRuntime{
+		entered: make(chan struct{}),
+		allow:   make(chan struct{}),
+	}
+	cp.EndpointRuntime = runtime
+	t.Cleanup(runtime.release)
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- cp.DeleteEndpoint(created.ID) }()
+	select {
+	case <-runtime.entered:
+	case <-time.After(time.Second):
+		t.Fatal("delete did not reach runtime removal while holding endpoint lock")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/endpoints/"+created.ID,
+		nil,
+	).WithContext(requestCtx)
+	req.SetPathValue("id", created.ID)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleGetEndpoint(cp).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+	cancel()
+
+	returnedBeforeRelease := false
+	select {
+	case <-handlerDone:
+		returnedBeforeRelease = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	runtime.release()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("get handler did not finish after endpoint removal released")
+	}
+	if !returnedBeforeRelease {
+		t.Fatal("canceled get handler remained blocked behind endpoint mutation")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled get handler status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteEndpoint: %v", err)
+	}
+}
 
 func TestUpdateEndpointHandlerStopsOnCanceledRequestDuringSQLiteLock(t *testing.T) {
 	root := t.TempDir()

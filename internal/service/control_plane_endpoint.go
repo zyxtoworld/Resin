@@ -189,13 +189,27 @@ func (s *ControlPlaneService) withEndpointMutationContext(ctx context.Context, f
 }
 
 func (s *ControlPlaneService) ListEndpoints() ([]EndpointResponse, error) {
+	return s.ListEndpointsContext(context.Background())
+}
+
+// ListEndpointsContext lists endpoints while honoring request cancellation
+// while waiting for an endpoint mutation read boundary or the state query.
+func (s *ControlPlaneService) ListEndpointsContext(ctx context.Context) ([]EndpointResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s == nil || s.Engine == nil {
 		return nil, internal("endpoint service is not initialized", nil)
 	}
-	s.endpointMu.RLock()
+	if err := s.endpointMu.rLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.endpointMu.RUnlock()
 
-	custom, err := s.Engine.ListEndpoints()
+	custom, err := s.Engine.ListEndpointsContext(ctx)
 	if err != nil {
 		return nil, internal("list endpoints", err)
 	}
@@ -208,6 +222,18 @@ func (s *ControlPlaneService) ListEndpoints() ([]EndpointResponse, error) {
 }
 
 func (s *ControlPlaneService) GetEndpoint(id string) (*EndpointResponse, error) {
+	return s.GetEndpointContext(context.Background(), id)
+}
+
+// GetEndpointContext returns one endpoint while honoring request cancellation
+// while waiting for an endpoint mutation read boundary or the state query.
+func (s *ControlPlaneService) GetEndpointContext(ctx context.Context, id string) (*EndpointResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if id == DefaultEndpointID {
 		response := s.endpointResponse(s.defaultEndpoint(), "environment", true)
 		return &response, nil
@@ -215,10 +241,12 @@ func (s *ControlPlaneService) GetEndpoint(id string) (*EndpointResponse, error) 
 	if s == nil || s.Engine == nil {
 		return nil, internal("endpoint service is not initialized", nil)
 	}
-	s.endpointMu.RLock()
+	if err := s.endpointMu.rLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.endpointMu.RUnlock()
 
-	endpoint, err := s.Engine.GetEndpoint(id)
+	endpoint, err := s.Engine.GetEndpointContext(ctx, id)
 	if errors.Is(err, state.ErrNotFound) {
 		return nil, notFound("endpoint not found")
 	}

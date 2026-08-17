@@ -55,7 +55,7 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
-		leases, err := cp.ListLeases(platformID)
+		leases, err := cp.ListLeasesContext(r.Context(), platformID)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -120,7 +120,7 @@ func HandleGetLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeServiceError(w, err)
 			return
 		}
-		lease, err := cp.GetLease(platformID, account)
+		lease, err := cp.GetLeaseContext(r.Context(), platformID, account)
 		if err != nil {
 			writeServiceError(w, err)
 			return

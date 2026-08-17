@@ -12,7 +12,7 @@ func HandleListEndpoints(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		endpoints, err := cp.ListEndpoints()
+		endpoints, err := cp.ListEndpointsContext(r.Context())
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -23,7 +23,7 @@ func HandleListEndpoints(cp *service.ControlPlaneService) http.HandlerFunc {
 
 func HandleGetEndpoint(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		endpoint, err := cp.GetEndpoint(PathParam(r, "id"))
+		endpoint, err := cp.GetEndpointContext(r.Context(), PathParam(r, "id"))
 		if err != nil {
 			writeServiceError(w, err)
 			return

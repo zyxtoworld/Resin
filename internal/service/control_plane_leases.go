@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
@@ -71,12 +72,24 @@ func (s *ControlPlaneService) resolveLeaseNodeTagFromHex(hashHex string) string 
 
 // ListLeases returns all leases for a platform.
 func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, error) {
+	return s.ListLeasesContext(context.Background(), platformID)
+}
+
+// ListLeasesContext returns all leases while honoring cancellation before
+// entering the runtime generation read owner.
+func (s *ControlPlaneService) ListLeasesContext(ctx context.Context, platformID string) ([]LeaseResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.beforeLeaseServiceRouterReadHook != nil {
 		s.beforeLeaseServiceRouterReadHook()
 	}
 	var result []LeaseResponse
 	var resultErr error
-	s.withRuntimeRead(func() {
+	if err := s.withRuntimeReadContext(ctx, func() {
 		leases, exists := s.Router.ListLeasesForPlatform(platformID)
 		if !exists {
 			resultErr = notFound("platform not found")
@@ -86,7 +99,9 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 		for _, lease := range leases {
 			result = append(result, leaseToResponse(lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
 		}
-	})
+	}); err != nil {
+		return nil, err
+	}
 	if resultErr != nil {
 		return nil, resultErr
 	}
@@ -95,9 +110,21 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 
 // GetLease returns a single lease.
 func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseResponse, error) {
+	return s.GetLeaseContext(context.Background(), platformID, account)
+}
+
+// GetLeaseContext returns one lease while honoring cancellation before
+// entering the runtime generation read owner.
+func (s *ControlPlaneService) GetLeaseContext(ctx context.Context, platformID, account string) (*LeaseResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var result *LeaseResponse
 	var resultErr error
-	s.withRuntimeRead(func() {
+	if err := s.withRuntimeReadContext(ctx, func() {
 		ml, exists := s.Router.ReadLeaseForPlatform(model.LeaseKey{PlatformID: platformID, Account: account})
 		if !exists {
 			resultErr = notFound("platform not found")
@@ -109,7 +136,9 @@ func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseRespon
 		}
 		resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
 		result = &resp
-	})
+	}); err != nil {
+		return nil, err
+	}
 	if resultErr != nil {
 		return nil, resultErr
 	}

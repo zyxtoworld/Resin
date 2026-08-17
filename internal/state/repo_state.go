@@ -511,7 +511,16 @@ func (r *StateRepo) DeletePlatformContext(ctx context.Context, id string) error 
 
 // GetPlatformName returns platform name by ID without decoding filter columns.
 func (r *StateRepo) GetPlatformName(id string) (string, error) {
-	row := r.db.QueryRow(`SELECT name FROM platforms WHERE id = ?`, id)
+	return r.GetPlatformNameContext(context.Background(), id)
+}
+
+// GetPlatformNameContext returns a platform name while honoring ctx during
+// the SQLite query.
+func (r *StateRepo) GetPlatformNameContext(ctx context.Context, id string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := r.db.QueryRowContext(ctx, `SELECT name FROM platforms WHERE id = ?`, id)
 	var name string
 	if err := row.Scan(&name); err != nil {
 		if err == sql.ErrNoRows {
@@ -857,7 +866,16 @@ func (r *StateRepo) GetEndpointContext(ctx context.Context, id string) (*model.E
 
 // ListEndpoints returns all persisted custom endpoints ordered by port.
 func (r *StateRepo) ListEndpoints() ([]model.Endpoint, error) {
-	rows, err := r.db.Query(`
+	return r.ListEndpointsContext(context.Background())
+}
+
+// ListEndpointsContext returns all persisted custom endpoints while honoring
+// caller cancellation during the SQLite read.
+func (r *StateRepo) ListEndpointsContext(ctx context.Context) ([]model.Endpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
 		       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
 		FROM endpoints ORDER BY port ASC

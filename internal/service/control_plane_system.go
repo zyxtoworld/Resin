@@ -104,13 +104,37 @@ func (m *cancellableRWMutex) ensure() {
 }
 
 func (m *cancellableRWMutex) RLock() {
+	_ = m.rLockContext(context.Background())
+}
+
+func (m *cancellableRWMutex) rLockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.ensure()
 	m.mu.Lock()
-	for m.writer || m.waitingWriters > 0 {
+	stopWake := context.AfterFunc(ctx, func() {
+		m.mu.Lock()
+		m.cond.Broadcast()
+		m.mu.Unlock()
+	})
+	for {
+		if !m.writer && m.waitingWriters == 0 {
+			m.readers++
+			m.mu.Unlock()
+			stopWake()
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			m.mu.Unlock()
+			stopWake()
+			return err
+		}
 		m.cond.Wait()
 	}
-	m.readers++
-	m.mu.Unlock()
 }
 
 func (m *cancellableRWMutex) RUnlock() {
@@ -308,6 +332,11 @@ type ControlPlaneService struct {
 	// platform read enters the service-owned platform generation boundary.
 	// Production leaves it nil.
 	beforePlatformReadHook func()
+
+	// beforePlatformModelReadHook is a package-test seam immediately before a
+	// persisted platform model/name read. The context identifies whether the
+	// caller propagated its request cancellation. Production leaves it nil.
+	beforePlatformModelReadHook func(context.Context)
 
 	// afterPlatformPersistHook is a package-test seam after the platform row is
 	// persisted and before the runtime pool publish. Production leaves it nil.

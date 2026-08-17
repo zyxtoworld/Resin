@@ -49,7 +49,7 @@ func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		subs, err := cp.ListSubscriptions(enabled)
+		subs, err := cp.ListSubscriptionsContext(r.Context(), enabled)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -85,7 +85,7 @@ func HandleGetSubscription(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		s, err := cp.GetSubscription(id)
+		s, err := cp.GetSubscriptionContext(r.Context(), id)
 		if err != nil {
 			writeServiceError(w, err)
 			return

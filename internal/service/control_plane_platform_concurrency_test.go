@@ -135,6 +135,181 @@ func TestUpdatePlatformContext_WithLiveRequestContextReturnsSuccess(t *testing.T
 	}
 }
 
+func TestUpdatePlatformContext_CancellationInterruptsPostLockModelRead(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+
+	name := "platform-post-lock-read-cancel"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("seed CreatePlatform: %v", err)
+	}
+
+	loadEntered := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var loadOnce sync.Once
+	cp.beforePlatformModelReadHook = func(readCtx context.Context) {
+		loadOnce.Do(func() { close(loadEntered) })
+		if readCtx.Done() == nil {
+			<-releaseLoad
+			return
+		}
+		select {
+		case <-readCtx.Done():
+		case <-releaseLoad:
+		}
+	}
+	defer func() {
+		select {
+		case <-releaseLoad:
+		default:
+			close(releaseLoad)
+		}
+	}()
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := cp.UpdatePlatformContext(requestCtx, created.ID, []byte(`{"sticky_ttl":"2h"}`))
+		updateDone <- updateErr
+	}()
+
+	select {
+	case <-loadEntered:
+	case <-time.After(time.Second):
+		t.Fatal("UpdatePlatformContext did not reach post-lock model-read boundary")
+	}
+	cancel()
+	returnedBeforeRelease := false
+	select {
+	case updateErr := <-updateDone:
+		returnedBeforeRelease = true
+		if !errors.Is(updateErr, context.Canceled) {
+			t.Fatalf("UpdatePlatformContext error = %v, want context.Canceled", updateErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(releaseLoad)
+	if !returnedBeforeRelease {
+		select {
+		case <-updateDone:
+		case <-time.After(time.Second):
+			t.Fatal("UpdatePlatformContext did not finish after releasing model-read seam")
+		}
+		t.Fatal("canceled UpdatePlatformContext remained blocked on non-context model read")
+	}
+}
+
+func TestResetPlatformToDefaultContext_CancellationInterruptsPostLockNameRead(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+
+	name := "platform-reset-post-lock-read-cancel"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("seed CreatePlatform: %v", err)
+	}
+
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var readOnce sync.Once
+	cp.beforePlatformModelReadHook = func(readCtx context.Context) {
+		readOnce.Do(func() { close(readEntered) })
+		if readCtx.Done() == nil {
+			<-releaseRead
+			return
+		}
+		select {
+		case <-readCtx.Done():
+		case <-releaseRead:
+		}
+	}
+	defer func() {
+		select {
+		case <-releaseRead:
+		default:
+			close(releaseRead)
+		}
+	}()
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resetDone := make(chan error, 1)
+	go func() {
+		_, resetErr := cp.ResetPlatformToDefaultContext(requestCtx, created.ID)
+		resetDone <- resetErr
+	}()
+
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ResetPlatformToDefaultContext did not reach post-lock name-read boundary")
+	}
+	cancel()
+
+	returnedBeforeRelease := false
+	select {
+	case resetErr := <-resetDone:
+		returnedBeforeRelease = true
+		if !errors.Is(resetErr, context.Canceled) {
+			t.Fatalf("ResetPlatformToDefaultContext error = %v, want context.Canceled", resetErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(releaseRead)
+	if !returnedBeforeRelease {
+		select {
+		case <-resetDone:
+		case <-time.After(time.Second):
+			t.Fatal("ResetPlatformToDefaultContext did not finish after releasing name-read seam")
+		}
+		t.Fatal("canceled ResetPlatformToDefaultContext remained blocked on non-context name read")
+	}
+}
+
 func TestUpdatePlatformContextCancellationWhileAnotherMutationOwnsPlatformLock(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(

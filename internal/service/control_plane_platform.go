@@ -458,11 +458,10 @@ func (s *ControlPlaneService) ListPlatformsContext(ctx context.Context) ([]Platf
 	return resp, nil
 }
 
-func (s *ControlPlaneService) getPlatformModel(id string) (*model.Platform, error) {
-	return s.getPlatformModelContext(context.Background(), id)
-}
-
 func (s *ControlPlaneService) getPlatformModelContext(ctx context.Context, id string) (*model.Platform, error) {
+	if s.beforePlatformModelReadHook != nil {
+		s.beforePlatformModelReadHook(ctx)
+	}
 	p, err := s.Engine.GetPlatformContext(ctx, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
@@ -474,6 +473,13 @@ func (s *ControlPlaneService) getPlatformModelContext(ctx context.Context, id st
 		return nil, internal("get platform", err)
 	}
 	return p, nil
+}
+
+func (s *ControlPlaneService) getPlatformNameContext(ctx context.Context, id string) (string, error) {
+	if s.beforePlatformModelReadHook != nil {
+		s.beforePlatformModelReadHook(ctx)
+	}
+	return s.Engine.GetPlatformNameContext(ctx, id)
 }
 
 // GetPlatform returns a single platform by ID.
@@ -654,7 +660,7 @@ func (s *ControlPlaneService) UpdatePlatformContext(ctx context.Context, id stri
 	}
 
 	// Load current.
-	current, err := s.getPlatformModel(id)
+	current, err := s.getPlatformModelContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -799,7 +805,7 @@ func (s *ControlPlaneService) DeletePlatformContext(ctx context.Context, id stri
 		return conflict("cannot delete Default platform")
 	}
 	if _, ok := s.Pool.GetPlatform(id); !ok {
-		if _, err := s.Engine.GetPlatformName(id); err != nil {
+		if _, err := s.getPlatformNameContext(ctx, id); err != nil {
 			if errors.Is(err, state.ErrNotFound) {
 				return notFound("platform not found")
 			}
@@ -847,7 +853,7 @@ func (s *ControlPlaneService) ResetPlatformToDefaultContext(ctx context.Context,
 	}
 	defer s.platformMu.Unlock()
 
-	name, err := s.Engine.GetPlatformName(id)
+	name, err := s.getPlatformNameContext(ctx, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return nil, notFound("platform not found")
