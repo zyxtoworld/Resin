@@ -29,18 +29,59 @@ func (g *runtimeBatchGate) init() {
 }
 
 func (g *runtimeBatchGate) readLock() {
+	_ = g.readLockContext(context.Background())
+}
+
+func (g *runtimeBatchGate) readLockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	g.init()
 	g.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		g.mu.Unlock()
+		return err
+	}
 	if g.writer || g.waitingWriter > 0 {
 		if hook := g.afterReaderBlocked; hook != nil {
 			hook()
 		}
 	}
+	var stopWake func() bool
+	if ctx.Done() != nil {
+		stopWake = context.AfterFunc(ctx, func() {
+			g.mu.Lock()
+			g.cond.Broadcast()
+			g.mu.Unlock()
+		})
+	}
 	for g.writer || g.waitingWriter > 0 {
+		if err := ctx.Err(); err != nil {
+			g.mu.Unlock()
+			if stopWake != nil {
+				stopWake()
+			}
+			return err
+		}
 		g.cond.Wait()
+	}
+	if err := ctx.Err(); err != nil {
+		g.mu.Unlock()
+		if stopWake != nil {
+			stopWake()
+		}
+		return err
 	}
 	g.readers++
 	g.mu.Unlock()
+	if stopWake != nil {
+		stopWake()
+	}
+	return nil
 }
 
 func (g *runtimeBatchGate) readUnlock() {

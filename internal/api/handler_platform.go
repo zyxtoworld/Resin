@@ -190,7 +190,7 @@ func HandleRebuildPlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if err := cp.RebuildPlatformView(id); err != nil {
+		if err := cp.RebuildPlatformViewContext(r.Context(), id); err != nil {
 			writeServiceError(w, err)
 			return
 		}

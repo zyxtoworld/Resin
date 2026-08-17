@@ -441,15 +441,26 @@ func (p *GlobalNodePool) WithRuntimeMutationContext(ctx context.Context, fn func
 // WithRuntimeRead observes one complete subscription/node/platform
 // generation. It is the read-side counterpart of WithRuntimeMutation.
 func (p *GlobalNodePool) WithRuntimeRead(fn func()) {
+	_ = p.WithRuntimeReadContext(context.Background(), fn)
+}
+
+// WithRuntimeReadContext observes one complete runtime generation while
+// allowing a request-bound caller to abandon admission if a refresh owns the
+// write side. Cancellation is only effective before the read owner is
+// admitted; an admitted callback still runs to completion.
+func (p *GlobalNodePool) WithRuntimeReadContext(ctx context.Context, fn func()) error {
 	if p == nil || fn == nil {
-		return
+		return nil
 	}
 	if hook := p.beforeRuntimeReadLockHook; hook != nil {
 		hook()
 	}
-	p.runtimeBatchMu.readLock()
+	if err := p.runtimeBatchMu.readLockContext(ctx); err != nil {
+		return err
+	}
 	defer p.runtimeBatchMu.readUnlock()
 	fn()
+	return nil
 }
 
 // TryWithRuntimeRead runs fn only when a complete runtime generation can be

@@ -852,11 +852,17 @@ func (s *ControlPlaneService) ResetPlatformToDefaultContext(ctx context.Context,
 
 // RebuildPlatformView triggers a full rebuild of the platform's routable view.
 func (s *ControlPlaneService) RebuildPlatformView(id string) error {
+	return s.RebuildPlatformViewContext(context.Background(), id)
+}
+
+// RebuildPlatformViewContext triggers a full rebuild while allowing an HTTP
+// caller to abandon runtime-batch admission when its request is canceled.
+func (s *ControlPlaneService) RebuildPlatformViewContext(ctx context.Context, id string) error {
 	if s.beforePlatformRebuildHook != nil {
 		s.beforePlatformRebuildHook()
 	}
 	var rebuildErr error
-	s.Pool.WithRuntimeRead(func() {
+	if err := s.Pool.WithRuntimeReadContext(ctx, func() {
 		plat, ok := s.Pool.GetPlatform(id)
 		if !ok {
 			rebuildErr = notFound("platform not found")
@@ -865,7 +871,9 @@ func (s *ControlPlaneService) RebuildPlatformView(id string) error {
 		if !s.Pool.RebuildPlatformIfCurrent(id, plat) {
 			rebuildErr = notFound("platform not found")
 		}
-	})
+	}); err != nil {
+		return err
+	}
 	return rebuildErr
 }
 

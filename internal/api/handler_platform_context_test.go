@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/service"
 	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/topology"
@@ -120,5 +122,77 @@ func TestCreatePlatformHandlerStopsOnCanceledRequestDuringSQLiteLock(t *testing.
 	}
 	if _, ok := pool.GetPlatformByName("canceled-platform-create"); ok {
 		t.Fatal("canceled platform create left a runtime platform")
+	}
+}
+
+func TestRebuildPlatformHandlerStopsOnCanceledRuntimeBatchRead(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	platformID := "00000000-0000-0000-0000-000000000001"
+	if err := pool.RegisterPlatform(platform.NewPlatform(platformID, "rebuild-cancel", nil, nil)); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+	cp := &service.ControlPlaneService{Pool: pool}
+
+	mutationEntered := make(chan struct{})
+	allowMutation := make(chan struct{})
+	mutationDone := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseMutation := func() { releaseOnce.Do(func() { close(allowMutation) }) }
+	t.Cleanup(func() {
+		releaseMutation()
+		select {
+		case <-mutationDone:
+		case <-time.After(time.Second):
+			t.Error("runtime mutation owner did not finish during cleanup")
+		}
+	})
+
+	go func() {
+		pool.WithRuntimeMutation(func() {
+			close(mutationEntered)
+			<-allowMutation
+		})
+		close(mutationDone)
+	}()
+	select {
+	case <-mutationEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not acquire its write owner")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/platforms/"+platformID+"/actions/rebuild-routable-view",
+		nil,
+	).WithContext(requestCtx)
+	req.SetPathValue("id", platformID)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleRebuildPlatform(cp).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+
+	cancel()
+	select {
+	case <-handlerDone:
+		if rec.Code == http.StatusOK {
+			t.Fatalf("canceled rebuild returned success")
+		}
+	case <-time.After(250 * time.Millisecond):
+		releaseMutation()
+		<-handlerDone
+		t.Fatal("canceled rebuild remained blocked on runtime batch read owner")
+	}
+
+	releaseMutation()
+	select {
+	case <-mutationDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not finish after release")
 	}
 }
