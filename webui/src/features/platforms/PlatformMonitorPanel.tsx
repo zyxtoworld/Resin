@@ -3,7 +3,6 @@ import { Activity, AlertTriangle, Clock3, Layers, Link2, ShieldCheck, Waypoints 
 import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Bar, BarChart, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import type { TooltipPayloadEntry } from "recharts";
 import { Badge } from "../../components/ui/Badge";
 import { Card } from "../../components/ui/Card";
 import { Select } from "../../components/ui/Select";
@@ -64,7 +63,13 @@ type HistogramBarPoint = {
   count: number;
 };
 
-type ChartTooltipPayload = ReadonlyArray<TooltipPayloadEntry>;
+type ChartTooltipPayloadEntry = {
+  dataKey?: string | number;
+  value?: unknown;
+  payload?: unknown;
+};
+
+type ChartTooltipPayload = ReadonlyArray<ChartTooltipPayloadEntry>;
 
 type LatencyHistogramProps = {
   buckets: LatencyBucket[];
