@@ -11,6 +11,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/subscription"
@@ -28,7 +29,7 @@ func newRetryWiringTestRuntime(
 	t *testing.T,
 	geoEntered chan<- struct{},
 	allowGeo <-chan struct{},
-) (*topology.GlobalNodePool, *routing.Router, node.Hash) {
+) (*topology.GlobalNodePool, *routing.Router, node.Hash, *subscription.Subscription) {
 	t.Helper()
 
 	subManager := topology.NewSubscriptionManager()
@@ -90,13 +91,13 @@ func newRetryWiringTestRuntime(
 		Authorities: func() []string { return []string{"example.com"} },
 		P2CWindow:   func() time.Duration { return 10 * time.Minute },
 	})
-	return pool, router, hash
+	return pool, router, hash, sub
 }
 
 func TestWireRetryDownloader_CancelDoesNotLeaveRouteRequest(t *testing.T) {
 	geoEntered := make(chan struct{}, 1)
 	allowGeo := make(chan struct{})
-	pool, router, retryHash := newRetryWiringTestRuntime(t, geoEntered, allowGeo)
+	pool, router, retryHash, _ := newRetryWiringTestRuntime(t, geoEntered, allowGeo)
 	routeReachedAfterCancel := make(chan struct{}, 1)
 	router = routing.NewRouter(routing.RouterConfig{
 		Pool:        pool,
@@ -191,7 +192,7 @@ func TestWireRetryDownloader_CancelDoesNotLeaveRouteRequest(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("platform replacement did not complete after release")
 		}
-		if _, err := retryDL.NodePicker(context.Background(), "https://example.com/retry"); !errors.Is(err, topology.ErrNoAvailableOutbound) {
+		if _, err := retryDL.NodePicker(context.Background(), "https://example.com/retry", nil); !errors.Is(err, topology.ErrNoAvailableOutbound) {
 			t.Fatalf("picker after publishing filtered replacement = %v, want ErrNoAvailableOutbound", err)
 		}
 	case <-time.After(time.Second):
@@ -202,5 +203,52 @@ func TestWireRetryDownloader_CancelDoesNotLeaveRouteRequest(t *testing.T) {
 		case <-time.After(time.Second):
 		}
 		t.Fatal("retry download reached neither the production route nor proxy fetch")
+	}
+}
+
+func TestWireRetryDownloader_UsesDistinctDefaultPoolEntries(t *testing.T) {
+	pool, _, _, sub := newRetryWiringTestRuntime(t, nil, nil)
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.41","server_port":443}`)
+	secondHash := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(secondHash, subscription.ManagedNode{Tags: []string{"retry"}})
+	pool.AddNodeFromSub(secondHash, raw, "retry-sub")
+	secondEntry, ok := pool.GetEntry(secondHash)
+	if !ok {
+		t.Fatal("second retry node missing")
+	}
+	secondOutbound := testutil.NewNoopOutbound()
+	secondEntry.Outbound.Store(&secondOutbound)
+	secondEntry.SetEgressIP(netip.MustParseAddr("203.0.113.41"))
+	secondEntry.LatencyTable.Update("example.com", 25*time.Millisecond, 10*time.Minute)
+	pool.RecordResult(secondHash, true)
+	pool.NotifyNodeDirty(secondHash)
+
+	manager := outbound.NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+	app := &resinApp{topoRuntime: &topologyRuntime{pool: pool, outboundMgr: manager}}
+	retryDL := &netutil.RetryDownloader{
+		Direct: retryTestDownloaderFunc(func(_ context.Context, url string) ([]byte, error) {
+			return nil, &netutil.HTTPStatusError{StatusCode: 503, URL: url}
+		}),
+	}
+	app.wireRetryDownloader(retryDL)
+
+	seen := make([]node.Hash, 0, 2)
+	retryDL.ProxyFetch = func(_ context.Context, selection netutil.NodeSelection, _ string) ([]byte, error) {
+		seen = append(seen, selection.Hash)
+		if len(seen) == 1 {
+			return nil, errors.New("first production proxy candidate failed")
+		}
+		return []byte(`{"outbounds":[{"type":"shadowsocks","tag":"downloaded","server":"1.1.1.1","server_port":443}]}`), nil
+	}
+
+	body, err := retryDL.Download(context.Background(), "https://example.com/subscription")
+	if err != nil {
+		t.Fatalf("expected second production candidate to succeed, got %v", err)
+	}
+	if len(seen) != 2 || seen[0] == seen[1] {
+		t.Fatalf("production picker reused a failed candidate: seen=%v", seen)
+	}
+	if len(body) == 0 {
+		t.Fatal("production retry returned an empty subscription body")
 	}
 }

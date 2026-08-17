@@ -33,6 +33,12 @@ func makeMockFetcher(body []byte, err error) func(context.Context, string) ([]by
 	}
 }
 
+type retrySchedulerDownloaderFunc func(context.Context, string) ([]byte, error)
+
+func (f retrySchedulerDownloaderFunc) Download(ctx context.Context, url string) ([]byte, error) {
+	return f(ctx, url)
+}
+
 func makeSubscriptionJSON(outbounds ...string) []byte {
 	arr := "["
 	for i, o := range outbounds {
@@ -217,6 +223,64 @@ func TestScheduler_UpdateSubscription_FetchFailure(t *testing.T) {
 	}
 	if pool.Size() != 0 {
 		t.Fatalf("pool should be empty after fetch failure, got %d", pool.Size())
+	}
+}
+
+func TestScheduler_UpdateSubscription_RetryDownloaderUsesDistinctCandidates(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("retry-scheduler", "Retry Scheduler", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	first := netutil.NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"scheduler-retry-a"}`))}
+	second := netutil.NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"scheduler-retry-b"}`))}
+	var pickerCalls, proxyCalls int
+	retryDL := &netutil.RetryDownloader{
+		Direct: retrySchedulerDownloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
+			return nil, &netutil.HTTPStatusError{StatusCode: 503, URL: "https://example.com/sub"}
+		}),
+		NodePicker: func(_ context.Context, _ string, attempted []netutil.NodeSelection) (netutil.NodeSelection, error) {
+			pickerCalls++
+			switch len(attempted) {
+			case 0:
+				return first, nil
+			case 1:
+				if attempted[0].Hash != first.Hash {
+					t.Fatalf("retry picker received wrong first candidate: %v", attempted)
+				}
+				return second, nil
+			default:
+				return netutil.NodeSelection{}, errors.New("scheduler retry candidates exhausted")
+			}
+		},
+		ProxyFetch: func(_ context.Context, selection netutil.NodeSelection, _ string) ([]byte, error) {
+			proxyCalls++
+			if selection.Hash == first.Hash {
+				return nil, errors.New("first scheduler proxy candidate failed")
+			}
+			if selection.Hash == second.Hash {
+				return makeSubscriptionJSON(`{"type":"shadowsocks","tag":"retried","server":"1.1.1.1","server_port":443}`), nil
+			}
+			return nil, errors.New("unexpected scheduler retry candidate")
+		},
+	}
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Downloader: retryDL,
+	})
+
+	if !sched.UpdateSubscription(sub) {
+		t.Fatal("refresh was not admitted")
+	}
+	if got := sub.GetLastError(); got != "" {
+		t.Fatalf("retry downloader refresh failed: %q", got)
+	}
+	if pickerCalls != 2 || proxyCalls != 2 {
+		t.Fatalf("expected two distinct proxy attempts, picker=%d proxy=%d", pickerCalls, proxyCalls)
+	}
+	if pool.Size() != 1 {
+		t.Fatalf("expected retried subscription to publish one node, got %d", pool.Size())
 	}
 }
 

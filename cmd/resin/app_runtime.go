@@ -308,8 +308,14 @@ func (a *resinApp) wireRetryDownloader(retryDL *netutil.RetryDownloader) {
 	// Resource downloads have no account or sticky-lease semantics. Pick from
 	// the published Default platform view without entering Router's lifecycle
 	// lock or creating routing state.
-	retryDL.NodePicker = func(ctx context.Context, _ string) (netutil.NodeSelection, error) {
-		hash, entry, err := a.topoRuntime.pool.PickDefaultPlatformOutbound(ctx)
+	retryDL.NodePicker = func(ctx context.Context, _ string, attempted []netutil.NodeSelection) (netutil.NodeSelection, error) {
+		excluded := make([]node.Hash, 0, len(attempted))
+		for _, selection := range attempted {
+			if selection.Hash != node.Zero {
+				excluded = append(excluded, selection.Hash)
+			}
+		}
+		hash, entry, err := a.topoRuntime.pool.PickDefaultPlatformOutboundExcluding(ctx, excluded)
 		if err != nil {
 			return netutil.NodeSelection{}, err
 		}

@@ -1171,18 +1171,26 @@ func (p *GlobalNodePool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {
 // it sees either the old complete view or the newly published complete view.
 // The platform's regex/region/health/latency filters remain authoritative.
 func (p *GlobalNodePool) PickDefaultPlatformOutbound(ctx context.Context) (node.Hash, *node.NodeEntry, error) {
+	return p.PickDefaultPlatformOutboundExcluding(ctx, nil)
+}
+
+// PickDefaultPlatformOutboundExcluding selects a ready outbound from the
+// published Default platform view while excluding hashes already attempted by
+// one bounded resource download. The exclusion set is per request; it does
+// not mutate pool health or sticky state.
+func (p *GlobalNodePool) PickDefaultPlatformOutboundExcluding(ctx context.Context, excluded []node.Hash) (node.Hash, *node.NodeEntry, error) {
 	var selected node.Hash
 	var selectedEntry *node.NodeEntry
 	var err error
 	if !p.TryWithRuntimeRead(func() {
-		selected, selectedEntry, err = p.pickDefaultPlatformOutbound(ctx)
+		selected, selectedEntry, err = p.pickDefaultPlatformOutbound(ctx, excluded)
 	}) {
 		return node.Zero, nil, ErrRuntimeGenerationBusy
 	}
 	return selected, selectedEntry, err
 }
 
-func (p *GlobalNodePool) pickDefaultPlatformOutbound(ctx context.Context) (node.Hash, *node.NodeEntry, error) {
+func (p *GlobalNodePool) pickDefaultPlatformOutbound(ctx context.Context, excluded []node.Hash) (node.Hash, *node.NodeEntry, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1199,6 +1207,10 @@ func (p *GlobalNodePool) pickDefaultPlatformOutbound(ctx context.Context) (node.
 	}
 
 	subLookup := p.MakeSubLookup()
+	excludedHashes := make(map[node.Hash]struct{}, len(excluded))
+	for _, hash := range excluded {
+		excludedHashes[hash] = struct{}{}
+	}
 	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
 	var selected node.Hash
 	var selectedEntry *node.NodeEntry
@@ -1208,6 +1220,9 @@ func (p *GlobalNodePool) pickDefaultPlatformOutbound(ctx context.Context) (node.
 		if err := ctx.Err(); err != nil {
 			canceled = true
 			break
+		}
+		if _, excluded := excludedHashes[candidate.Hash]; excluded {
+			continue
 		}
 		entry, ok := p.nodes.Load(candidate.Hash)
 		if !ok || entry == nil || entry != candidate.Entry {

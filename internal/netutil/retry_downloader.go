@@ -16,6 +16,13 @@ type NodeSelection struct {
 	Entry *node.NodeEntry
 }
 
+// NodePicker selects one candidate that is not in attempted. The attempted
+// slice belongs to the current download and is not reused across requests;
+// the picker must apply it before returning a candidate.
+type NodePicker func(ctx context.Context, target string, attempted []NodeSelection) (NodeSelection, error)
+
+const maxProxyAttempts = 2
+
 // RetryDownloader decorates a Downloader with proxy retry logic.
 type RetryDownloader struct {
 	Direct Downloader
@@ -23,7 +30,7 @@ type RetryDownloader struct {
 	// If <= 0, it falls back to DirectDownloader's dynamic timeout when available,
 	// otherwise 30s.
 	ProxyAttemptTimeout time.Duration
-	NodePicker          func(ctx context.Context, target string) (NodeSelection, error)
+	NodePicker          NodePicker
 	ProxyFetch          func(ctx context.Context, selection NodeSelection, url string) ([]byte, error)
 }
 
@@ -53,13 +60,14 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 
 	attemptTimeout := r.proxyAttemptTimeout()
 
-	// Retry 2 times with random proxy nodes.
-	for i := 0; i < 2; i++ {
+	attempted := make([]NodeSelection, 0, maxProxyAttempts)
+	for attempt := 0; attempt < maxProxyAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return nil, err
 		}
 
-		selection, pickErr := r.NodePicker(ctx, url)
+		pickerAttempted := append([]NodeSelection(nil), attempted...)
+		selection, pickErr := r.NodePicker(ctx, url, pickerAttempted)
 		if pickErr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
@@ -69,6 +77,12 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 			}
 			continue
 		}
+		if selectionAlreadyAttempted(selection, attempted) {
+			// A picker that ignores the attempted set cannot provide a bounded
+			// retry sequence. Fail closed instead of looping on one node.
+			break
+		}
+		attempted = append(attempted, selection)
 
 		attemptCtx := ctx
 		cancel := func() {}
@@ -92,6 +106,18 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 		return nil, ctxErr
 	}
 	return nil, err
+}
+
+func selectionAlreadyAttempted(selection NodeSelection, attempted []NodeSelection) bool {
+	for _, previous := range attempted {
+		if selection.Hash != node.Zero && selection.Hash == previous.Hash {
+			return true
+		}
+		if selection.Entry != nil && selection.Entry == previous.Entry {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldRetryViaProxy(err error) bool {

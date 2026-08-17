@@ -97,6 +97,24 @@ func TestPickDefaultPlatformOutbound_AllNodesWithoutOutbound(t *testing.T) {
 	}
 }
 
+func TestPickDefaultPlatformOutboundExcluding_SkipsAttemptedHash(t *testing.T) {
+	pool, sub := newPoolPickerTestPool(t, nil)
+	first := addPickerTestNode(t, pool, sub, `{"picker":"first"}`, "picker", true)
+	second := addPickerTestNode(t, pool, sub, `{"picker":"second"}`, "picker", true)
+
+	got, _, err := pool.PickDefaultPlatformOutboundExcluding(context.Background(), []node.Hash{first})
+	if err != nil {
+		t.Fatalf("pick excluding first: %v", err)
+	}
+	if got != second {
+		t.Fatalf("pick returned %s, want unattempted second node %s", got.Hex(), second.Hex())
+	}
+
+	if _, _, err := pool.PickDefaultPlatformOutboundExcluding(context.Background(), []node.Hash{first, second}); !errors.Is(err, ErrNoAvailableOutbound) {
+		t.Fatalf("pick with all candidates excluded = %v, want ErrNoAvailableOutbound", err)
+	}
+}
+
 func TestPickDefaultPlatformOutbound_RespectsDefaultFilters(t *testing.T) {
 	pool, sub := newPoolPickerTestPool(t, []*regexp.Regexp{regexp.MustCompile("allowed")})
 	addPickerTestNode(t, pool, sub, `{"picker":"excluded"}`, "excluded", true)

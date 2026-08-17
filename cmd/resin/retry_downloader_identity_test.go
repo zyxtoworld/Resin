@@ -107,8 +107,8 @@ func TestWireRetryDownloaderRejectsSameHashReplacementBetweenPickAndFetch(t *tes
 	productionPicker := retryDL.NodePicker
 	picked := make(chan struct{})
 	allowFetch := make(chan struct{})
-	retryDL.NodePicker = func(ctx context.Context, target string) (netutil.NodeSelection, error) {
-		selection, err := productionPicker(ctx, target)
+	retryDL.NodePicker = func(ctx context.Context, target string, attempted []netutil.NodeSelection) (netutil.NodeSelection, error) {
+		selection, err := productionPicker(ctx, target, attempted)
 		if err == nil {
 			close(picked)
 			<-allowFetch
