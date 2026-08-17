@@ -1,15 +1,24 @@
 package metrics
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
+
+	"github.com/Resinat/Resin/internal/metricsconfig"
 )
 
 // Collector holds hot-path atomic counters for global and per-platform metrics.
-// All fields are updated with atomic operations for lock-free performance.
+// RecordRequest uses one read-side request window so a flush cannot split a
+// request's global/platform counts from its latency samples.
 type Collector struct {
-	global   *counters
-	platform sync.Map // string -> *counters
+	requestWindowMu sync.RWMutex
+	global          *counters
+	platform        sync.Map // string -> *counters
+
+	// Package-private seams for deterministic request-window tests.
+	beforeRecordRequestHook    func()
+	afterRecordRequestLockHook func()
 }
 
 // counters holds atomic counters for one measurement scope (global or per-platform).
@@ -50,25 +59,24 @@ type CountersSnapshot struct {
 	LatencyOverMs   int
 }
 
-// NewCollector creates a new Collector with the given latency histogram parameters.
-func NewCollector(latencyBinMs, latencyOverflowMs int) *Collector {
-	if latencyBinMs <= 0 {
-		latencyBinMs = 50
-	}
-	if latencyOverflowMs <= 0 {
-		latencyOverflowMs = 5000
+const (
+	defaultLatencyBinMs      = 50
+	defaultLatencyOverflowMs = 5000
+)
+
+// NewCollector creates a new Collector with the given latency histogram
+// parameters. It validates the bucket count before allocating any counters.
+func NewCollector(latencyBinMs, latencyOverflowMs int) (*Collector, error) {
+	bucketCount, err := metricsconfig.LatencyHistogramBucketCount(latencyBinMs, latencyOverflowMs)
+	if err != nil {
+		return nil, fmt.Errorf("latency histogram: %w", err)
 	}
 	return &Collector{
-		global: newCounters(latencyBinMs, latencyOverflowMs),
-	}
+		global: newCounters(latencyBinMs, latencyOverflowMs, bucketCount),
+	}, nil
 }
 
-func newCounters(binMs, overMs int) *counters {
-	regularBuckets := (overMs + binMs - 1) / binMs // ceil(over/bin)
-	if regularBuckets <= 0 {
-		regularBuckets = 1
-	}
-	bucketCount := regularBuckets + 1 // +1 overflow bucket
+func newCounters(binMs, overMs, bucketCount int) *counters {
 	return &counters{
 		latencyBuckets: make([]atomic.Int64, bucketCount),
 		latencyBinMs:   binMs,
@@ -83,13 +91,22 @@ func (c *Collector) getOrCreatePlatform(platformID string) *counters {
 	if v, ok := c.platform.Load(platformID); ok {
 		return v.(*counters)
 	}
-	nc := newCounters(c.global.latencyBinMs, c.global.latencyOverMs)
+	nc := newCounters(c.global.latencyBinMs, c.global.latencyOverMs, len(c.global.latencyBuckets))
 	actual, _ := c.platform.LoadOrStore(platformID, nc)
 	return actual.(*counters)
 }
 
 // RecordRequest records a completed request.
 func (c *Collector) RecordRequest(platformID string, success bool, latencyMs int64, isConnect bool) {
+	if hook := c.beforeRecordRequestHook; hook != nil {
+		hook()
+	}
+	c.requestWindowMu.RLock()
+	if hook := c.afterRecordRequestLockHook; hook != nil {
+		hook()
+	}
+	defer c.requestWindowMu.RUnlock()
+
 	c.global.requests.Add(1)
 	if success {
 		c.global.successRequests.Add(1)
@@ -200,11 +217,23 @@ func (c *Collector) RecordProbe(kind ProbeKind) {
 
 // Snapshot returns a point-in-time snapshot of the global counters.
 func (c *Collector) Snapshot() CountersSnapshot {
-	return snapshot(c.global)
+	c.requestWindowMu.RLock()
+	defer c.requestWindowMu.RUnlock()
+	return c.snapshotUnlocked()
 }
 
 // PlatformSnapshot returns a snapshot for a specific platform.
 func (c *Collector) PlatformSnapshot(platformID string) (CountersSnapshot, bool) {
+	c.requestWindowMu.RLock()
+	defer c.requestWindowMu.RUnlock()
+	return c.platformSnapshotUnlocked(platformID)
+}
+
+func (c *Collector) snapshotUnlocked() CountersSnapshot {
+	return snapshot(c.global)
+}
+
+func (c *Collector) platformSnapshotUnlocked(platformID string) (CountersSnapshot, bool) {
 	v, ok := c.platform.Load(platformID)
 	if !ok {
 		return CountersSnapshot{}, false
@@ -214,6 +243,12 @@ func (c *Collector) PlatformSnapshot(platformID string) (CountersSnapshot, bool)
 
 // PlatformSnapshots returns snapshots for all known platforms.
 func (c *Collector) PlatformSnapshots() map[string]CountersSnapshot {
+	c.requestWindowMu.RLock()
+	defer c.requestWindowMu.RUnlock()
+	return c.platformSnapshotsUnlocked()
+}
+
+func (c *Collector) platformSnapshotsUnlocked() map[string]CountersSnapshot {
 	result := make(map[string]CountersSnapshot)
 	c.platform.Range(func(key, value any) bool {
 		result[key.(string)] = snapshot(value.(*counters))
@@ -256,11 +291,23 @@ func swapLatencyBuckets(ct *counters) []int64 {
 // per-bucket counts accumulated since the last call. The counters are reset to 0
 // so the next call only captures new samples.
 func (c *Collector) SwapLatencyBuckets() []int64 {
+	c.requestWindowMu.Lock()
+	defer c.requestWindowMu.Unlock()
+	return c.swapLatencyBucketsUnlocked()
+}
+
+func (c *Collector) swapLatencyBucketsUnlocked() []int64 {
 	return swapLatencyBuckets(c.global)
 }
 
 // PlatformSwapLatencyBuckets does the same for a specific platform.
 func (c *Collector) PlatformSwapLatencyBuckets(platformID string) ([]int64, bool) {
+	c.requestWindowMu.Lock()
+	defer c.requestWindowMu.Unlock()
+	return c.platformSwapLatencyBucketsUnlocked(platformID)
+}
+
+func (c *Collector) platformSwapLatencyBucketsUnlocked(platformID string) ([]int64, bool) {
 	v, ok := c.platform.Load(platformID)
 	if !ok {
 		return nil, false
@@ -270,6 +317,12 @@ func (c *Collector) PlatformSwapLatencyBuckets(platformID string) ([]int64, bool
 
 // PlatformSwapAll atomically drains latency histograms for all known platforms.
 func (c *Collector) PlatformSwapAll() map[string][]int64 {
+	c.requestWindowMu.Lock()
+	defer c.requestWindowMu.Unlock()
+	return c.platformSwapAllUnlocked()
+}
+
+func (c *Collector) platformSwapAllUnlocked() map[string][]int64 {
 	result := make(map[string][]int64)
 	c.platform.Range(func(key, value any) bool {
 		result[key.(string)] = swapLatencyBuckets(value.(*counters))

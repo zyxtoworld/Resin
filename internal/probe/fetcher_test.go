@@ -1,12 +1,11 @@
 package probe
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/Resinat/Resin/internal/node"
 )
 
 func TestDirectFetcher_HTTPFallbackLatencyNonZero(t *testing.T) {
@@ -17,7 +16,7 @@ func TestDirectFetcher_HTTPFallbackLatencyNonZero(t *testing.T) {
 	defer srv.Close()
 
 	fetcher := DirectFetcher(func() time.Duration { return time.Second })
-	body, latency, err := fetcher(node.Zero, srv.URL)
+	body, latency, err := fetcher(context.Background(), nil, srv.URL)
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}

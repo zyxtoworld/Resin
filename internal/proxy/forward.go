@@ -9,8 +9,10 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/routing"
 )
@@ -40,7 +42,7 @@ type ForwardProxy struct {
 	transportConfig   OutboundTransportConfig
 	transportPool     *OutboundTransportPool
 	transportPoolOnce sync.Once
-	directTransport   *http.Transport
+	directTransport   atomic.Pointer[http.Transport]
 	directOnce        sync.Once
 	bypass            *TargetBypassMatcher
 }
@@ -75,14 +77,25 @@ func (p *ForwardProxy) outboundHTTPTransport(routed routedOutbound) *http.Transp
 			p.transportPool = NewOutboundTransportPool(p.transportConfig)
 		}
 	})
-	return p.transportPool.Get(routed.Route.NodeHash, routed.Outbound, p.metricsSink)
+	return p.transportPool.Get(routed.Route.NodeHash, routed.Entry, routed.Outbound, p.metricsSink)
 }
 
 func (p *ForwardProxy) directHTTPTransport() *http.Transport {
 	p.directOnce.Do(func() {
-		p.directTransport = newDirectHTTPTransport(p.transportConfig, p.metricsSink)
+		p.directTransport.Store(newDirectHTTPTransport(p.transportConfig, p.metricsSink))
 	})
-	return p.directTransport
+	return p.directTransport.Load()
+}
+
+// CloseIdleConnections releases direct/bypass HTTP keep-alive connections.
+// Routed transports are owned by OutboundTransportPool and are closed there.
+func (p *ForwardProxy) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	if transport := p.directTransport.Load(); transport != nil {
+		transport.CloseIdleConnections()
+	}
 }
 
 func (p *ForwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +240,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	lifecycle.setAccount(account)
 
 	var route routing.RouteResult
+	var routeEntry *node.NodeEntry
 	var hasRoute bool
 	var transport *http.Transport
 	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
@@ -240,10 +254,11 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		route = routed.Route
+		routeEntry = routed.Entry
 		hasRoute = true
 		lifecycle.setRouteResult(route)
 		if p.health != nil {
-			go p.health.RecordLatency(route.NodeHash, netutil.ExtractDomain(r.Host), nil)
+			recordLatencyAsync(p.health, route.NodeHash, routeEntry, netutil.ExtractDomain(r.Host), nil)
 		}
 		transport = p.outboundHTTPTransport(routed)
 	}
@@ -278,7 +293,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError("forward_roundtrip", err)
 		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 		if hasRoute {
-			recordPassiveResultAsync(p.health, route, false)
+			recordPassiveResultAsync(p.health, route, routeEntry, false)
 		}
 		writeProxyError(w, proxyErr)
 		return
@@ -302,7 +317,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setUpstreamError("forward_upstream_to_client_copy", copyErr)
 			lifecycle.setNetOK(false)
 			if hasRoute {
-				recordPassiveResultAsync(p.health, route, false)
+				recordPassiveResultAsync(p.health, route, routeEntry, false)
 			}
 		}
 		return
@@ -310,7 +325,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Full body transfer succeeded — count as network success even for 5xx HTTP.
 	if hasRoute {
-		recordPassiveResultAsync(p.health, route, true)
+		recordPassiveResultAsync(p.health, route, routeEntry, true)
 	}
 }
 
@@ -397,6 +412,7 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle.setHTTPStatus(http.StatusOK)
 	relay := pumpPreparedTunnel(clientConn, clientBuf.Reader, prepare.session, tunnelPumpOptions{
+		ctx:                         r.Context(),
 		requireBidirectionalTraffic: true,
 		onFirstIngressByte:          lifecycle.markFirstByteReceived,
 	})
@@ -407,7 +423,9 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !relay.canceled {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 // shouldRecordForwardCopyFailure decides whether an HTTP response body copy

@@ -258,6 +258,50 @@ func TestInheritLeaseByPlatformName_Success(t *testing.T) {
 	}
 }
 
+func TestInheritLeaseByPlatformName_RejectsReplacementAfterNameResolution(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+
+	now := time.Now().UnixNano()
+	seedLease(t, cp, model.Lease{
+		PlatformID:  plat.ID,
+		Account:     "stale-parent",
+		NodeHash:    node.HashFromRawOptions([]byte(`{"id":"stale-parent"}`)).Hex(),
+		EgressIP:    "203.0.113.10",
+		CreatedAtNs: now - int64(time.Minute),
+		ExpiryNs:    now + int64(time.Hour),
+	})
+
+	replacementDone := make(chan struct{})
+	var replaceErr error
+	cp.beforeLeaseInheritanceRouterCallHook = func() {
+		replacementErr := cp.Pool.ReplacePlatform(platform.NewPlatform(plat.ID, "Renamed", nil, nil))
+		replaceErr = replacementErr
+		close(replacementDone)
+	}
+
+	err := cp.InheritLeaseByPlatformName("Default", "stale-parent", "stale-child")
+	if replaceErr != nil {
+		t.Fatalf("ReplacePlatform: %v", replaceErr)
+	}
+	select {
+	case <-replacementDone:
+	default:
+		t.Fatal("platform replacement did not reach the name-resolution interleaving")
+	}
+	if err == nil {
+		t.Fatal("expected stale name inheritance to fail after platform replacement")
+	}
+	assertServiceErrorCode(t, err, "NOT_FOUND")
+	if child := cp.Router.ReadLease(model.LeaseKey{PlatformID: plat.ID, Account: "stale-child"}); child != nil {
+		t.Fatal("stale inheritance created a lease on the replacement platform")
+	}
+
+	current, ok := cp.Pool.GetPlatform(plat.ID)
+	if !ok || current == plat || current.Name != "Renamed" {
+		t.Fatalf("replacement platform was not published: current=%#v, ok=%v", current, ok)
+	}
+}
+
 func TestInheritLeaseByPlatformName_OverwritesExistingTargetLease(t *testing.T) {
 	cp, plat := newLeaseInheritanceTestService()
 
@@ -329,6 +373,24 @@ func TestInheritLeaseByPlatformName_ParentLeaseMissingOrExpired(t *testing.T) {
 	err = cp.InheritLeaseByPlatformName(plat.Name, "expired-parent", "child")
 	if err == nil {
 		t.Fatal("expected NOT_FOUND for expired parent lease")
+	}
+	assertServiceErrorCode(t, err, "NOT_FOUND")
+}
+
+func TestInheritLeaseByPlatformName_RejectsLeaseAtExactDeadline(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	now := time.Unix(1_700_000_000, 123).UTC()
+	seedLease(t, cp, model.Lease{
+		PlatformID: plat.ID,
+		Account:    "exact-expiry-parent",
+		NodeHash:   node.HashFromRawOptions([]byte(`{"id":"exact-expiry-parent"}`)).Hex(),
+		EgressIP:   "203.0.113.78",
+		ExpiryNs:   now.UnixNano(),
+	})
+
+	err := cp.inheritLeaseByPlatformNameAt(plat.Name, "exact-expiry-parent", "child", now)
+	if err == nil {
+		t.Fatal("expected NOT_FOUND for parent lease at its exact deadline")
 	}
 	assertServiceErrorCode(t, err, "NOT_FOUND")
 }

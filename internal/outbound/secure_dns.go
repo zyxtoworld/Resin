@@ -334,6 +334,11 @@ func (t *secureDNSFailoverTransport) Exchange(ctx context.Context, message *mDNS
 
 	var attemptErrs []error
 	for _, upstreamTag := range t.upstreamTags {
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
 		upstream, ok := t.manager.Transport(upstreamTag)
 		if !ok || upstream == nil {
 			attemptErrs = append(attemptErrs, fmt.Errorf("%s: transport not found", upstreamTag))
@@ -349,6 +354,11 @@ func (t *secureDNSFailoverTransport) Exchange(ctx context.Context, message *mDNS
 				err = errors.New("empty response")
 			} else {
 				err = dns.RcodeError(response.Rcode)
+			}
+		}
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
 			}
 		}
 		attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", upstreamTag, err))

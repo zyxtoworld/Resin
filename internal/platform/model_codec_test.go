@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -61,6 +62,22 @@ func TestBuildFromModel_Success(t *testing.T) {
 	}
 	if len(plat.RegionFilters) != 2 || plat.RegionFilters[0] != "us" || plat.RegionFilters[1] != "jp" {
 		t.Fatalf("region filters mismatch: %+v", plat.RegionFilters)
+	}
+}
+
+func TestBuildFromModel_RejectsStickyTTLExpiryOverflow(t *testing.T) {
+	_, err := BuildFromModel(model.Platform{
+		ID:                     "plat-overflow",
+		Name:                   "Overflow",
+		StickyTTLNs:            math.MaxInt64,
+		ReverseProxyMissAction: "TREAT_AS_EMPTY",
+		AllocationPolicy:       "BALANCED",
+	})
+	if err == nil {
+		t.Fatal("expected sticky ttl expiry overflow error")
+	}
+	if !strings.Contains(err.Error(), "sticky_ttl_ns") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

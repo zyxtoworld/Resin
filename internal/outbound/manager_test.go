@@ -15,6 +15,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/testutil"
+	"github.com/Resinat/Resin/internal/topology"
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -56,11 +57,41 @@ func (b *panicBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
 }
 
 type closableOnly struct {
-	closed atomic.Bool
+	closed       atomic.Bool
+	closeEntered chan struct{}
+	allowClose   chan struct{}
+	closeOnce    sync.Once
+}
+
+type fetchTrackingOutbound struct {
+	dialEntered chan struct{}
+	dialOnce    sync.Once
+	allowDial   <-chan struct{}
+}
+
+func (o *fetchTrackingOutbound) Type() string           { return "fetch-tracking" }
+func (o *fetchTrackingOutbound) Tag() string            { return "fetch-tracking" }
+func (o *fetchTrackingOutbound) Network() []string      { return []string{"tcp", "udp"} }
+func (o *fetchTrackingOutbound) Dependencies() []string { return nil }
+func (o *fetchTrackingOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	o.dialOnce.Do(func() { close(o.dialEntered) })
+	if o.allowDial != nil {
+		<-o.allowDial
+	}
+	return nil, errors.New("fetch-tracking: dial called")
+}
+func (o *fetchTrackingOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("fetch-tracking: listen packet not supported")
 }
 
 func (c *closableOnly) Close() error {
 	c.closed.Store(true)
+	if c.closeEntered != nil {
+		c.closeOnce.Do(func() { close(c.closeEntered) })
+	}
+	if c.allowClose != nil {
+		<-c.allowClose
+	}
 	return nil
 }
 
@@ -129,6 +160,10 @@ func (b *blockingClosableBuilder) firstBuilt(t *testing.T) *closableOnly {
 // mockPool implements PoolAccessor for tests.
 type mockPool struct {
 	entries sync.Map // node.Hash -> *node.NodeEntry
+
+	rangeEntered chan struct{}
+	allowRange   chan struct{}
+	rangeOnce    sync.Once
 }
 
 func (p *mockPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
@@ -139,7 +174,15 @@ func (p *mockPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
 	return v.(*node.NodeEntry), true
 }
 
+func (p *mockPool) IsNodeDisabled(node.Hash) bool { return false }
+
 func (p *mockPool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {
+	if p.rangeEntered != nil {
+		p.rangeOnce.Do(func() {
+			close(p.rangeEntered)
+			<-p.allowRange
+		})
+	}
 	p.entries.Range(func(key, value any) bool {
 		return fn(key.(node.Hash), value.(*node.NodeEntry))
 	})
@@ -206,6 +249,32 @@ func TestEnsureNodeOutbound_BuildPanicCaptured(t *testing.T) {
 	}
 	if got := entry.GetLastError(); !strings.Contains(got, "outbound build: panic: simulated build panic") {
 		t.Fatalf("unexpected last error after build panic: %q", got)
+	}
+}
+
+func TestEnsureNodeOutboundForEntryRejectsStaleGeneration(t *testing.T) {
+	entryA := newTestEntry(`{"type":"generation-a"}`)
+	entryB := node.NewNodeEntry(entryA.Hash, json.RawMessage(`{"type":"generation-b"}`), time.Now(), 0)
+	pool := &mockPool{}
+	pool.addEntry(entryA)
+	pool.entries.Store(entryA.Hash, entryB)
+
+	builder := &countingBuilder{}
+	mgr := NewOutboundManager(pool, builder)
+	mgr.EnsureNodeOutboundForEntry(entryA.Hash, entryA)
+	if got := builder.Count(); got != 0 {
+		t.Fatalf("stale generation started an outbound build: %d", got)
+	}
+	if entryA.HasOutbound() || entryB.HasOutbound() {
+		t.Fatal("stale generation changed an outbound")
+	}
+
+	mgr.EnsureNodeOutboundForEntry(entryB.Hash, entryB)
+	if got := builder.Count(); got != 1 {
+		t.Fatalf("current generation build count = %d, want 1", got)
+	}
+	if !entryB.HasOutbound() {
+		t.Fatal("current generation did not receive its outbound")
 	}
 }
 
@@ -293,6 +362,395 @@ func TestEnsureNodeOutbound_NodeRemovedDuringBuild_DropsAndCloses(t *testing.T) 
 	}
 }
 
+func TestShutdown_ClosesOutboundBuiltAfterAdmission(t *testing.T) {
+	entry := newTestEntry(`{"type":"slow-build-shutdown"}`)
+	p := &mockPool{}
+	p.addEntry(entry)
+	builder := newBlockingClosableBuilder()
+	mgr := NewOutboundManager(p, builder)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mgr.EnsureNodeOutbound(entry.Hash)
+	}()
+	<-builder.started
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		mgr.Shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned before the admitted Build completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(builder.release)
+	<-done
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after the admitted Build completed")
+	}
+
+	if entry.Outbound.Load() != nil {
+		t.Fatal("shutdown published an outbound after admission closed")
+	}
+	ob := builder.firstBuilt(t)
+	if !ob.closed.Load() {
+		t.Fatal("shutdown did not close the in-flight build result")
+	}
+}
+
+func TestShutdownWaitsForAdmittedBuildBeforeCompleting(t *testing.T) {
+	entry := newTestEntry(`{"type":"shutdown-waits-for-build"}`)
+	p := &mockPool{}
+	p.addEntry(entry)
+	builder := newBlockingClosableBuilder()
+	mgr := NewOutboundManager(p, builder)
+
+	buildDone := make(chan struct{})
+	go func() {
+		defer close(buildDone)
+		mgr.EnsureNodeOutbound(entry.Hash)
+	}()
+	select {
+	case <-builder.started:
+	case <-time.After(time.Second):
+		t.Fatal("EnsureNodeOutbound did not enter Build")
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- mgr.ShutdownContext(context.Background())
+	}()
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("ShutdownContext returned before the admitted Build completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(builder.release)
+	select {
+	case <-buildDone:
+	case <-time.After(time.Second):
+		t.Fatal("admitted Build did not finish after release")
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not finish after the admitted Build completed")
+	}
+}
+
+func TestShutdown_WaitsForRetiredOutboundClose(t *testing.T) {
+	entry := newTestEntry(`{"type":"blocking-retire-close"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	ob := &closableOnly{
+		closeEntered: make(chan struct{}),
+		allowClose:   make(chan struct{}),
+	}
+	var raw adapter.Outbound = ob
+	entry.Outbound.Store(&raw)
+	mgr := NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		mgr.Shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-ob.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not retire the published outbound")
+	}
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned before retired outbound Close completed")
+	default:
+	}
+
+	close(ob.allowClose)
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after retired outbound Close completed")
+	}
+}
+
+func TestShutdownWaitsForRemovedNodeOutboundRetirement(t *testing.T) {
+	raw := json.RawMessage(`{"type":"shutdown-removed-outbound"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	pool.AddNodeFromSub(hash, raw, "shutdown-sub")
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("setup: node entry not found")
+	}
+	ob := &closableOnly{
+		closeEntered: make(chan struct{}),
+		allowClose:   make(chan struct{}),
+	}
+	var rawOutbound adapter.Outbound = ob
+	entry.Outbound.Store(&rawOutbound)
+
+	mgr := NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+	pool.SetOnNodeRemoved(func(_ node.Hash, removed *node.NodeEntry) {
+		mgr.RemoveNodeOutbound(removed)
+	})
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, "shutdown-sub")
+		close(removeDone)
+	}()
+	select {
+	case <-ob.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("node removal did not start outbound retirement")
+	}
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("node removal waited for outbound Close")
+	}
+
+	retirementSet := make(chan int, 1)
+	mgr.beforeRetirementWaitHook = func(count int) {
+		retirementSet <- count
+	}
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- mgr.ShutdownContext(context.Background())
+	}()
+
+	select {
+	case count := <-retirementSet:
+		if count != 1 {
+			t.Fatalf("Shutdown retirement set = %d, want removed outbound included", count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not reach retirement wait")
+	}
+
+	close(ob.allowClose)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after removed outbound Close")
+	}
+}
+
+func TestShutdownDoesNotMissPoolRemovalCallbackOutsideRetirementAdmission(t *testing.T) {
+	raw := json.RawMessage(`{"type":"shutdown-callback-gap"}`)
+	hash := node.HashFromRawOptions(raw)
+	p := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	p.AddNodeFromSub(hash, raw, "shutdown-callback-gap-sub")
+	entry, ok := p.GetEntry(hash)
+	if !ok {
+		t.Fatal("setup: node entry not found")
+	}
+
+	ob := &closableOnly{
+		closeEntered: make(chan struct{}),
+		allowClose:   make(chan struct{}),
+	}
+	var rawOutbound adapter.Outbound = ob
+	entry.Outbound.Store(&rawOutbound)
+	_, releaseLease, acquired := entry.AcquireOutbound()
+	if !acquired {
+		t.Fatal("setup: expected outbound lease")
+	}
+	var releaseLeaseOnce sync.Once
+
+	mgr := NewOutboundManager(p, &testutil.StubOutboundBuilder{})
+	callbackEntered := make(chan struct{})
+	allowCallback := make(chan struct{})
+	var callbackOnce sync.Once
+	var allowCallbackOnce sync.Once
+	var allowCloseOnce sync.Once
+	p.SetOnNodeRemoved(func(_ node.Hash, removed *node.NodeEntry) {
+		if removed != entry {
+			t.Errorf("removed callback entry = %p, want %p", removed, entry)
+		}
+		callbackOnce.Do(func() { close(callbackEntered) })
+		<-allowCallback
+		mgr.RemoveNodeOutbound(removed)
+	})
+
+	removeDone := make(chan struct{})
+	go func() {
+		p.RemoveNodeFromSub(hash, "shutdown-callback-gap-sub")
+		close(removeDone)
+	}()
+	t.Cleanup(func() {
+		allowCallbackOnce.Do(func() { close(allowCallback) })
+		allowCloseOnce.Do(func() { close(ob.allowClose) })
+		releaseLeaseOnce.Do(releaseLease)
+		select {
+		case <-removeDone:
+		case <-time.After(time.Second):
+			t.Error("pool removal cleanup did not finish")
+		}
+	})
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("pool removal did not enter the production removal callback")
+	}
+	if _, present := p.GetEntry(hash); present {
+		t.Fatal("pool entry remained visible after callback entry")
+	}
+
+	shutdownDone := make(chan error, 1)
+	retirementSnapshot := make(chan int, 1)
+	shutdownEntered := make(chan struct{})
+	var shutdownEnteredOnce sync.Once
+	mgr.beforeRetirementLifecycleHook = func() {
+		shutdownEnteredOnce.Do(func() { close(shutdownEntered) })
+	}
+	mgr.beforeRetirementWaitHook = func(count int) {
+		retirementSnapshot <- count
+	}
+	go func() { shutdownDone <- mgr.ShutdownContext(context.Background()) }()
+	select {
+	case <-shutdownEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not enter the pool lifecycle boundary")
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("ShutdownContext returned before the already-started pool removal callback registered retirement: %v", err)
+	default:
+	}
+
+	allowCallbackOnce.Do(func() { close(allowCallback) })
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("pool removal did not finish after callback release")
+	}
+	select {
+	case count := <-retirementSnapshot:
+		if count != 1 {
+			t.Fatalf("retirement snapshot = %d, want callback retirement included", count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not reach the final retirement snapshot")
+	}
+	allowCloseOnce.Do(func() { close(ob.allowClose) })
+	releaseLeaseOnce.Do(releaseLease)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not finish after callback and lease release")
+	}
+}
+
+func TestShutdownTracksRetirementAddedAfterPoolSnapshot(t *testing.T) {
+	entry := newTestEntry(`{"type":"late-retirement"}`)
+	ob := &closableOnly{
+		closeEntered: make(chan struct{}),
+		allowClose:   make(chan struct{}),
+	}
+	var raw adapter.Outbound = ob
+	entry.Outbound.Store(&raw)
+
+	p := &mockPool{
+		rangeEntered: make(chan struct{}),
+		allowRange:   make(chan struct{}),
+	}
+	p.addEntry(entry)
+	mgr := NewOutboundManager(p, &testutil.StubOutboundBuilder{})
+
+	retirementCallEntered := make(chan struct{})
+	mgr.beforeRetirementTrackHook = func(*node.NodeEntry) {
+		close(retirementCallEntered)
+	}
+	retirementSnapshot := make(chan int, 1)
+	allowRetirementWait := make(chan struct{})
+	mgr.beforeRetirementWaitHook = func(count int) {
+		retirementSnapshot <- count
+		<-allowRetirementWait
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- mgr.ShutdownContext(context.Background()) }()
+	select {
+	case <-p.rangeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not begin the pool retirement snapshot")
+	}
+
+	// This is the production callback order: the pool deletion has already
+	// removed the entry, and its onNodeRemoved callback arrives while the
+	// outbound shutdown owner is between its snapshot and wait.
+	p.removeEntry(entry.Hash)
+	lateRemovalDone := make(chan struct{})
+	go func() {
+		mgr.RemoveNodeOutbound(entry)
+		close(lateRemovalDone)
+	}()
+	select {
+	case <-retirementCallEntered:
+	case <-time.After(time.Second):
+		t.Fatal("late node-removal callback did not enter retirement admission")
+	}
+
+	close(p.allowRange)
+	select {
+	case count := <-retirementSnapshot:
+		if count != 1 {
+			t.Fatalf("final retirement snapshot = %d, want late callback included", count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not reach the retirement wait boundary")
+	}
+	select {
+	case <-lateRemovalDone:
+	case <-time.After(time.Second):
+		t.Fatal("late node-removal callback did not register retirement")
+	}
+	select {
+	case <-ob.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("late retirement did not start outbound Close")
+	}
+
+	close(allowRetirementWait)
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown returned before the late retirement Close completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(ob.allowClose)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after the late retirement Close completed")
+	}
+}
+
 func TestRemoveNodeOutbound(t *testing.T) {
 	entry := newTestEntry(`{"type":"rm"}`)
 	pool := &mockPool{}
@@ -329,6 +787,154 @@ func TestFetch_OutboundNotReady(t *testing.T) {
 	_, _, err := mgr.Fetch(ctx, entry.Hash, "http://example.com")
 	if !errors.Is(err, ErrOutboundNotReady) {
 		t.Fatalf("expected ErrOutboundNotReady, got: %v", err)
+	}
+}
+
+func TestFetchWithExpectedEntry_RejectsCircuitOpenEntry(t *testing.T) {
+	entry := newTestEntry(`{"type":"circuit-open"}`)
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	entry.CircuitOpenSince.Store(time.Now().UnixNano())
+
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	mgr := NewOutboundManager(pool, nil)
+
+	_, _, err := mgr.FetchWithExpectedEntry(
+		context.Background(),
+		entry.Hash,
+		entry,
+		"http://example.com",
+		"",
+	)
+	if !errors.Is(err, ErrOutboundNotReady) {
+		t.Fatalf("expected ErrOutboundNotReady for circuit-open entry, got %v", err)
+	}
+}
+
+func TestFetchWithExpectedEntry_RejectsAfterShutdownAdmissionClosesBeforeRetirement(t *testing.T) {
+	entry := newTestEntry(`{"type":"fetch-after-shutdown"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	tracking := &fetchTrackingOutbound{dialEntered: make(chan struct{})}
+	var raw adapter.Outbound = tracking
+	entry.Outbound.Store(&raw)
+
+	mgr := NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+	retirementStarted := make(chan struct{})
+	allowRetirement := make(chan struct{})
+	var allowRetirementOnce sync.Once
+	mgr.beforeRetirementLifecycleHook = func() {
+		close(retirementStarted)
+		<-allowRetirement
+	}
+	t.Cleanup(func() { allowRetirementOnce.Do(func() { close(allowRetirement) }) })
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- mgr.ShutdownContext(context.Background()) }()
+	select {
+	case <-retirementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not close admission before retirement")
+	}
+
+	_, _, err := mgr.FetchWithExpectedEntry(
+		context.Background(),
+		entry.Hash,
+		entry,
+		"http://example.test/",
+		"",
+	)
+	if !errors.Is(err, ErrOutboundNotReady) {
+		t.Fatalf("fetch after shutdown admission close = %v, want ErrOutboundNotReady", err)
+	}
+	select {
+	case <-tracking.dialEntered:
+		t.Fatal("fetch after shutdown admission close reached the outbound")
+	default:
+	}
+
+	allowRetirementOnce.Do(func() { close(allowRetirement) })
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not finish after retirement was released")
+	}
+}
+
+func TestFetchAdmittedBeforeShutdownKeepsLeaseUntilDialReturns(t *testing.T) {
+	entry := newTestEntry(`{"type":"fetch-before-shutdown"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	allowDial := make(chan struct{})
+	tracking := &fetchTrackingOutbound{
+		dialEntered: make(chan struct{}),
+		allowDial:   allowDial,
+	}
+	var raw adapter.Outbound = tracking
+	entry.Outbound.Store(&raw)
+
+	mgr := NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, _, err := mgr.FetchWithExpectedEntry(
+			context.Background(),
+			entry.Hash,
+			entry,
+			"http://example.test/",
+			"",
+		)
+		fetchDone <- err
+	}()
+	select {
+	case <-tracking.dialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("fetch did not acquire the outbound lease")
+	}
+
+	retirementWaiting := make(chan struct{})
+	var retirementWaitingOnce sync.Once
+	mgr.beforeRetirementWaitHook = func(count int) {
+		if count != 1 {
+			t.Errorf("retirement count = %d, want 1", count)
+		}
+		retirementWaitingOnce.Do(func() { close(retirementWaiting) })
+	}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- mgr.ShutdownContext(context.Background()) }()
+	select {
+	case <-retirementWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not reach the admitted lease retirement")
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before admitted fetch completed: %v", err)
+	default:
+	}
+
+	close(allowDial)
+	select {
+	case err := <-fetchDone:
+		if err == nil {
+			t.Fatal("expected the gated test dial to return an error")
+		}
+		if errors.Is(err, ErrOutboundNotReady) {
+			t.Fatalf("admitted fetch was rejected as not ready: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admitted fetch did not finish after DialContext was released")
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not finish after the admitted fetch released its lease")
 	}
 }
 

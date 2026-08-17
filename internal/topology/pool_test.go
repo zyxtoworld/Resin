@@ -59,6 +59,51 @@ func TestPool_AddNodeFromSub_Idempotent(t *testing.T) {
 	}
 }
 
+func TestPool_AddNodeRuntimeCallbackDoesNotBlockOtherLifecycleMutations(t *testing.T) {
+	runtimeEntered := make(chan struct{})
+	releaseRuntime := make(chan struct{})
+	runtimeOnce := sync.Once{}
+
+	pool := NewGlobalNodePool(PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+		OnNodeAddedRuntime: func(node.Hash, *node.NodeEntry) {
+			runtimeOnce.Do(func() { close(runtimeEntered) })
+			<-releaseRuntime
+		},
+	})
+	raw := json.RawMessage(`{"type":"runtime-callback","server":"198.51.100.20"}`)
+	hash := node.HashFromRawOptions(raw)
+
+	addDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(hash, raw, "runtime-callback-sub")
+		close(addDone)
+	}()
+	select {
+	case <-runtimeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime callback did not start")
+	}
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, "runtime-callback-sub")
+		close(removeDone)
+	}()
+	select {
+	case <-removeDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("node lifecycle mutation blocked behind runtime preparation")
+	}
+
+	close(releaseRuntime)
+	select {
+	case <-addDone:
+	case <-time.After(time.Second):
+		t.Fatal("add did not finish after runtime preparation release")
+	}
+}
+
 func TestPool_AddNodeFromSub_NewNodeStartsCircuitOpen(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	pool := newTestPool(subMgr)
@@ -123,6 +168,179 @@ func TestPool_RemoveNodeFromSub_Idempotent(t *testing.T) {
 
 	if pool.Size() != 0 {
 		t.Fatalf("expected 0 nodes, got %d", pool.Size())
+	}
+}
+
+func TestPool_RecreatedNodeWaitsForRemovedEntryCleanup(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"cleanup-order","server":"198.51.100.10"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, "s1")
+	removedEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("setup: node not found")
+	}
+
+	cleanupEntered := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	pool.SetOnNodeRemoved(func(_ node.Hash, entry *node.NodeEntry) {
+		if entry != removedEntry {
+			t.Fatalf("removed callback received unexpected entry: got %p want %p", entry, removedEntry)
+		}
+		close(cleanupEntered)
+		<-releaseCleanup
+	})
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, "s1")
+		close(removeDone)
+	}()
+	select {
+	case <-cleanupEntered:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not reach the lifecycle cleanup callback")
+	}
+
+	addDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(hash, raw, "s1")
+		close(addDone)
+	}()
+	select {
+	case <-addDone:
+		t.Fatal("recreated node became visible before removed-entry cleanup completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseCleanup)
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not finish after cleanup release")
+	}
+	select {
+	case <-addDone:
+	case <-time.After(time.Second):
+		t.Fatal("recreated node did not finish after cleanup release")
+	}
+
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == removedEntry {
+		t.Fatal("expected a distinct recreated node entry")
+	}
+}
+
+func TestPool_RemoveNodeFromSub_RetiresOutboundBeforeRemovalCallback(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "Sub1", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"remove-before-retire","server":"198.51.100.11"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("setup: node not found")
+	}
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	pool.SetOnNodeRemoved(func(_ node.Hash, removed *node.NodeEntry) {
+		if removed != entry {
+			t.Errorf("removed callback entry = %p, want %p", removed, entry)
+		}
+		close(callbackEntered)
+		<-releaseCallback
+	})
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, sub.ID)
+		close(removeDone)
+	}()
+
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not reach callback")
+	}
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatal("node should already be absent when removal callback runs")
+	}
+
+	_, release, acquired := entry.AcquireOutbound()
+	if acquired {
+		release()
+		t.Fatal("removed entry admitted a new outbound lease before removal returned")
+	}
+
+	close(releaseCallback)
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not finish after callback release")
+	}
+}
+
+func TestPool_RemoveNodeFromSub_DeleteVisibilityImpliesOutboundRetired(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-delete-point", "DeletePoint", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"remove-delete-point","server":"198.51.100.12"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("setup: node not found")
+	}
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+
+	deletePublished := make(chan struct{})
+	releaseDeleteHook := make(chan struct{})
+	var releaseOnce sync.Once
+	pool.afterNodeDeleteComputeHook = func(gotHash node.Hash, gotEntry *node.NodeEntry) {
+		if gotHash != hash || gotEntry != entry {
+			t.Errorf("delete hook got (%s, %p), want (%s, %p)", gotHash.Hex(), gotEntry, hash.Hex(), entry)
+		}
+		close(deletePublished)
+		<-releaseDeleteHook
+	}
+	defer releaseOnce.Do(func() { close(releaseDeleteHook) })
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, sub.ID)
+		close(removeDone)
+	}()
+	select {
+	case <-deletePublished:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not publish DeleteOp boundary")
+	}
+	if _, ok := pool.GetEntry(hash); ok {
+		t.Fatal("node remained visible after DeleteOp boundary")
+	}
+
+	_, release, acquired := entry.AcquireOutbound()
+	if acquired {
+		release()
+	}
+	releaseOnce.Do(func() { close(releaseDeleteHook) })
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not finish after DeleteOp boundary release")
+	}
+	if acquired {
+		t.Fatal("entry admitted a new outbound lease after DeleteOp became visible")
 	}
 }
 
@@ -273,10 +491,14 @@ func TestPool_NotifyNodeDirty_UpdatesPlatformsInParallel(t *testing.T) {
 	releaseGeoLookup := make(chan struct{})
 	allGeoLookupStarted := make(chan struct{})
 	var geoLookupCalls atomic.Int32
+	var blockGeoLookup atomic.Bool
 
 	pool := NewGlobalNodePool(PoolConfig{
 		SubLookup: subMgr.Lookup,
 		GeoLookup: func(addr netip.Addr) string {
+			if !blockGeoLookup.Load() {
+				return "us"
+			}
 			if geoLookupCalls.Add(1) == 2 {
 				close(allGeoLookupStarted)
 			}
@@ -311,6 +533,8 @@ func TestPool_NotifyNodeDirty_UpdatesPlatformsInParallel(t *testing.T) {
 	plat2 := platform.NewPlatform("p2", "P2", nil, []string{"us"})
 	pool.RegisterPlatform(plat1)
 	pool.RegisterPlatform(plat2)
+	geoLookupCalls.Store(0)
+	blockGeoLookup.Store(true)
 
 	done := make(chan struct{})
 	go func() {
@@ -351,10 +575,14 @@ func TestPool_RebuildAllPlatforms_UpdatesInParallel(t *testing.T) {
 	releaseGeoLookup := make(chan struct{})
 	allGeoLookupStarted := make(chan struct{})
 	var geoLookupCalls atomic.Int32
+	var blockGeoLookup atomic.Bool
 
 	pool := NewGlobalNodePool(PoolConfig{
 		SubLookup: subMgr.Lookup,
 		GeoLookup: func(addr netip.Addr) string {
+			if !blockGeoLookup.Load() {
+				return "us"
+			}
 			if geoLookupCalls.Add(1) == 2 {
 				close(allGeoLookupStarted)
 			}
@@ -389,6 +617,8 @@ func TestPool_RebuildAllPlatforms_UpdatesInParallel(t *testing.T) {
 	plat2 := platform.NewPlatform("p2", "P2", nil, []string{"us"})
 	pool.RegisterPlatform(plat1)
 	pool.RegisterPlatform(plat2)
+	geoLookupCalls.Store(0)
+	blockGeoLookup.Store(true)
 
 	done := make(chan struct{})
 	go func() {
@@ -421,6 +651,97 @@ func TestPool_RebuildAllPlatforms_UpdatesInParallel(t *testing.T) {
 	}
 	if !plat1.View().Contains(h) || !plat2.View().Contains(h) {
 		t.Fatal("rebuild should populate both platform views")
+	}
+}
+
+func TestScheduler_SetSubscriptionEnabledSkipsUnregisteredSnapshot(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-rebuild-delete", "Provider", "url", false, false)
+	subMgr.Register(sub)
+
+	var deleted atomic.Bool
+	var rebuiltAfterDelete atomic.Bool
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup: subMgr.Lookup,
+		GeoLookup: func(netip.Addr) string {
+			if deleted.Load() {
+				rebuiltAfterDelete.Store(true)
+			}
+			return "us"
+		},
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+
+	raw := json.RawMessage(`{"type":"ss","server":"198.51.100.42"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entry, ok := pool.GetEntry(h)
+	if !ok {
+		t.Fatal("setup: node entry not found")
+	}
+	entry.CircuitOpenSince.Store(0)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+
+	plat := platform.NewPlatform("p-rebuild-delete", "RebuildDelete", nil, []string{"us"})
+	if err := pool.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+	sched := newTestScheduler(subMgr, pool, nil)
+
+	rebuildReached := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+	pool.beforePlatformRebuildAllHook = func() {
+		close(rebuildReached)
+		<-releaseRebuild
+	}
+	defer func() {
+		pool.beforePlatformRebuildAllHook = nil
+		select {
+		case <-releaseRebuild:
+		default:
+			close(releaseRebuild)
+		}
+	}()
+
+	rebuildDone := make(chan struct{})
+	go func() {
+		sched.SetSubscriptionEnabled(sub, true)
+		close(rebuildDone)
+	}()
+	select {
+	case <-rebuildReached:
+	case <-time.After(time.Second):
+		t.Fatal("RebuildAllPlatforms did not reach the snapshot boundary")
+	}
+
+	deleteDone := make(chan struct{})
+	go func() {
+		pool.UnregisterPlatform(plat.ID)
+		deleted.Store(true)
+		close(deleteDone)
+	}()
+	select {
+	case <-deleteDone:
+	case <-time.After(time.Second):
+		t.Fatal("UnregisterPlatform did not complete before releasing the rebuild")
+	}
+	close(releaseRebuild)
+
+	select {
+	case <-rebuildDone:
+	case <-time.After(time.Second):
+		t.Fatal("RebuildAllPlatforms did not finish after release")
+	}
+	if rebuiltAfterDelete.Load() {
+		t.Fatal("RebuildAllPlatforms rebuilt a platform after it was unregistered")
 	}
 }
 
@@ -667,6 +988,86 @@ func TestPool_RangePlatforms_UsesSnapshotAndDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestPool_RegisterPlatformRejectsConflictsWithoutMutation(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	pool := newTestPool(subMgr)
+
+	first := platform.NewPlatform("p-first", "SameName", nil, nil)
+	if err := pool.RegisterPlatform(first); err != nil {
+		t.Fatalf("RegisterPlatform first: %v", err)
+	}
+
+	duplicateID := platform.NewPlatform("p-first", "OtherName", nil, nil)
+	if err := pool.RegisterPlatform(duplicateID); !errors.Is(err, ErrPlatformAlreadyRegistered) {
+		t.Fatalf("duplicate ID error = %v, want ErrPlatformAlreadyRegistered", err)
+	}
+	if got, ok := pool.GetPlatform("p-first"); !ok || got != first {
+		t.Fatal("duplicate ID changed the existing ID mapping")
+	}
+	if _, ok := pool.GetPlatformByName("OtherName"); ok {
+		t.Fatal("duplicate ID installed a new name mapping")
+	}
+
+	duplicateName := platform.NewPlatform("p-second", "SameName", nil, nil)
+	if err := pool.RegisterPlatform(duplicateName); !errors.Is(err, ErrPlatformNameConflict) {
+		t.Fatalf("duplicate name error = %v, want ErrPlatformNameConflict", err)
+	}
+	if got, ok := pool.GetPlatformByName("SameName"); !ok || got != first {
+		t.Fatal("duplicate name changed the existing name mapping")
+	}
+	if _, ok := pool.GetPlatform("p-second"); ok {
+		t.Fatal("duplicate name installed an ID mapping")
+	}
+
+	if err := pool.RegisterPlatform(nil); !errors.Is(err, ErrInvalidPlatform) {
+		t.Fatalf("nil platform error = %v, want ErrInvalidPlatform", err)
+	}
+}
+
+func TestPool_RegisterPlatformRebuildsAfterPrePublishNodeChange(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-register-race", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	hash := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"node"}})
+
+	entry := node.NewNodeEntry(hash, raw, time.Now(), 16)
+	entry.AddSubscriptionID(sub.ID)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        50 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+	entry.CircuitOpenSince.Store(time.Now().UnixNano())
+	pool.LoadNodeFromBootstrap(entry)
+
+	plat := platform.NewPlatform("p-register-race", "Register-Race", nil, nil)
+	// This is the CreatePlatform shape: prepare the view before publishing the
+	// platform object. At this point the node is intentionally not routable.
+	pool.RebuildPlatform(plat)
+	if plat.View().Contains(hash) {
+		t.Fatal("pre-publish rebuild unexpectedly included the unhealthy node")
+	}
+
+	// The node becomes routable while the platform is still unpublished. Its
+	// notification has no registered recipient and must be recovered by the
+	// registration publish itself.
+	entry.CircuitOpenSince.Store(0)
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	pool.NotifyNodeDirty(hash)
+
+	if err := pool.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+	if !plat.View().Contains(hash) {
+		t.Fatal("registered platform lost a node change that occurred before publish")
+	}
+}
+
 func TestPool_ReplacePlatform_Success(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	pool := newTestPool(subMgr)
@@ -690,6 +1091,74 @@ func TestPool_ReplacePlatform_Success(t *testing.T) {
 	gotByName, ok := pool.GetPlatformByName("NewName")
 	if !ok || gotByName != nextPlat {
 		t.Fatal("new name mapping should point to replaced platform")
+	}
+}
+
+func TestPool_ReplacePlatform_WaitsForPlatformReadOwner(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	pool := newTestPool(subMgr)
+	oldPlat := platform.NewPlatform("p-read-owner", "ReadOwner", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+
+	readEntered := make(chan struct{})
+	allowRead := make(chan struct{})
+	readDone := make(chan bool, 1)
+	go func() {
+		readDone <- pool.WithPlatformReadByName("ReadOwner", func(got *platform.Platform) {
+			if got != oldPlat {
+				t.Errorf("read callback got platform %p, want old %p", got, oldPlat)
+			}
+			close(readEntered)
+			<-allowRead
+		})
+	}()
+	<-readEntered
+
+	replaceAttempted := make(chan struct{})
+	allowReplaceLock := make(chan struct{})
+	var attemptOnce sync.Once
+	pool.beforePlatformReplaceLockHook = func() {
+		attemptOnce.Do(func() { close(replaceAttempted) })
+		<-allowReplaceLock
+	}
+	defer func() {
+		pool.beforePlatformReplaceLockHook = nil
+		select {
+		case <-allowRead:
+		default:
+			close(allowRead)
+		}
+		select {
+		case <-allowReplaceLock:
+		default:
+			close(allowReplaceLock)
+		}
+	}()
+
+	nextPlat := platform.NewPlatform("p-read-owner", "ReadOwnerNext", nil, nil)
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	<-replaceAttempted
+	close(allowReplaceLock)
+
+	select {
+	case err := <-replaceDone:
+		t.Fatalf("ReplacePlatform committed while platform read owner was held: %v", err)
+	default:
+	}
+
+	close(allowRead)
+	if ok := <-readDone; !ok {
+		t.Fatal("WithPlatformReadByName unexpectedly reported missing platform")
+	}
+	if err := <-replaceDone; err != nil {
+		t.Fatalf("ReplacePlatform: %v", err)
+	}
+	got, ok := pool.GetPlatform("p-read-owner")
+	if !ok || got != nextPlat {
+		t.Fatalf("replacement not published after read owner release: got=%p ok=%v", got, ok)
 	}
 }
 
@@ -778,6 +1247,282 @@ func TestPool_ReplacePlatform_RebuildsViewBeforePublish(t *testing.T) {
 	}
 	if !got.View().Contains(h) {
 		t.Fatal("replaced platform view should include routable us-node")
+	}
+}
+
+func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-replace-race", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h2 := node.HashFromRawOptions(raw)
+
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(h2, subscription.ManagedNode{Tags: []string{"node-2"}})
+	sub.SwapManagedNodes(mn)
+
+	// Add h2 before installing the seams. It is present in the pool but not
+	// routable until the replacement has finished its rebuild.
+	pool.AddNodeFromSub(h2, raw, sub.ID)
+	entry, ok := pool.GetEntry(h2)
+	if !ok {
+		t.Fatal("h2 entry not found")
+	}
+	entry.CircuitOpenSince.Store(0)
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	oldPlat := platform.NewPlatform("p-replace-race", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	nextPlat := platform.NewPlatform(
+		"p-replace-race",
+		"New",
+		[]*regexp.Regexp{regexp.MustCompile("node-2")},
+		nil,
+	)
+
+	rebuildReached := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+	snapshotReached := make(chan struct{})
+	var snapshotOnce sync.Once
+
+	// Every initialization operation is complete before either seam is
+	// installed. The notification is allowed to reach the snapshot boundary,
+	// but is not awaited before replacement is released: the fixed path waits
+	// on platMu there by design.
+	pool.beforePlatformSnapshotLockHook = func() {
+		snapshotOnce.Do(func() { close(snapshotReached) })
+	}
+	pool.afterPlatformRebuildHook = func() {
+		close(rebuildReached)
+		<-releaseRebuild
+	}
+	defer func() {
+		pool.beforePlatformSnapshotLockHook = nil
+		pool.afterPlatformRebuildHook = nil
+		select {
+		case <-releaseRebuild:
+		default:
+			close(releaseRebuild)
+		}
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() {
+		replaceDone <- pool.ReplacePlatform(nextPlat)
+	}()
+
+	select {
+	case <-rebuildReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not reach the rebuild/publish boundary")
+	}
+	if nextPlat.View().Contains(h2) {
+		t.Fatal("next platform should exclude h2 while it is not routable")
+	}
+
+	// Make h2 routable only after next's rebuild has taken its snapshot.
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+
+	notifyDone := make(chan struct{})
+	go func() {
+		pool.NotifyNodeDirty(h2)
+		close(notifyDone)
+	}()
+
+	select {
+	case <-snapshotReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node notification did not reach platformSnapshot")
+	}
+
+	// Do not wait for NotifyNodeDirty before releasing replacement: the fixed
+	// implementation intentionally blocks its snapshot RLock until publish.
+	close(releaseRebuild)
+
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not complete")
+	}
+	select {
+	case <-notifyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node notification did not complete")
+	}
+
+	got, ok := pool.GetPlatform("p-replace-race")
+	if !ok || got != nextPlat {
+		t.Fatal("replacement did not publish next platform")
+	}
+	if !nextPlat.View().Contains(h2) {
+		t.Fatal("published next platform lost the concurrent node notification")
+	}
+}
+
+func TestPool_ReplacePlatform_DoesNotLoseNotificationCapturedBeforePublish(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-replace-before-publish", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entry, ok := pool.GetEntry(h)
+	if !ok {
+		t.Fatal("node entry not found")
+	}
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	oldPlat := platform.NewPlatform("p-replace-before-publish", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	nextPlat := platform.NewPlatform(
+		"p-replace-before-publish",
+		"New",
+		[]*regexp.Regexp{regexp.MustCompile("node")},
+		nil,
+	)
+
+	snapshotCaptured := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	var snapshotBoundaryOnce sync.Once
+	pool.beforePlatformSnapshotLockHook = func() {
+		snapshotBoundaryOnce.Do(func() {
+			close(snapshotCaptured)
+			<-releaseSnapshot
+		})
+	}
+	snapshotCopied := make(chan struct{})
+	releaseCopied := make(chan struct{})
+	var snapshotCopiedOnce sync.Once
+	pool.afterPlatformSnapshotHook = func() {
+		snapshotCopiedOnce.Do(func() {
+			close(snapshotCopied)
+			<-releaseCopied
+		})
+	}
+	notifyReached := make(chan struct{})
+	releaseNotify := make(chan struct{})
+	pool.beforePlatformNotifyHook = func(plat *platform.Platform) {
+		if plat != oldPlat {
+			return
+		}
+		close(notifyReached)
+		<-releaseNotify
+	}
+	rebuildReached := make(chan struct{})
+	releaseRebuild := make(chan struct{})
+	pool.afterPlatformRebuildHook = func() {
+		close(rebuildReached)
+		<-releaseRebuild
+	}
+	defer func() {
+		pool.beforePlatformSnapshotLockHook = nil
+		pool.afterPlatformSnapshotHook = nil
+		pool.beforePlatformNotifyHook = nil
+		pool.afterPlatformRebuildHook = nil
+		select {
+		case <-releaseSnapshot:
+		default:
+			close(releaseSnapshot)
+		}
+		select {
+		case <-releaseCopied:
+		default:
+			close(releaseCopied)
+		}
+		select {
+		case <-releaseNotify:
+		default:
+			close(releaseNotify)
+		}
+		select {
+		case <-releaseRebuild:
+		default:
+			close(releaseRebuild)
+		}
+	}()
+
+	notifyDone := make(chan struct{})
+	go func() {
+		pool.NotifyNodeDirty(h)
+		close(notifyDone)
+	}()
+	select {
+	case <-snapshotCaptured:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification did not reach platform snapshot boundary")
+	}
+	close(releaseSnapshot)
+	select {
+	case <-snapshotCopied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification did not capture platform snapshot")
+	}
+	close(releaseCopied)
+
+	replaceDone := make(chan error, 1)
+	go func() {
+		replaceDone <- pool.ReplacePlatform(nextPlat)
+	}()
+	select {
+	case <-rebuildReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not reach rebuild/publish boundary")
+	}
+	select {
+	case <-notifyReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("captured notification did not reach old platform")
+	}
+
+	// The node becomes routable only after the replacement rebuild took its
+	// snapshot. The in-flight notification is still blocked before updating the
+	// old platform.
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entry.CircuitOpenSince.Store(0)
+	close(releaseRebuild)
+
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not complete")
+	}
+	if nextPlat.View().Contains(h) {
+		t.Fatal("next platform unexpectedly included node before notification completed")
+	}
+
+	close(releaseNotify)
+	select {
+	case <-notifyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("captured notification did not finish")
+	}
+	if !nextPlat.View().Contains(h) {
+		t.Fatal("published replacement lost a notification captured before publish")
 	}
 }
 

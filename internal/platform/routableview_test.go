@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Resinat/Resin/internal/node"
 )
@@ -159,5 +160,77 @@ func TestRoutableView_ConcurrentAddRemove(t *testing.T) {
 
 	if rv.Size() != 100 {
 		t.Fatalf("expected 100 after concurrent remove, got %d", rv.Size())
+	}
+}
+
+func TestRoutableView_RandomPickDoesNotReportEmptyAfterConcurrentShrink(t *testing.T) {
+	rv := NewRoutableView()
+	h0 := hashForViewShard(t, 0)
+	h1 := hashForViewShard(t, 1)
+	rv.Add(h0)
+	rv.Add(h1)
+
+	var seed uint64 = 1
+	for {
+		probe := rand.New(rand.NewPCG(seed, 1))
+		if probe.IntN(2) == 1 {
+			break
+		}
+		seed++
+	}
+	rng := rand.New(rand.NewPCG(seed, 1))
+
+	scanStarted := make(chan struct{})
+	rv.beforeRandomPickScanHook = func() {
+		close(scanStarted)
+	}
+	rv.shards[0].mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			rv.shards[0].mu.Unlock()
+		}
+	}()
+
+	result := make(chan struct {
+		h  node.Hash
+		ok bool
+	}, 1)
+	go func() {
+		h, ok := rv.RandomPick(rng)
+		result <- struct {
+			h  node.Hash
+			ok bool
+		}{h: h, ok: ok}
+	}()
+	select {
+	case <-scanStarted:
+	case <-time.After(time.Second):
+		t.Fatal("RandomPick did not reach the controlled scan boundary")
+	}
+
+	rv.Remove(h1)
+	if rv.Size() != 1 {
+		t.Fatalf("controlled shrink has size %d, want 1", rv.Size())
+	}
+	rv.shards[0].mu.Unlock()
+	locked = false
+	if !rv.Contains(h0) {
+		t.Fatal("controlled shrink lost the surviving entry")
+	}
+
+	got := <-result
+	if !got.ok || got.h != h0 {
+		t.Fatalf("RandomPick = (%s, %v), want surviving entry (%s, true)", got.h.Hex(), got.ok, h0.Hex())
+	}
+}
+
+func hashForViewShard(t *testing.T, want int) node.Hash {
+	t.Helper()
+	for i := 0; ; i++ {
+		h := makeHash(`{"routable-shard":` + strconv.Itoa(i) + `}`)
+		if shardFor(h) == want {
+			return h
+		}
 	}
 }

@@ -92,7 +92,7 @@ func HandlePatchSystemConfig(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		result, err := cp.PatchRuntimeConfig(body)
+		result, err := cp.PatchRuntimeConfigContext(r.Context(), body)
 		if err != nil {
 			writeServiceError(w, err)
 			return

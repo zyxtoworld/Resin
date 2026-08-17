@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactElement } from "react";
+import { useEffect, useMemo, useState, type ReactElement } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "./auth-store";
 
@@ -6,16 +6,24 @@ type RequireAuthProps = {
   children: ReactElement;
 };
 
+type AuthCheckState = {
+  key: symbol;
+  checked: boolean;
+  anonymousAllowed: boolean;
+};
+
 export function RequireAuth({ children }: RequireAuthProps) {
   const token = useAuthStore((state) => state.token);
   const location = useLocation();
-  const [checked, setChecked] = useState(Boolean(token));
-  const [anonymousAllowed, setAnonymousAllowed] = useState(false);
+  const authCheckKey = useMemo(() => Symbol(token ? "authenticated" : "anonymous"), [token]);
+  const [authCheck, setAuthCheck] = useState<AuthCheckState>(() => ({
+    key: authCheckKey,
+    checked: Boolean(token),
+    anonymousAllowed: false,
+  }));
 
   useEffect(() => {
     if (token) {
-      setAnonymousAllowed(false);
-      setChecked(true);
       return;
     }
 
@@ -23,25 +31,20 @@ export function RequireAuth({ children }: RequireAuthProps) {
     const controller = new AbortController();
 
     const checkAuthMode = async () => {
+      let anonymousAllowed = false;
       try {
         const response = await fetch("/api/v1/system/info", {
           method: "GET",
           signal: controller.signal,
         });
-        if (!active) {
-          return;
-        }
         // /api/v1/system/info returns 200 only when admin auth is disabled.
-        setAnonymousAllowed(response.ok);
+        anonymousAllowed = response.ok;
       } catch {
-        if (!active) {
-          return;
-        }
-        setAnonymousAllowed(false);
-      } finally {
-        if (active) {
-          setChecked(true);
-        }
+        anonymousAllowed = false;
+      }
+
+      if (active) {
+        setAuthCheck({ key: authCheckKey, checked: true, anonymousAllowed });
       }
     };
 
@@ -51,7 +54,11 @@ export function RequireAuth({ children }: RequireAuthProps) {
       active = false;
       controller.abort();
     };
-  }, [token]);
+  }, [authCheckKey, token]);
+
+  const authCheckIsCurrent = authCheck.key === authCheckKey;
+  const checked = Boolean(token) || (authCheckIsCurrent && authCheck.checked);
+  const anonymousAllowed = !token && authCheckIsCurrent && authCheck.anonymousAllowed;
 
   if (token || anonymousAllowed) {
     return children;

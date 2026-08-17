@@ -26,6 +26,10 @@ type ReadOnlyView interface {
 type RoutableView struct {
 	shards [numShards]shard
 	size   atomic.Int64 // total count across all shards
+
+	// Package-private coordination seam for the concurrent RandomPick
+	// regression test. Production leaves it nil.
+	beforeRandomPickScanHook func()
 }
 
 type shard struct {
@@ -117,6 +121,9 @@ func (rv *RoutableView) RandomPick(rng *rand.Rand) (node.Hash, bool) {
 	}
 
 	target := rng.IntN(total)
+	if hook := rv.beforeRandomPickScanHook; hook != nil {
+		hook()
+	}
 	for i := range rv.shards {
 		s := &rv.shards[i]
 		s.mu.RLock()
@@ -128,6 +135,21 @@ func (rv *RoutableView) RandomPick(rng *rand.Rand) (node.Hash, bool) {
 		}
 		target -= n
 		s.mu.RUnlock()
+	}
+	// The set can shrink after size/target were read. If it is still non-empty,
+	// return a current member instead of turning that transient mismatch into
+	// a false empty result.
+	if rv.Size() > 0 {
+		var fallback node.Hash
+		found := false
+		rv.Range(func(h node.Hash) bool {
+			fallback = h
+			found = true
+			return false
+		})
+		if found {
+			return fallback, true
+		}
 	}
 	return node.Zero, false
 }

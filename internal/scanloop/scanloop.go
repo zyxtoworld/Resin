@@ -32,11 +32,38 @@ func Run(stopCh <-chan struct{}, minInterval, jitterRange time.Duration, fn func
 		}
 
 		timer.Reset(interval)
-		select {
-		case <-stopCh:
+		if !waitForTimerOrStop(stopCh, timer.C) {
 			return
-		case <-timer.C:
 		}
 		fn()
+	}
+}
+
+// waitForTimerOrStop gives a stop signal precedence over a timer that is
+// already ready. The first select alone is insufficient: when both channels
+// are ready, Go deliberately chooses a random case. The second non-blocking
+// check is the stop linearization point immediately before invoking fn.
+func waitForTimerOrStop(stopCh <-chan struct{}, timerCh <-chan time.Time) bool {
+	return waitForTimerOrStopWithHook(stopCh, timerCh, nil)
+}
+
+func waitForTimerOrStopWithHook(
+	stopCh <-chan struct{},
+	timerCh <-chan time.Time,
+	afterTimerReceive func(),
+) bool {
+	select {
+	case <-stopCh:
+		return false
+	case <-timerCh:
+		if afterTimerReceive != nil {
+			afterTimerReceive()
+		}
+		select {
+		case <-stopCh:
+			return false
+		default:
+			return true
+		}
 	}
 }

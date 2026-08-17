@@ -11,13 +11,17 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
+	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
@@ -106,6 +110,280 @@ func setProxyE2EOutboundDialFunc(
 	ob := &mockOutbound{dialFunc: dialFunc}
 	var wrapped adapter.Outbound = ob
 	entry.Outbound.Store(&wrapped)
+}
+
+type replacingHealthRecorder struct {
+	pool        *topology.GlobalNodePool
+	rawOptions  json.RawMessage
+	subID       string
+	replaced    chan struct{}
+	completed   chan struct{}
+	replaceOnce sync.Once
+	doneOnce    sync.Once
+}
+
+func (r *replacingHealthRecorder) replaceNode(hash node.Hash) {
+	r.replaceOnce.Do(func() {
+		r.pool.RemoveNodeFromSub(hash, r.subID)
+		r.pool.AddNodeFromSub(hash, r.rawOptions, r.subID)
+		close(r.replaced)
+	})
+}
+
+func (r *replacingHealthRecorder) complete() {
+	r.doneOnce.Do(func() { close(r.completed) })
+}
+
+func (r *replacingHealthRecorder) RecordResultForEntry(hash node.Hash, expected *node.NodeEntry, success bool) bool {
+	r.replaceNode(hash)
+	applied := r.pool.RecordResultForEntry(hash, expected, success)
+	r.complete()
+	return applied
+}
+
+func (r *replacingHealthRecorder) RecordLatencyForEntry(hash node.Hash, expected *node.NodeEntry, rawTarget string, latency *time.Duration) bool {
+	return r.pool.RecordLatencyForEntry(hash, expected, rawTarget, latency)
+}
+
+func (r *replacingHealthRecorder) RecordPassiveResultForEntry(platformID string, hash node.Hash, expected *node.NodeEntry, success bool) bool {
+	r.replaceNode(hash)
+	if success || !r.passiveCircuitBreakerDisabled(platformID) {
+		applied := r.pool.RecordResultForEntry(hash, expected, success)
+		r.complete()
+		return applied
+	}
+	r.complete()
+	return false
+}
+
+func (r *replacingHealthRecorder) passiveCircuitBreakerDisabled(platformID string) bool {
+	// The test uses an enabled platform, so passive feedback is always applied
+	// by the real pool on the old implementation.
+	return false
+}
+
+func TestForwardProxy_DoesNotApplyPassiveResultToRecreatedEntry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	raw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`)
+	hash := node.HashFromRawOptions(raw)
+	oldEntry, ok := env.pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("node not found in pool")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	health := &replacingHealthRecorder{
+		pool:       env.pool,
+		rawOptions: raw,
+		subID:      "sub-1",
+		replaced:   make(chan struct{}),
+		completed:  make(chan struct{}),
+	}
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     health,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/health-race", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", w.Code, http.StatusOK)
+	}
+
+	select {
+	case <-health.completed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for passive health callback")
+	}
+	select {
+	case <-health.replaced:
+	case <-time.After(time.Second):
+		t.Fatal("health callback did not replace the node")
+	}
+
+	newEntry, ok := env.pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("expected a recreated node entry")
+	}
+	if !newEntry.IsCircuitOpen() {
+		t.Fatal("passive result from the old request cleared the recreated entry circuit")
+	}
+}
+
+func TestRecordPassiveResultAsync_UsesCapturedPlatformPolicy(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.PassiveCircuitBreakerDisabled = true
+
+	route, err := env.router.RouteRequest("plat", "", "https://example.com")
+	if err != nil {
+		t.Fatalf("RouteRequest: %v", err)
+	}
+	entry := route.SelectedEntry()
+	if entry == nil {
+		t.Fatal("route did not carry selected entry")
+	}
+	if !route.PassiveCircuitBreakerDisabled {
+		t.Fatal("route did not capture disabled passive policy")
+	}
+
+	// Replace the platform policy before the admitted asynchronous callback
+	// runs. The old ID-based callback would read the new enabled policy and
+	// count this failure.
+	plat.PassiveCircuitBreakerDisabled = false
+	owner := NewHealthWriteOwner(env.pool)
+	recordPassiveResultAsync(owner, route, entry, false)
+	owner.CloseAndWait()
+
+	if got := entry.FailureCount.Load(); got != 0 {
+		t.Fatalf("late passive failure used replacement policy: failure count=%d, want 0", got)
+	}
+}
+
+func TestHealthWriteOwner_BarriersProductionDirtyFlush(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("persistence bootstrap: %v", err)
+	}
+	defer closer.Close()
+
+	subManager := topology.NewSubscriptionManager()
+	var callbackCalls atomic.Int32
+	callbackEntered := make(chan struct{})
+	callbackRelease := make(chan struct{})
+	callbackDone := make(chan struct{})
+	var callbackOnce sync.Once
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(_ netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyDecayWindow:     func() time.Duration { return time.Minute },
+		OnNodeDynamicChanged: func(hash node.Hash) {
+			if callbackCalls.Add(1) == 1 {
+				callbackOnce.Do(func() { close(callbackEntered) })
+				<-callbackRelease
+				engine.MarkNodeDynamic(hash.Hex())
+				close(callbackDone)
+			}
+		},
+	})
+
+	sub := subscription.NewSubscription("sub-health", "sub-health", "https://example.com", true, false)
+	subManager.Register(sub)
+	raw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`)
+	hash := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("node not found in pool")
+	}
+
+	readers := state.CacheReaders{
+		ReadNodeStatic: func(key string) *model.NodeStatic {
+			if key != hash.Hex() {
+				return nil
+			}
+			return &model.NodeStatic{
+				Hash:        key,
+				RawOptions:  append(json.RawMessage(nil), entry.RawOptions...),
+				CreatedAtNs: entry.CreatedAt.UnixNano(),
+			}
+		},
+		ReadNodeDynamic: func(key string) *model.NodeDynamic {
+			if key != hash.Hex() {
+				return nil
+			}
+			return &model.NodeDynamic{
+				Hash:             key,
+				FailureCount:     int(entry.FailureCount.Load()),
+				CircuitOpenSince: entry.CircuitOpenSince.Load(),
+			}
+		},
+		ReadNodeLatency:      func(state.NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease:            func(state.LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(state.SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+	engine.MarkNodeStatic(hash.Hex())
+	if err := engine.FlushDirtySets(readers); err != nil {
+		t.Fatalf("initial static flush: %v", err)
+	}
+
+	worker := state.NewCacheFlushWorker(
+		engine,
+		readers,
+		func() int { return 1 << 20 },
+		func() time.Duration { return time.Hour },
+		time.Hour,
+	)
+	worker.Start()
+	defer worker.Stop()
+
+	owner := NewHealthWriteOwner(pool)
+	recordPassiveResultAsync(owner, routing.RouteResult{NodeHash: hash}, entry, true)
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("production pool callback did not start")
+	}
+
+	ownerDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(ownerDone)
+	}()
+	select {
+	case <-owner.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("health owner did not close admission")
+	}
+	select {
+	case <-ownerDone:
+		t.Fatal("owner returned before admitted dirty write completed")
+	default:
+	}
+
+	close(callbackRelease)
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("production pool callback did not mark dynamic state")
+	}
+	select {
+	case <-ownerDone:
+	case <-time.After(time.Second):
+		t.Fatal("health owner did not drain admitted write")
+	}
+
+	worker.Stop()
+	if dirty := engine.DirtyCount(); dirty != 0 {
+		t.Fatalf("final flush left %d dirty entries", dirty)
+	}
+	dynamics, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("load dynamic cache: %v", err)
+	}
+	if len(dynamics) != 1 || dynamics[0].Hash != hash.Hex() || dynamics[0].CircuitOpenSince != 0 {
+		t.Fatalf("final flush did not persist health update: %+v", dynamics)
+	}
+
+	recordPassiveResultAsync(owner, routing.RouteResult{NodeHash: hash}, entry, true)
+	if got := callbackCalls.Load(); got != 1 {
+		t.Fatalf("health write started after owner close: callback calls=%d", got)
+	}
 }
 
 func TestForwardProxy_E2EHTTPSuccess(t *testing.T) {
@@ -500,9 +778,17 @@ func TestReverseProxy_E2ECapturesDetailPayloads(t *testing.T) {
 		PlatformLookup: env.pool,
 		Health:         &mockHealthRecorder{},
 		Events: ConfigAwareEventEmitter{
-			Base:                         emitter,
-			RequestLogEnabled:            func() bool { return true },
-			ReverseProxyLogDetailEnabled: func() bool { return true },
+			Base: emitter,
+			RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+				return RequestLogRuntimeConfig{
+					Enabled:             true,
+					DetailEnabled:       true,
+					ReqHeadersMaxBytes:  -1,
+					ReqBodyMaxBytes:     -1,
+					RespHeadersMaxBytes: -1,
+					RespBodyMaxBytes:    -1,
+				}
+			},
 		},
 	})
 
@@ -606,9 +892,17 @@ func TestReverseProxy_E2EWebSocketUpgrade_WithDetailCapture(t *testing.T) {
 		PlatformLookup: env.pool,
 		Health:         &mockHealthRecorder{},
 		Events: ConfigAwareEventEmitter{
-			Base:                         emitter,
-			RequestLogEnabled:            func() bool { return true },
-			ReverseProxyLogDetailEnabled: func() bool { return true },
+			Base: emitter,
+			RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+				return RequestLogRuntimeConfig{
+					Enabled:             true,
+					DetailEnabled:       true,
+					ReqHeadersMaxBytes:  -1,
+					ReqBodyMaxBytes:     -1,
+					RespHeadersMaxBytes: -1,
+					RespBodyMaxBytes:    -1,
+				}
+			},
 		},
 	})
 	reverseSrv := httptest.NewServer(rp)
@@ -695,6 +989,117 @@ func TestReverseProxy_E2EWebSocketUpgrade_WithDetailCapture(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("expected reverse log event for websocket upgrade")
+	}
+}
+
+func TestReverseProxy_E2EWebSocketUpgradeClientCloseDrainsBackend(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	emitter := newMockEventEmitter()
+	upstreamUpgraded := make(chan struct{})
+	upstreamClosed := make(chan struct{})
+	var upstreamUpgradeOnce sync.Once
+	var upstreamCloseOnce sync.Once
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("upstream does not support hijack")
+			return
+		}
+		conn, brw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		defer upstreamCloseOnce.Do(func() { close(upstreamClosed) })
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+		_, _ = brw.WriteString("Connection: Upgrade\r\n")
+		_, _ = brw.WriteString("Upgrade: websocket\r\n")
+		_, _ = brw.WriteString("\r\n")
+		if err := brw.Flush(); err != nil {
+			t.Errorf("upstream upgrade flush: %v", err)
+			return
+		}
+		upstreamUpgradeOnce.Do(func() { close(upstreamUpgraded) })
+		_, _ = io.Copy(io.Discard, conn)
+	}))
+	defer upstream.Close()
+
+	upstreamAddr := strings.TrimPrefix(upstream.URL, "http://")
+	setProxyE2EOutboundDialFunc(t, env, func(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, upstreamAddr)
+	})
+
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:     "tok",
+		Router:         env.router,
+		Pool:           env.pool,
+		PlatformLookup: env.pool,
+		Health:         &mockHealthRecorder{},
+		Events:         emitter,
+	})
+	reverseSrv := httptest.NewServer(rp)
+	defer reverseSrv.Close()
+
+	reverseAddr := strings.TrimPrefix(reverseSrv.URL, "http://")
+	clientConn, err := net.Dial("tcp", reverseAddr)
+	if err != nil {
+		t.Fatalf("dial reverse proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
+	request := fmt.Sprintf(
+		"GET /tok/plat:acct/http/%s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+		upstreamHost,
+		reverseAddr,
+	)
+	if _, err := clientConn.Write([]byte(request)); err != nil {
+		t.Fatalf("write upgrade request: %v", err)
+	}
+	reader := bufio.NewReader(clientConn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read upgrade status: %v", err)
+	}
+	if !strings.Contains(statusLine, "101 Switching Protocols") {
+		t.Fatalf("unexpected upgrade status: %q", statusLine)
+	}
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			t.Fatalf("read upgrade headers: %v", readErr)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	select {
+	case <-upstreamUpgraded:
+	case <-time.After(time.Second):
+		t.Fatal("upstream upgrade did not complete")
+	}
+
+	// httputil.ReverseProxy owns the request-context cancellation watcher for
+	// 101 upgrades. Closing the client must close the backend and let the
+	// handler's request lifecycle finish without a late copier.
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("close client connection: %v", err)
+	}
+	select {
+	case <-upstreamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("reverse upgrade backend was not closed after client cancellation")
+	}
+	select {
+	case logEvent := <-emitter.logCh:
+		if logEvent.HTTPStatus != http.StatusSwitchingProtocols {
+			t.Fatalf("HTTPStatus: got %d, want %d", logEvent.HTTPStatus, http.StatusSwitchingProtocols)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reverse upgrade handler did not finish after client cancellation")
 	}
 }
 
@@ -941,6 +1346,77 @@ func TestForwardProxy_CONNECTClientCanceledBeforeResponse(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if health.resultCalls.Load() != 0 {
 		t.Fatalf("client-canceled CONNECT should not record health result, got %d calls", health.resultCalls.Load())
+	}
+}
+
+func TestForwardProxy_CONNECTContextCancelBeforeTrafficDoesNotPenalizeNode(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer upstreamPeer.Close()
+	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return upstreamConn, nil
+	})
+
+	targetHealth := &mockPassiveHealthRecorder{}
+	healthOwner := NewHealthWriteOwner(targetHealth)
+	defer healthOwner.CloseAndWait()
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     healthOwner,
+	})
+
+	request := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+	request.Host = "example.com:443"
+	request.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	requestCtx, cancelRequest := context.WithCancel(request.Context())
+	defer cancelRequest()
+	request = request.WithContext(requestCtx)
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	writer := &hijackTestResponseWriter{
+		conn: serverConn,
+		rw:   bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn)),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fp.ServeHTTP(writer, request)
+	}()
+
+	reader := bufio.NewReader(clientConn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read CONNECT status: %v", err)
+	}
+	if !strings.Contains(statusLine, "200 Connection Established") {
+		t.Fatalf("unexpected CONNECT status: %q", statusLine)
+	}
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			t.Fatalf("read CONNECT headers: %v", readErr)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	// No bytes have crossed either direction. Cancellation must close both
+	// copies and release the upstream lease, but it is not an upstream node
+	// failure and must not call RecordPassiveResultForEntry(false).
+	cancelRequest()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Forward CONNECT did not return after request cancellation")
+	}
+	healthOwner.CloseAndWait()
+	if got := targetHealth.passiveCalls.Load(); got != 0 {
+		t.Fatalf("canceled CONNECT recorded %d passive health results, want 0", got)
 	}
 }
 

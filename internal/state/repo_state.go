@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,12 +21,182 @@ import (
 // All writes are serialized by an internal mutex.
 type StateRepo struct {
 	db *sql.DB
-	mu sync.Mutex
+	mu stateWriteMutex
+
+	writeMu      sync.Mutex
+	writeDone    chan struct{}
+	writeCtx     context.Context
+	writeCancel  context.CancelFunc
+	writeClosed  bool
+	activeWrites int
+	// beforeWriteHook is package-private coordination for lifecycle tests.
+	// Production leaves it nil.
+	beforeWriteHook func()
+	// beforeWriteMutexHook is package-private coordination immediately before
+	// the serialized repository write owner is acquired. Production leaves it
+	// nil.
+	beforeWriteMutexHook func()
 }
 
 // newStateRepo creates a StateRepo for the given state.db connection.
 func newStateRepo(db *sql.DB) *StateRepo {
-	return &StateRepo{db: db}
+	writeCtx, writeCancel := context.WithCancel(context.Background())
+	return &StateRepo{db: db, writeCtx: writeCtx, writeCancel: writeCancel}
+}
+
+var ErrStateWriteAdmissionClosed = errors.New("state write admission closed")
+
+// withWrite admits one strong-persistence mutation. Shutdown closes this
+// admission before closing state.db so a handler that outlives HTTP draining
+// cannot start a new state mutation.
+func (r *StateRepo) withWrite(fn func(context.Context) error) error {
+	return r.withWriteContext(context.Background(), fn)
+}
+
+// withWriteContext admits one strong-persistence mutation and combines the
+// caller context with the state-write shutdown context. The caller can
+// therefore cancel an HTTP mutation without weakening shutdown cancellation
+// for ordinary background callers.
+func (r *StateRepo) withWriteContext(parent context.Context, fn func(context.Context) error) error {
+	if r == nil {
+		return ErrStateWriteAdmissionClosed
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	interruptible := parent.Done() != nil
+
+	r.writeMu.Lock()
+	if r.writeCtx == nil {
+		r.writeCtx, r.writeCancel = context.WithCancel(context.Background())
+	}
+	if r.writeClosed {
+		r.writeMu.Unlock()
+		return ErrStateWriteAdmissionClosed
+	}
+	r.activeWrites++
+	if r.activeWrites == 1 {
+		r.writeDone = make(chan struct{})
+	}
+	ctx := r.writeCtx
+	r.writeMu.Unlock()
+	mergedCtx, cancel := context.WithCancel(parent)
+	if interruptible {
+		mergedCtx = context.WithValue(mergedCtx, contextSQLiteWriteKey{}, true)
+	}
+	stopAdmissionCancel := context.AfterFunc(ctx, cancel)
+	defer func() {
+		stopAdmissionCancel()
+		cancel()
+		r.writeMu.Lock()
+		r.activeWrites--
+		if r.activeWrites == 0 && r.writeDone != nil {
+			close(r.writeDone)
+			r.writeDone = nil
+		}
+		r.writeMu.Unlock()
+	}()
+	if hook := r.beforeWriteHook; hook != nil {
+		hook()
+	}
+	if err := mergedCtx.Err(); err != nil {
+		return err
+	}
+	retryUntil := time.Now().Add(time.Duration(DefaultSQLiteBusyTimeoutMs) * time.Millisecond)
+	for {
+		err := fn(mergedCtx)
+		if err == nil || !interruptible || mergedCtx.Err() != nil || !isSQLiteBusyError(err) || !time.Now().Before(retryUntil) {
+			return err
+		}
+
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-mergedCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return mergedCtx.Err()
+		}
+	}
+}
+
+func (r *StateRepo) lockWriteContext(ctx context.Context) (func(), error) {
+	if err := r.mu.lockContext(ctx); err != nil {
+		return nil, err
+	}
+	if !isContextSQLiteWrite(ctx) {
+		return r.mu.Unlock, nil
+	}
+
+	if _, err := r.db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", contextSQLiteBusyTimeoutMs)); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	return func() {
+		_, _ = r.db.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+		r.mu.Unlock()
+	}, nil
+}
+
+// CloseStateWriteAdmissionAndWait rejects new strong writes, cancels writes
+// already admitted, and waits for them until ctx expires. A later caller may
+// use a different context to finish observing the same admission owner.
+func (r *StateRepo) CloseStateWriteAdmissionAndWait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.writeMu.Lock()
+	if r.writeCtx == nil {
+		r.writeCtx, r.writeCancel = context.WithCancel(context.Background())
+	}
+	if !r.writeClosed {
+		r.writeClosed = true
+		if r.writeCancel != nil {
+			r.writeCancel()
+		}
+	}
+	done := r.writeDone
+	if r.activeWrites == 0 || done == nil {
+		r.writeMu.Unlock()
+		return nil
+	}
+	r.writeMu.Unlock()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForWrites waits until every admitted strong mutation has returned after
+// write admission has been closed. If admission is still open, this method is
+// not the owner of the strong-write lifecycle and returns immediately.
+func (r *StateRepo) waitForWrites() {
+	if r == nil {
+		return
+	}
+
+	r.writeMu.Lock()
+	done := r.writeDone
+	if !r.writeClosed || r.activeWrites == 0 || done == nil {
+		r.writeMu.Unlock()
+		return
+	}
+	r.writeMu.Unlock()
+	<-done
 }
 
 func encodeStringSliceJSON(values []string) (string, error) {
@@ -55,7 +226,15 @@ func decodeStringSliceJSON(raw string) ([]string, error) {
 // GetSystemConfig loads the runtime config and version from state.db.
 // Returns nil config and version 0 if no row exists.
 func (r *StateRepo) GetSystemConfig() (*config.RuntimeConfig, int, error) {
-	row := r.db.QueryRow("SELECT config_json, version FROM system_config WHERE id = 1")
+	return r.GetSystemConfigContext(context.Background())
+}
+
+// GetSystemConfigContext loads the runtime config with caller cancellation.
+func (r *StateRepo) GetSystemConfigContext(ctx context.Context) (*config.RuntimeConfig, int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := r.db.QueryRowContext(ctx, "SELECT config_json, version FROM system_config WHERE id = 1")
 	var configJSON string
 	var version int
 	if err := row.Scan(&configJSON, &version); err != nil {
@@ -73,98 +252,50 @@ func (r *StateRepo) GetSystemConfig() (*config.RuntimeConfig, int, error) {
 
 // SaveSystemConfig persists the runtime config with the given version.
 func (r *StateRepo) SaveSystemConfig(cfg *config.RuntimeConfig, version int, updatedAtNs int64) error {
+	return r.SaveSystemConfigContext(context.Background(), cfg, version, updatedAtNs)
+}
+
+// SaveSystemConfigContext persists the runtime config with caller
+// cancellation while retaining the state-write shutdown admission contract.
+func (r *StateRepo) SaveSystemConfigContext(ctx context.Context, cfg *config.RuntimeConfig, version int, updatedAtNs int64) error {
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal system_config: %w", err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
-	_, err = r.db.Exec(`
-		INSERT INTO system_config (id, config_json, version, updated_at_ns)
-		VALUES (1, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			config_json   = excluded.config_json,
-			version       = excluded.version,
-			updated_at_ns = excluded.updated_at_ns
-	`, string(data), version, updatedAtNs)
-	return err
+		_, err = r.db.ExecContext(writeCtx, `
+			INSERT INTO system_config (id, config_json, version, updated_at_ns)
+			VALUES (1, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				config_json   = excluded.config_json,
+				version       = excluded.version,
+				updated_at_ns = excluded.updated_at_ns
+		`, string(data), version, updatedAtNs)
+		return err
+	})
 }
 
 // --- platforms ---
 
-// UpsertPlatform inserts or updates a platform by ID.
-// If the name collides with a different platform's name, ErrConflict is returned.
-func (r *StateRepo) UpsertPlatform(p model.Platform) error {
-	p.Name = platform.NormalizePlatformName(p.Name)
-	if err := platform.ValidatePlatformName(p.Name); err != nil {
-		return fmt.Errorf("platform name: %w", err)
-	}
-
-	// Validate strongly-typed filters before persistence.
-	if _, err := platform.CompileRegexFilters(p.RegexFilters); err != nil {
-		return err
-	}
-	if err := platform.ValidateRegionFilters(p.RegionFilters); err != nil {
-		return err
-	}
-	if _, err := platform.CompileResponseRules(p.ID, p.ResponseRules); err != nil {
-		return err
-	}
-	if p.ResponseRules == nil {
-		p.ResponseRules = []model.PlatformResponseRule{}
-	}
-	missAction := platform.NormalizeReverseProxyMissAction(p.ReverseProxyMissAction)
-	if missAction == "" {
-		return fmt.Errorf("reverse_proxy_miss_action: invalid value %q", p.ReverseProxyMissAction)
-	}
-	p.ReverseProxyMissAction = string(missAction)
-	if !platform.AllocationPolicy(p.AllocationPolicy).IsValid() {
-		return fmt.Errorf("allocation_policy: invalid value %q", p.AllocationPolicy)
-	}
-	behavior := platform.ReverseProxyEmptyAccountBehavior(strings.TrimSpace(p.ReverseProxyEmptyAccountBehavior))
-	if behavior == "" {
-		behavior = platform.ReverseProxyEmptyAccountBehaviorRandom
-	}
-	if !behavior.IsValid() {
-		return fmt.Errorf("reverse_proxy_empty_account_behavior: invalid value %q", p.ReverseProxyEmptyAccountBehavior)
-	}
-	p.ReverseProxyEmptyAccountBehavior = string(behavior)
-	normalizedFixedHeaders, fixedHeaders, err := platform.NormalizeFixedAccountHeaders(p.ReverseProxyFixedAccountHeader)
-	if err != nil {
-		return fmt.Errorf("reverse_proxy_fixed_account_header: %w", err)
-	}
-	p.ReverseProxyFixedAccountHeader = normalizedFixedHeaders
-	if behavior == platform.ReverseProxyEmptyAccountBehaviorFixedHeader && len(fixedHeaders) == 0 {
-		return fmt.Errorf(
-			"reverse_proxy_fixed_account_header: required when reverse_proxy_empty_account_behavior is %s",
-			platform.ReverseProxyEmptyAccountBehaviorFixedHeader,
-		)
-	}
-	regexFiltersJSON, err := encodeStringSliceJSON(p.RegexFilters)
-	if err != nil {
-		return fmt.Errorf("encode platform %s regex_filters: %w", p.ID, err)
-	}
-	regionFiltersJSON, err := encodeStringSliceJSON(p.RegionFilters)
-	if err != nil {
-		return fmt.Errorf("encode platform %s region_filters: %w", p.ID, err)
-	}
-	responseRulesJSON, err := json.Marshal(p.ResponseRules)
-	if err != nil {
-		return fmt.Errorf("encode platform %s response_rules: %w", p.ID, err)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	_, err = r.db.Exec(`
+const platformInsertSQL = `
 		INSERT INTO platforms (id, name, sticky_ttl_ns, regex_filters_json, region_filters_json,
 		                       response_rules_json,
 		                       reverse_proxy_miss_action, reverse_proxy_empty_account_behavior,
 		                       reverse_proxy_fixed_account_header, allocation_policy,
 		                       passive_circuit_breaker_disabled, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+const platformUpsertSQL = platformInsertSQL + `
 		ON CONFLICT(id) DO UPDATE SET
 			name                     = excluded.name,
 			sticky_ttl_ns            = excluded.sticky_ttl_ns,
@@ -176,17 +307,138 @@ func (r *StateRepo) UpsertPlatform(p model.Platform) error {
 			reverse_proxy_fixed_account_header   = excluded.reverse_proxy_fixed_account_header,
 			allocation_policy        = excluded.allocation_policy,
 			passive_circuit_breaker_disabled = excluded.passive_circuit_breaker_disabled,
-			updated_at_ns            = excluded.updated_at_ns
-	`, p.ID, p.Name, p.StickyTTLNs, regexFiltersJSON, regionFiltersJSON, responseRulesJSON,
-		p.ReverseProxyMissAction, p.ReverseProxyEmptyAccountBehavior, p.ReverseProxyFixedAccountHeader,
-		p.AllocationPolicy, p.PassiveCircuitBreakerDisabled, p.UpdatedAtNs)
+			updated_at_ns            = excluded.updated_at_ns`
+
+func preparePlatformPersistence(p model.Platform) (model.Platform, string, string, string, error) {
+	p.Name = platform.NormalizePlatformName(p.Name)
+	if err := platform.ValidatePlatformName(p.Name); err != nil {
+		return model.Platform{}, "", "", "", fmt.Errorf("platform name: %w", err)
+	}
+
+	// Validate strongly-typed filters before persistence.
+	if _, err := platform.CompileRegexFilters(p.RegexFilters); err != nil {
+		return model.Platform{}, "", "", "", err
+	}
+	if err := platform.ValidateRegionFilters(p.RegionFilters); err != nil {
+		return model.Platform{}, "", "", "", err
+	}
+	if _, err := platform.CompileResponseRules(p.ID, p.ResponseRules); err != nil {
+		return model.Platform{}, "", "", "", err
+	}
+	if p.ResponseRules == nil {
+		p.ResponseRules = []model.PlatformResponseRule{}
+	}
+	missAction := platform.NormalizeReverseProxyMissAction(p.ReverseProxyMissAction)
+	if missAction == "" {
+		return model.Platform{}, "", "", "", fmt.Errorf("reverse_proxy_miss_action: invalid value %q", p.ReverseProxyMissAction)
+	}
+	p.ReverseProxyMissAction = string(missAction)
+	if !platform.AllocationPolicy(p.AllocationPolicy).IsValid() {
+		return model.Platform{}, "", "", "", fmt.Errorf("allocation_policy: invalid value %q", p.AllocationPolicy)
+	}
+	behavior := platform.ReverseProxyEmptyAccountBehavior(strings.TrimSpace(p.ReverseProxyEmptyAccountBehavior))
+	if behavior == "" {
+		behavior = platform.ReverseProxyEmptyAccountBehaviorRandom
+	}
+	if !behavior.IsValid() {
+		return model.Platform{}, "", "", "", fmt.Errorf("reverse_proxy_empty_account_behavior: invalid value %q", p.ReverseProxyEmptyAccountBehavior)
+	}
+	p.ReverseProxyEmptyAccountBehavior = string(behavior)
+	normalizedFixedHeaders, fixedHeaders, err := platform.NormalizeFixedAccountHeaders(p.ReverseProxyFixedAccountHeader)
 	if err != nil {
-		if isSQLiteUniqueConstraint(err) {
-			return fmt.Errorf("%w: platform name already exists", ErrConflict)
-		}
+		return model.Platform{}, "", "", "", fmt.Errorf("reverse_proxy_fixed_account_header: %w", err)
+	}
+	p.ReverseProxyFixedAccountHeader = normalizedFixedHeaders
+	if behavior == platform.ReverseProxyEmptyAccountBehaviorFixedHeader && len(fixedHeaders) == 0 {
+		return model.Platform{}, "", "", "", fmt.Errorf(
+			"reverse_proxy_fixed_account_header: required when reverse_proxy_empty_account_behavior is %s",
+			platform.ReverseProxyEmptyAccountBehaviorFixedHeader,
+		)
+	}
+	regexFiltersJSON, err := encodeStringSliceJSON(p.RegexFilters)
+	if err != nil {
+		return model.Platform{}, "", "", "", fmt.Errorf("encode platform %s regex_filters: %w", p.ID, err)
+	}
+	regionFiltersJSON, err := encodeStringSliceJSON(p.RegionFilters)
+	if err != nil {
+		return model.Platform{}, "", "", "", fmt.Errorf("encode platform %s region_filters: %w", p.ID, err)
+	}
+	responseRulesJSON, err := json.Marshal(p.ResponseRules)
+	if err != nil {
+		return model.Platform{}, "", "", "", fmt.Errorf("encode platform %s response_rules: %w", p.ID, err)
+	}
+	return p, regexFiltersJSON, regionFiltersJSON, string(responseRulesJSON), nil
+}
+
+func platformPersistenceArgs(p model.Platform, regexFiltersJSON, regionFiltersJSON, responseRulesJSON string) []any {
+	return []any{
+		p.ID, p.Name, p.StickyTTLNs, regexFiltersJSON, regionFiltersJSON, responseRulesJSON,
+		p.ReverseProxyMissAction, p.ReverseProxyEmptyAccountBehavior, p.ReverseProxyFixedAccountHeader,
+		p.AllocationPolicy, p.PassiveCircuitBreakerDisabled, p.UpdatedAtNs,
+	}
+}
+
+// UpsertPlatform inserts or updates a platform by ID.
+// If the name collides with a different platform's name, ErrConflict is returned.
+func (r *StateRepo) UpsertPlatform(p model.Platform) error {
+	return r.UpsertPlatformContext(context.Background(), p)
+}
+
+// UpsertPlatformContext inserts or updates a platform by ID while honoring ctx.
+func (r *StateRepo) UpsertPlatformContext(ctx context.Context, p model.Platform) error {
+	p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON, err := preparePlatformPersistence(p)
+	if err != nil {
 		return err
 	}
-	return err
+
+	return r.withWriteContext(ctx, func(ctx context.Context) error {
+		unlock, err := r.lockWriteContext(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		_, err = r.db.ExecContext(ctx, platformUpsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		if err != nil {
+			if isSQLiteUniqueConstraint(err) {
+				return fmt.Errorf("%w: platform name already exists", ErrConflict)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// InsertPlatform persists a new platform and rejects both duplicate IDs and
+// duplicate names. Create paths must use this strict operation; UpsertPlatform
+// is reserved for updates and bootstrap reconciliation.
+func (r *StateRepo) InsertPlatform(p model.Platform) error {
+	return r.InsertPlatformContext(context.Background(), p)
+}
+
+// InsertPlatformContext persists a new platform while honoring ctx.
+func (r *StateRepo) InsertPlatformContext(ctx context.Context, p model.Platform) error {
+	p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON, err := preparePlatformPersistence(p)
+	if err != nil {
+		return err
+	}
+
+	return r.withWriteContext(ctx, func(ctx context.Context) error {
+		unlock, err := r.lockWriteContext(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		_, err = r.db.ExecContext(ctx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		if err != nil {
+			if isSQLitePlatformConflict(err) {
+				return fmt.Errorf("%w: platform ID or name already exists", ErrConflict)
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 func isSQLiteUniqueConstraint(err error) bool {
@@ -194,27 +446,54 @@ func isSQLiteUniqueConstraint(err error) bool {
 	if !errors.As(err, &sqlErr) {
 		return false
 	}
-	switch sqlErr.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE:
-		return true
+	return sqlErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+}
+
+func isSQLiteBusyError(err error) bool {
+	var sqlErr *sqlite.Error
+	if !errors.As(err, &sqlErr) {
+		return false
 	}
-	return false
+	return sqlErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+func isSQLitePlatformConflict(err error) bool {
+	var sqlErr *sqlite.Error
+	if !errors.As(err, &sqlErr) {
+		return false
+	}
+	switch sqlErr.Code() {
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+		return true
+	default:
+		return false
+	}
 }
 
 // DeletePlatform removes a platform by ID.
 func (r *StateRepo) DeletePlatform(id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.DeletePlatformContext(context.Background(), id)
+}
 
-	result, err := r.db.Exec("DELETE FROM platforms WHERE id = ?", id)
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+// DeletePlatformContext removes a platform by ID while honoring ctx.
+func (r *StateRepo) DeletePlatformContext(ctx context.Context, id string) error {
+	return r.withWriteContext(ctx, func(ctx context.Context) error {
+		unlock, err := r.lockWriteContext(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		result, err := r.db.ExecContext(ctx, "DELETE FROM platforms WHERE id = ?", id)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // GetPlatformName returns platform name by ID without decoding filter columns.
@@ -315,6 +594,12 @@ func (r *StateRepo) ListPlatforms() ([]model.Platform, error) {
 // UpsertSubscription inserts or updates a subscription by ID.
 // On update, created_at_ns is preserved (not overwritten).
 func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
+	return r.UpsertSubscriptionContext(context.Background(), s)
+}
+
+// UpsertSubscriptionContext inserts or updates a subscription while honoring
+// the caller's cancellation during the write owner and SQLite operation.
+func (r *StateRepo) UpsertSubscriptionContext(ctx context.Context, s model.Subscription) error {
 	// Validate minimum update interval (30 seconds).
 	const minInterval = int64(30 * time.Second)
 	if s.UpdateIntervalNs < minInterval {
@@ -327,10 +612,17 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 		return fmt.Errorf("source_type: must be remote or local, got %q", s.SourceType)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
-	_, err := r.db.Exec(`
+		_, err = r.db.ExecContext(writeCtx, `
 			INSERT INTO subscriptions (id, name, source_type, url, content, update_interval_ns, enabled,
 			                           ephemeral, incremental_alive_nodes, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -346,24 +638,39 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 				ephemeral_node_evict_delay_ns = excluded.ephemeral_node_evict_delay_ns,
 				updated_at_ns      = excluded.updated_at_ns
 		`, s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
-		s.Ephemeral, s.IncrementalAliveNodes, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
-	return err
+			s.Ephemeral, s.IncrementalAliveNodes, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
+		return err
+	})
 }
 
 // DeleteSubscription removes a subscription by ID.
 func (r *StateRepo) DeleteSubscription(id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.DeleteSubscriptionContext(context.Background(), id)
+}
 
-	result, err := r.db.Exec("DELETE FROM subscriptions WHERE id = ?", id)
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+// DeleteSubscriptionContext removes a subscription while honoring the
+// caller's cancellation during the write owner and SQLite operation.
+func (r *StateRepo) DeleteSubscriptionContext(ctx context.Context, id string) error {
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		result, err := r.db.ExecContext(writeCtx, "DELETE FROM subscriptions WHERE id = ?", id)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // ListSubscriptions returns all subscriptions.
@@ -394,29 +701,56 @@ func (r *StateRepo) ListSubscriptions() ([]model.Subscription, error) {
 
 // InsertEndpoint persists a new custom endpoint.
 func (r *StateRepo) InsertEndpoint(endpoint model.Endpoint) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.InsertEndpointContext(context.Background(), endpoint)
+}
 
-	_, err := r.db.Exec(`
+// InsertEndpointContext persists a new custom endpoint while honoring the
+// caller's cancellation during the SQLite operation.
+func (r *StateRepo) InsertEndpointContext(ctx context.Context, endpoint model.Endpoint) error {
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		_, err = r.db.ExecContext(writeCtx, `
 		INSERT INTO endpoints (
 			id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
 			allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, endpoint.ID, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
-		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
-		endpoint.AllowSOCKS5, endpoint.CreatedAtNs, endpoint.UpdatedAtNs)
-	if isSQLiteUniqueConstraint(err) {
-		return fmt.Errorf("%w: endpoint id or port already exists", ErrConflict)
-	}
-	return err
+		`, endpoint.ID, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
+			endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
+			endpoint.AllowSOCKS5, endpoint.CreatedAtNs, endpoint.UpdatedAtNs)
+		if isSQLiteUniqueConstraint(err) {
+			return fmt.Errorf("%w: endpoint id or port already exists", ErrConflict)
+		}
+		return err
+	})
 }
 
 // UpdateEndpoint replaces the mutable fields of an existing custom endpoint.
 func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.UpdateEndpointContext(context.Background(), endpoint)
+}
 
-	result, err := r.db.Exec(`
+// UpdateEndpointContext replaces endpoint fields while honoring the caller's
+// cancellation during the SQLite operation.
+func (r *StateRepo) UpdateEndpointContext(ctx context.Context, endpoint model.Endpoint) error {
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		result, err := r.db.ExecContext(writeCtx, `
 		UPDATE endpoints SET
 			port = ?,
 			enabled = ?,
@@ -428,41 +762,65 @@ func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
 			allow_socks5 = ?,
 			updated_at_ns = ?
 		WHERE id = ?
-	`, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
-		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
-		endpoint.AllowSOCKS5, endpoint.UpdatedAtNs, endpoint.ID)
-	if isSQLiteUniqueConstraint(err) {
-		return fmt.Errorf("%w: endpoint port already exists", ErrConflict)
-	}
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+		`, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
+			endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
+			endpoint.AllowSOCKS5, endpoint.UpdatedAtNs, endpoint.ID)
+		if isSQLiteUniqueConstraint(err) {
+			return fmt.Errorf("%w: endpoint port already exists", ErrConflict)
+		}
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // DeleteEndpoint removes a custom endpoint by ID.
 func (r *StateRepo) DeleteEndpoint(id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.DeleteEndpointContext(context.Background(), id)
+}
 
-	result, err := r.db.Exec("DELETE FROM endpoints WHERE id = ?", id)
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+// DeleteEndpointContext removes an endpoint while honoring the caller's
+// cancellation during the SQLite operation.
+func (r *StateRepo) DeleteEndpointContext(ctx context.Context, id string) error {
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		result, err := r.db.ExecContext(writeCtx, "DELETE FROM endpoints WHERE id = ?", id)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // GetEndpoint returns one persisted custom endpoint.
 func (r *StateRepo) GetEndpoint(id string) (*model.Endpoint, error) {
-	row := r.db.QueryRow(`
+	return r.GetEndpointContext(context.Background(), id)
+}
+
+// GetEndpointContext returns one endpoint while honoring caller cancellation
+// during the SQLite read.
+func (r *StateRepo) GetEndpointContext(ctx context.Context, id string) (*model.Endpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := r.db.QueryRowContext(ctx, `
 		SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
 		       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
 		FROM endpoints WHERE id = ?
@@ -542,19 +900,24 @@ func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool,
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	var created bool
+	err = r.withWrite(func(ctx context.Context) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 
-	result, err := r.db.Exec(`
+		result, err := r.db.ExecContext(ctx, `
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
 		VALUES (?, ?, ?)
 		ON CONFLICT(url_prefix) DO NOTHING
-	`, rule.URLPrefix, headersJSON, rule.UpdatedAtNs)
-	if err != nil {
-		return false, err
-	}
-	n, _ := result.RowsAffected()
-	return n > 0, nil
+		`, rule.URLPrefix, headersJSON, rule.UpdatedAtNs)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		created = n > 0
+		return nil
+	})
+	return created, err
 }
 
 // UpsertAccountHeaderRuleWithCreated inserts or updates a rule by url_prefix and
@@ -565,58 +928,61 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderR
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	var inserted bool
+	err = r.withWrite(func(ctx context.Context) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 
-	tx, err := r.db.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
 
-	insertRes, err := tx.Exec(`
+		insertRes, err := tx.ExecContext(ctx, `
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
 		VALUES (?, ?, ?)
 		ON CONFLICT(url_prefix) DO NOTHING
-	`, rule.URLPrefix, headersJSON, rule.UpdatedAtNs)
-	if err != nil {
-		return false, err
-	}
+		`, rule.URLPrefix, headersJSON, rule.UpdatedAtNs)
+		if err != nil {
+			return err
+		}
 
-	inserted := false
-	if n, _ := insertRes.RowsAffected(); n > 0 {
-		inserted = true
-	} else {
-		// Existing row: apply update path.
-		if _, err := tx.Exec(`
+		inserted = false
+		if n, _ := insertRes.RowsAffected(); n > 0 {
+			inserted = true
+		} else {
+			// Existing row: apply update path.
+			if _, err := tx.ExecContext(ctx, `
 				UPDATE account_header_rules
 				SET headers_json = ?, updated_at_ns = ?
 				WHERE url_prefix = ?
 			`, headersJSON, rule.UpdatedAtNs, rule.URLPrefix); err != nil {
-			return false, err
+				return err
+			}
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return inserted, nil
+		return tx.Commit()
+	})
+	return inserted, err
 }
 
 // DeleteAccountHeaderRule removes a rule by url_prefix.
 func (r *StateRepo) DeleteAccountHeaderRule(prefix string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.withWrite(func(ctx context.Context) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 
-	result, err := r.db.Exec("DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
-	if err != nil {
-		return err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+		result, err := r.db.ExecContext(ctx, "DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // ListAccountHeaderRules returns all rules.

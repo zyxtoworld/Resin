@@ -38,7 +38,7 @@ func HandleGeoIPLookup(cp *service.ControlPlaneService) http.HandlerFunc {
 // HandleGeoIPUpdate returns a handler for POST /api/v1/geoip/actions/update-now.
 func HandleGeoIPUpdate(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := cp.UpdateGeoIPNow(); err != nil {
+		if err := cp.UpdateGeoIPNowContext(r.Context()); err != nil {
 			writeServiceError(w, err)
 			return
 		}

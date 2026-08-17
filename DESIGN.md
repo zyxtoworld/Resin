@@ -2342,16 +2342,17 @@ GeoIP 与订阅的下载都有错误重试的需求。
 * `RESIN_DEFAULT_PLATFORM_ALLOCATION_POLICY`：默认平台分配策略。枚举：`BALANCED|PREFER_LOW_LATENCY|PREFER_IDLE_IP`。默认 `BALANCED`。
 * `RESIN_PROBE_TIMEOUT`：单次探测请求超时。默认 "15s"。
 * `RESIN_RESOURCE_FETCH_TIMEOUT`：资源下载（订阅/GeoIP）单次尝试超时。默认 "30s"。
+  远端响应体最大 16 MiB；超过上限的响应按下载失败处理，避免无界内存分配。
 * `RESIN_NODE_DNS_UPSTREAMS`：Resin 托管节点域名解析上游，JSON 字符串数组。默认值为 `["https://doh.pub/dns-query","https://dns.alidns.com/dns-query","tls://223.5.5.5?sni=dns.alidns.com","local"]`；设置后完全按数组顺序作为 failover 链。仅作用于内部 sing-box builder 解析节点域名，不影响订阅下载、GeoIP 下载等其他资源下载路径。
   * 支持：`local`、`udp://host[:port]`、`tcp://host[:port]`、`tls://host[:port]?sni=name`、`quic://host[:port]?sni=name`、`https://host[:port][/path]?sni=name&bootstrap=local`、`h3://host[:port][/path]?sni=name&bootstrap=local`。
   * 默认端口由传输类型决定：UDP/TCP 为 53，DoT/DoQ 为 853，DoH/H3 为 443；DoH/H3 默认路径为 `/dns-query`。
 * `RESIN_PROXY_BYPASS`：不走代理节点的目标规则，默认空。用分号、逗号或换行分隔；命中规则的 HTTP 正向代理、SOCKS5 正向代理与反向代理请求会由 Resin 本机直连目标。支持精确主机、`*`/`?` 通配符、CIDR 网段与 `<local>`（无点号本地域名），例如 `localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>`。
 
 日志相关配置：
-* `RESIN_REQUEST_LOG_QUEUE_SIZE`：日志写入队列大小。至少是 RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE 的两倍。默认 8192。
-* `RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE`：批量写入数据库的大小。默认 4096.
+* `RESIN_REQUEST_LOG_QUEUE_SIZE`：日志写入队列大小。至少是 RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE 的两倍，最大 131072。默认 8192。
+* `RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE`：批量写入数据库的大小，最大 65536。默认 4096.
 * `RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL`：写库间隔。默认 "5m"。
-* `RESIN_REQUEST_LOG_DB_MAX_MB`：SQLite 当前活动日志数据库的最大字节数。默认 512。
+* `RESIN_REQUEST_LOG_DB_MAX_MB`：SQLite 当前活动日志数据库的最大字节数。默认 512；换算为字节后必须能由有符号 64 位整数表示，溢出配置拒绝启动。
 * `RESIN_REQUEST_LOG_DB_RETAIN_COUNT`：保留的日志数据库文件总数（滚动日志），默认 2。
 
 认证设置：
@@ -2399,10 +2400,10 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 #### 请求日志设置
 * `RequestLogEnabled`: 是否开启请求日志记录。此开关实时生效。默认 True。
 * `ReverseProxyLogDetailEnabled`: 是否记录反向代理的详细日志（请求/响应头与体）。默认 False。
-* `ReverseProxyLogReqHeadersMaxBytes`: 记录请求头的最大字节数。默认 4KB。
-* `ReverseProxyLogReqBodyMaxBytes`: 记录请求体的最大字节数。默认 1KB。
-* `ReverseProxyLogRespHeadersMaxBytes`: 记录响应头的最大字节数。默认 1KB。
-* `ReverseProxyLogRespBodyMaxBytes`: 记录响应体的最大字节数。默认 1KB。
+* `ReverseProxyLogReqHeadersMaxBytes`: 记录请求头的最大字节数。默认 4KB，单字段上限 16MiB。
+* `ReverseProxyLogReqBodyMaxBytes`: 记录请求体的最大字节数。默认 1KB，单字段上限 16MiB。
+* `ReverseProxyLogRespHeadersMaxBytes`: 记录响应头的最大字节数。默认 1KB，单字段上限 16MiB。
+* `ReverseProxyLogRespBodyMaxBytes`: 记录响应体的最大字节数。默认 1KB，单字段上限 16MiB。
 
 #### 健康检查参数
 * `MaxConsecutiveFailures`: 触发熔断的连续失败次数阈值。默认 3。
@@ -2412,7 +2413,7 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 
 #### 探测设置
 * `LatencyTestURL`: 主动延迟探测的目标 URL。默认 `https://www.gstatic.com/generate_204`。一定属于 LatencyAuthorities 之一。如果不属于就加入。
-* `LatencyAuthorities`: 权威域名列表。默认 `["gstatic.com", "google.com", "cloudflare.com", "github.com"]`。
+* `LatencyAuthorities`: 权威域名列表，最多 32 项。默认 `["gstatic.com", "google.com", "cloudflare.com", "github.com"]`。
 
 #### P2C 选路设置
 * `P2CLatencyWindow`: 在 P2C 选路时，仅考虑该时间窗口内更新过的延迟数据。默认 10 分钟。
@@ -2650,8 +2651,8 @@ func (c *tlsLatencyConn) Read(b []byte) (int, error) {
 			startNano := atomic.LoadInt64(&c.startTime)
 			if startNano > 0 {
 				latency := time.Duration(time.Now().UnixNano() - startNano)
-				// 异步上报延迟...
-				go c.recordLatency(latency)
+				// 由共享写入 owner 完成准入后异步上报延迟。
+				c.recordLatency(latency)
 			}
 		}
 	}

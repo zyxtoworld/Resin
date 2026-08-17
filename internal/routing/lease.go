@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // Lease represents a sticky routing lease.
@@ -72,17 +72,30 @@ func (t *LeaseTable) CreateLease(account string, lease Lease) {
 // Returns the deleted lease and true when a lease was actually deleted.
 func (t *LeaseTable) DeleteLease(account string) (Lease, bool) {
 	var deleted Lease
+	ok := t.deleteLeaseWith(account, func(lease Lease) {
+		deleted = lease
+	})
+	return deleted, ok
+}
+
+// deleteLeaseWith removes a lease and invokes onDeleted inside the same
+// per-account Compute callback, after the counters have been updated and
+// before the delete operation is committed. Callers use this only for local
+// bookkeeping such as assigning an event ticket; it must not run user code.
+func (t *LeaseTable) deleteLeaseWith(account string, onDeleted func(Lease)) bool {
 	ok := false
 	t.leases.Compute(account, func(oldVal Lease, loaded bool) (Lease, xsync.ComputeOp) {
 		if loaded {
 			t.stats.Dec(oldVal.EgressIP)
-			deleted = oldVal
 			ok = true
+			if onDeleted != nil {
+				onDeleted(oldVal)
+			}
 			return oldVal, xsync.DeleteOp
 		}
 		return oldVal, xsync.CancelOp
 	})
-	return deleted, ok
+	return ok
 }
 
 // Size returns the number of leases in the table.
@@ -95,8 +108,13 @@ func (s *IPLoadStats) Inc(ip netip.Addr) {
 	if !ip.IsValid() {
 		return
 	}
-	ctr, _ := s.counts.LoadOrStore(ip, new(atomic.Int64))
-	ctr.Add(1)
+	s.counts.Compute(ip, func(ctr *atomic.Int64, loaded bool) (*atomic.Int64, xsync.ComputeOp) {
+		if !loaded {
+			ctr = new(atomic.Int64)
+		}
+		ctr.Add(1)
+		return ctr, xsync.UpdateOp
+	})
 }
 
 // Dec decrements the lease count for an IP.
@@ -104,12 +122,15 @@ func (s *IPLoadStats) Dec(ip netip.Addr) {
 	if !ip.IsValid() {
 		return
 	}
-	if ctr, ok := s.counts.Load(ip); ok {
-		ctr.Add(-1)
-		// We don't remove zero counters to avoid race conditions with concurrent Inc.
-		// Since the set of egress IPs is bounded (by number of nodes), this leakage
-		// is acceptable and bounded.
-	}
+	s.counts.Compute(ip, func(ctr *atomic.Int64, loaded bool) (*atomic.Int64, xsync.ComputeOp) {
+		if !loaded {
+			return ctr, xsync.CancelOp
+		}
+		if ctr.Add(-1) <= 0 {
+			return ctr, xsync.DeleteOp
+		}
+		return ctr, xsync.UpdateOp
+	})
 }
 
 // Get returns the current lease count for an IP.
@@ -143,5 +164,5 @@ func (s *IPLoadStats) Snapshot() map[netip.Addr]int64 {
 
 // IsExpired checks if a lease is expired relative to the given time.
 func (l Lease) IsExpired(now time.Time) bool {
-	return l.ExpiryNs < now.UnixNano()
+	return l.ExpiryNs <= now.UnixNano()
 }

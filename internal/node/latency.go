@@ -1,6 +1,7 @@
 package node
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -16,6 +17,20 @@ type DomainLatencyStats struct {
 }
 
 const latencyReadTouchMinInterval = 100 * time.Millisecond
+
+// MaxLatencyAuthorityEntries is the hard per-node budget for resident
+// authority-domain samples. Runtime configuration uses the same limit before
+// it is published, while the table keeps the bound for defensive callers.
+const MaxLatencyAuthorityEntries = 32
+
+// ValidateLatencyAuthorities validates the configuration that controls the
+// resident latency partition.
+func ValidateLatencyAuthorities(authorities []string) error {
+	if len(authorities) > MaxLatencyAuthorityEntries {
+		return fmt.Errorf("at most %d authority domains are allowed", MaxLatencyAuthorityEntries)
+	}
+	return nil
+}
 
 type latencySlot struct {
 	key          uint64
@@ -36,7 +51,8 @@ type latencyEntry struct {
 // Domain lookup inside the table uses a 64-bit xxh3 hash key for compactness.
 // This intentionally accepts extremely low-probability hash collisions.
 type LatencyTable struct {
-	mu sync.Mutex
+	mu                sync.Mutex
+	authorityCapacity int
 
 	authorities []latencySlot
 	regular     []latencySlot
@@ -49,7 +65,8 @@ func NewLatencyTable(maxEntries int) *LatencyTable {
 		panic("node: latency table max entries must be positive")
 	}
 	return &LatencyTable{
-		regular: make([]latencySlot, maxEntries),
+		authorityCapacity: MaxLatencyAuthorityEntries,
+		regular:           make([]latencySlot, maxEntries),
 	}
 }
 
@@ -69,15 +86,24 @@ func (t *LatencyTable) Update(domain string, latency, decayWindow time.Duration)
 
 // UpdateClassified records a latency observation and writes into either
 // authority-resident partition or regular partition.
-// It returns evicted=true with evictedDomain when a regular-domain eviction
-// happens due to bounded capacity.
+// It returns evicted=true with evictedDomain when either bounded partition
+// discards a domain. Regular updates never evict another authority domain.
 func (t *LatencyTable) UpdateClassified(
 	domain string,
 	latency, decayWindow time.Duration,
 	isAuthority bool,
 ) (wasEmpty bool, evictedDomain string, evicted bool) {
+	return t.updateClassifiedAt(domain, latency, decayWindow, isAuthority, time.Now())
+}
+
+func (t *LatencyTable) updateClassifiedAt(
+	domain string,
+	latency, decayWindow time.Duration,
+	isAuthority bool,
+	now time.Time,
+) (wasEmpty bool, evictedDomain string, evicted bool) {
+	domain = canonicalLatencyDomain(domain)
 	key := domainKey(domain)
-	now := time.Now()
 	nowNs := now.UnixNano()
 
 	t.mu.Lock()
@@ -89,8 +115,8 @@ func (t *LatencyTable) UpdateClassified(
 	stats := tdEWMAUpdate(old, found, latency, decayWindow, now)
 
 	if isAuthority {
-		t.upsertAuthorityLocked(key, domain, stats, nowNs)
-		return wasEmpty, "", false
+		evictedDomain, evicted := t.upsertAuthorityLocked(key, domain, stats, nowNs)
+		return wasEmpty, evictedDomain, evicted
 	}
 	evictedDomain, evicted = t.upsertRegularLocked(key, domain, stats, nowNs)
 	return wasEmpty, evictedDomain, evicted
@@ -100,6 +126,7 @@ func (t *LatencyTable) UpdateClassified(
 // Read touches are write-throttled: last-access timestamp is updated only when
 // the last update is older than latencyReadTouchMinInterval.
 func (t *LatencyTable) GetDomainStats(domain string) (DomainLatencyStats, bool) {
+	domain = canonicalLatencyDomain(domain)
 	key := domainKey(domain)
 	nowNs := time.Now().UnixNano()
 	t.mu.Lock()
@@ -140,10 +167,24 @@ func (t *LatencyTable) LoadEntryClassified(
 	stats DomainLatencyStats,
 	isAuthority bool,
 ) (evictedDomain string, evicted bool) {
+	return t.loadEntryClassifiedAt(domain, stats, isAuthority, time.Now())
+}
+
+// loadEntryClassifiedAt is the bootstrap insertion primitive with an explicit
+// load timestamp. Persisted timestamps newer than the load are not valid LRU
+// access order, so they are capped at loadedAt.
+func (t *LatencyTable) loadEntryClassifiedAt(
+	domain string,
+	stats DomainLatencyStats,
+	isAuthority bool,
+	loadedAt time.Time,
+) (evictedDomain string, evicted bool) {
+	domain = canonicalLatencyDomain(domain)
 	key := domainKey(domain)
+	loadedAtNs := loadedAt.UnixNano()
 	accessNs := stats.LastUpdated.UnixNano()
-	if accessNs <= 0 {
-		accessNs = time.Now().UnixNano()
+	if accessNs <= 0 || accessNs > loadedAtNs {
+		accessNs = loadedAtNs
 	}
 
 	t.mu.Lock()
@@ -151,8 +192,7 @@ func (t *LatencyTable) LoadEntryClassified(
 
 	t.popDomainLocked(key)
 	if isAuthority {
-		t.upsertAuthorityLocked(key, domain, stats, accessNs)
-		return "", false
+		return t.upsertAuthorityLocked(key, domain, stats, accessNs)
 	}
 	return t.upsertRegularLocked(key, domain, stats, accessNs)
 }
@@ -237,14 +277,56 @@ func (t *LatencyTable) upsertAuthorityLocked(
 	domain string,
 	stats DomainLatencyStats,
 	accessNs int64,
-) {
-	t.authorities = append(t.authorities, latencySlot{
+) (evictedDomain string, evicted bool) {
+	if len(t.authorities) < t.authorityCapacity {
+		t.authorities = append(t.authorities, latencySlot{
+			key:          key,
+			domain:       domain,
+			stats:        stats,
+			lastAccessNs: accessNs,
+			occupied:     true,
+		})
+		return "", false
+	}
+
+	oldestIdx := t.oldestAuthorityIndexLocked()
+	if oldestIdx < 0 {
+		return "", false
+	}
+	evictedDomain = t.authorities[oldestIdx].domain
+	t.authorities[oldestIdx] = latencySlot{
 		key:          key,
 		domain:       domain,
 		stats:        stats,
 		lastAccessNs: accessNs,
 		occupied:     true,
-	})
+	}
+	return evictedDomain, true
+}
+
+func (t *LatencyTable) oldestAuthorityIndexLocked() int {
+	oldestIdx := -1
+	for i := range t.authorities {
+		if !t.authorities[i].occupied {
+			continue
+		}
+		if oldestIdx < 0 || latencyRankLess(
+			t.authorities[i].lastAccessNs,
+			t.authorities[i].domain,
+			t.authorities[oldestIdx].lastAccessNs,
+			t.authorities[oldestIdx].domain,
+		) {
+			oldestIdx = i
+		}
+	}
+	return oldestIdx
+}
+
+func latencyRankLess(accessNs int64, domain string, otherAccessNs int64, otherDomain string) bool {
+	if accessNs != otherAccessNs {
+		return accessNs < otherAccessNs
+	}
+	return domain < otherDomain
 }
 
 func (t *LatencyTable) upsertRegularLocked(
@@ -255,7 +337,6 @@ func (t *LatencyTable) upsertRegularLocked(
 ) (evictedDomain string, evicted bool) {
 	emptyIdx := -1
 	oldestIdx := -1
-	oldestAccessNs := int64(0)
 	for i := range t.regular {
 		slot := t.regular[i]
 		if !slot.occupied {
@@ -264,9 +345,13 @@ func (t *LatencyTable) upsertRegularLocked(
 			}
 			continue
 		}
-		if oldestIdx < 0 || slot.lastAccessNs < oldestAccessNs {
+		if oldestIdx < 0 || latencyRankLess(
+			slot.lastAccessNs,
+			slot.domain,
+			t.regular[oldestIdx].lastAccessNs,
+			t.regular[oldestIdx].domain,
+		) {
 			oldestIdx = i
-			oldestAccessNs = slot.lastAccessNs
 		}
 	}
 
@@ -295,7 +380,11 @@ func (t *LatencyTable) upsertRegularLocked(
 // domainKey builds a compact 64-bit key for domain matching in LatencyTable.
 // Collision handling is intentionally omitted as a memory/perf trade-off.
 func domainKey(domain string) uint64 {
-	return xxh3.HashString(domain)
+	return xxh3.HashString(canonicalLatencyDomain(domain))
+}
+
+func canonicalLatencyDomain(domain string) string {
+	return strings.ToLower(strings.TrimSpace(domain))
 }
 
 func deleteLatencySlot(slots []latencySlot, idx int) []latencySlot {
@@ -320,7 +409,17 @@ func tdEWMAUpdate(
 		}
 	}
 
-	dt := now.Sub(old.LastUpdated).Seconds()
+	elapsed := now.Sub(old.LastUpdated)
+	if elapsed < 0 {
+		// A future persisted sample cannot provide a valid decay interval.
+		// Rebuild from the current observation instead of allowing weight > 1
+		// to produce a negative or overflowing EWMA.
+		return DomainLatencyStats{
+			Ewma:        latency,
+			LastUpdated: now,
+		}
+	}
+	dt := elapsed.Seconds()
 	decay := decayWindow.Seconds()
 	if decay <= 0 {
 		decay = 1 // prevent division by zero

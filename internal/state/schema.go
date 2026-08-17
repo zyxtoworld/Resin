@@ -24,7 +24,7 @@ func OpenDB(path string) (*sql.DB, error) {
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
+		fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs),
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {

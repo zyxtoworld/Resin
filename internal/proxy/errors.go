@@ -138,5 +138,8 @@ func mapRouteError(err error) *ProxyError {
 	if errors.Is(err, routing.ErrNoAvailableNodes) {
 		return ErrNoAvailableNodes
 	}
+	if errors.Is(err, routing.ErrRuntimeGenerationBusy) {
+		return ErrNoAvailableNodes
+	}
 	return ErrInternalError
 }

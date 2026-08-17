@@ -19,7 +19,7 @@ import { formatApiErrorMessage } from "../../lib/error-message";
 import { formatDateTime } from "../../lib/time";
 import { getSystemConfig } from "../systemConfig/api";
 import { getRequestLog, getRequestLogPayloads, listRequestLogs } from "./api";
-import type { RequestLogItem, RequestLogListFilters } from "./types";
+import type { RequestLogItem, RequestLogListFilters, RequestLogPayloads } from "./types";
 
 type BoolFilter = "all" | "true" | "false";
 type ProxyTypeFilter = "all" | "1" | "2" | "3";
@@ -60,6 +60,12 @@ const REQUEST_LOGS_SOCKS_BADGE_CLASS = "request-logs-proxy-badge-socks";
 const PAYLOAD_TABS = ["request", "response"] as const;
 type PayloadTab = (typeof PAYLOAD_TABS)[number];
 const EMPTY_LOGS: RequestLogItem[] = [];
+const EMPTY_PAYLOAD_DATA = { headers: "", body: "" };
+type PayloadDisplayState = {
+  source: RequestLogPayloads | null;
+  tab: PayloadTab | null;
+  data: typeof EMPTY_PAYLOAD_DATA;
+};
 const BASE64_DECODE_FAILED = "[Base64 解码失败]";
 const UNSUPPORTED_CONTENT_ENCODING_PREFIX = "暂不支持的 Content-Encoding: ";
 const CONTENT_ENCODING_DECODE_FAILED_PREFIX = "Content-Encoding=";
@@ -369,11 +375,11 @@ export function RequestLogsPage() {
   const [selectedLogId, setSelectedLogId] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [payloadTab, setPayloadTab] = useState<PayloadTab>("request");
-  const [payloadData, setPayloadData] = useState<{ headers: string; body: string }>({
-    headers: "",
-    body: "",
-  });
-  const [payloadDecodePending, setPayloadDecodePending] = useState(false);
+  const [payloadDisplay, setPayloadDisplay] = useState<PayloadDisplayState>(() => ({
+    source: null,
+    tab: null,
+    data: EMPTY_PAYLOAD_DATA,
+  }));
   const { toasts, dismissToast } = useToast();
 
   const configQuery = useQuery({
@@ -468,6 +474,12 @@ export function RequestLogsPage() {
     staleTime: 30_000,
   });
 
+  const payloadResult = payloadQuery.data;
+  const payloadDisplayReady =
+    Boolean(payloadResult) && payloadDisplay.source === payloadResult && payloadDisplay.tab === payloadTab;
+  const payloadData = payloadDisplayReady ? payloadDisplay.data : EMPTY_PAYLOAD_DATA;
+  const payloadDecodePending = Boolean(payloadResult) && !payloadDisplayReady;
+
   useEffect(() => {
     if (!drawerVisible) {
       return;
@@ -544,15 +556,10 @@ export function RequestLogsPage() {
     const payload = payloadQuery.data;
 
     if (!payload) {
-      setPayloadData({ headers: "", body: "" });
-      setPayloadDecodePending(false);
       return () => {
         cancelled = true;
       };
     }
-
-    setPayloadData({ headers: "", body: "" });
-    setPayloadDecodePending(true);
 
     const decodePayload = async () => {
       const [headersBase64, bodyBase64] =
@@ -568,8 +575,7 @@ export function RequestLogsPage() {
       if (cancelled) {
         return;
       }
-      setPayloadData({ headers, body });
-      setPayloadDecodePending(false);
+      setPayloadDisplay({ source: payload, tab: payloadTab, data: { headers, body } });
     };
 
     void decodePayload().catch((error: unknown) => {
@@ -577,8 +583,11 @@ export function RequestLogsPage() {
         return;
       }
       const message = error instanceof Error ? translatePayloadDecodeErrorMessage(error.message, t) : t("未知错误");
-      setPayloadData({ headers: "", body: t("[Body 解码失败：{{message}}]", { message }) });
-      setPayloadDecodePending(false);
+      setPayloadDisplay({
+        source: payload,
+        tab: payloadTab,
+        data: { headers: "", body: t("[Body 解码失败：{{message}}]", { message }) },
+      });
     });
 
     return () => {

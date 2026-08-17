@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -8,6 +10,8 @@ import (
 	"github.com/Resinat/Resin/internal/probe"
 	"github.com/Resinat/Resin/internal/subscription"
 )
+
+var errProbeNodeGenerationChanged = errors.New("probe target node generation changed")
 
 // ------------------------------------------------------------------
 // Nodes
@@ -28,6 +32,15 @@ type NodeFilters struct {
 
 // ListNodes returns nodes from the pool with optional filters.
 func (s *ControlPlaneService) ListNodes(filters NodeFilters) ([]NodeSummary, error) {
+	var result []NodeSummary
+	var err error
+	s.withRuntimeRead(func() {
+		result, err = s.listNodes(filters)
+	})
+	return result, err
+}
+
+func (s *ControlPlaneService) listNodes(filters NodeFilters) ([]NodeSummary, error) {
 	var subLookup node.SubLookupFunc
 	if s != nil && s.Pool != nil {
 		subLookup = s.Pool.MakeSubLookup()
@@ -91,7 +104,8 @@ func (s *ControlPlaneService) ListNodes(filters NodeFilters) ([]NodeSummary, err
 			}
 		} else {
 			for h := range subNodes {
-				if _, ok := platformView[h]; !ok {
+				_, ok := platformView[h]
+				if !ok {
 					continue
 				}
 				appendIfMatchedHash(h)
@@ -207,6 +221,15 @@ func (s *ControlPlaneService) nodeEntryMatchesFilters(
 
 // GetNode returns a single node by hash.
 func (s *ControlPlaneService) GetNode(hashStr string) (*NodeSummary, error) {
+	var result *NodeSummary
+	var resultErr error
+	s.withRuntimeRead(func() {
+		result, resultErr = s.getNode(hashStr)
+	})
+	return result, resultErr
+}
+
+func (s *ControlPlaneService) getNode(hashStr string) (*NodeSummary, error) {
 	h, err := node.ParseHex(hashStr)
 	if err != nil {
 		return nil, invalidArg("node_hash: invalid format")
@@ -221,6 +244,13 @@ func (s *ControlPlaneService) GetNode(hashStr string) (*NodeSummary, error) {
 
 // ProbeEgress triggers a synchronous egress probe and returns results.
 func (s *ControlPlaneService) ProbeEgress(hashStr string) (*probe.EgressProbeResult, error) {
+	return s.ProbeEgressContext(context.Background(), hashStr)
+}
+
+// ProbeEgressContext triggers a synchronous egress probe bound to the caller
+// context. The exact entry captured before the probe remains part of the
+// generation contract.
+func (s *ControlPlaneService) ProbeEgressContext(ctx context.Context, hashStr string) (*probe.EgressProbeResult, error) {
 	h, err := node.ParseHex(hashStr)
 	if err != nil {
 		return nil, invalidArg("node_hash: invalid format")
@@ -229,9 +259,19 @@ func (s *ControlPlaneService) ProbeEgress(hashStr string) (*probe.EgressProbeRes
 	if !ok {
 		return nil, notFound("node not found")
 	}
-	result, err := s.ProbeMgr.ProbeEgressSync(h)
+	if s.beforeProbeManagerCallHook != nil {
+		s.beforeProbeManagerCallHook()
+	}
+	result, err := s.ProbeMgr.ProbeEgressSyncForEntryContext(ctx, h, entry)
 	if err != nil {
 		return nil, internal("egress probe failed", err)
+	}
+	if s.afterProbeManagerResultHook != nil {
+		s.afterProbeManagerResultHook()
+	}
+	current, ok := s.Pool.GetEntry(h)
+	if !ok || current != entry {
+		return nil, internal("probe target changed during probe", errProbeNodeGenerationChanged)
 	}
 	result.Region = entry.GetRegion(nil)
 	if s.GeoIP != nil {
@@ -242,16 +282,34 @@ func (s *ControlPlaneService) ProbeEgress(hashStr string) (*probe.EgressProbeRes
 
 // ProbeLatency triggers a synchronous latency probe and returns results.
 func (s *ControlPlaneService) ProbeLatency(hashStr string) (*probe.LatencyProbeResult, error) {
+	return s.ProbeLatencyContext(context.Background(), hashStr)
+}
+
+// ProbeLatencyContext triggers a synchronous latency probe bound to the
+// caller context. The exact entry captured before the probe remains part of
+// the generation contract.
+func (s *ControlPlaneService) ProbeLatencyContext(ctx context.Context, hashStr string) (*probe.LatencyProbeResult, error) {
 	h, err := node.ParseHex(hashStr)
 	if err != nil {
 		return nil, invalidArg("node_hash: invalid format")
 	}
-	if _, ok := s.Pool.GetEntry(h); !ok {
+	entry, ok := s.Pool.GetEntry(h)
+	if !ok {
 		return nil, notFound("node not found")
 	}
-	result, err := s.ProbeMgr.ProbeLatencySync(h)
+	if s.beforeProbeManagerCallHook != nil {
+		s.beforeProbeManagerCallHook()
+	}
+	result, err := s.ProbeMgr.ProbeLatencySyncForEntryContext(ctx, h, entry)
 	if err != nil {
 		return nil, internal("latency probe failed", err)
+	}
+	if s.afterProbeManagerResultHook != nil {
+		s.afterProbeManagerResultHook()
+	}
+	current, ok := s.Pool.GetEntry(h)
+	if !ok || current != entry {
+		return nil, internal("probe target changed during probe", errProbeNodeGenerationChanged)
 	}
 	return result, nil
 }

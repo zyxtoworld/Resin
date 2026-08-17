@@ -19,10 +19,8 @@ var randomRouteRNGPool = sync.Pool{
 }
 
 // randomRoute selects a routable node using P2C with latency/load scoring.
-// It intentionally trusts Platform.View as the routable source of truth and
-// does not do extra pool scans/availability validation on the hot path.
-// Post-pick race handling (node removed right after selection) is handled by
-// the caller in RouteRequest.
+// The pool entry must still be the exact entry published in Platform.View;
+// hash reuse during a delayed dirty notification must not bypass filters.
 func randomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
@@ -31,7 +29,10 @@ func randomRoute(
 	authorities []string,
 	p2cWindow time.Duration,
 ) (node.Hash, error) {
-	return randomRouteFiltered(plat, stats, pool, targetDomain, authorities, p2cWindow, nil)
+	return randomRouteFiltered(plat, stats, pool, targetDomain, authorities, p2cWindow, func(hash node.Hash) bool {
+		entry, ok := pool.GetEntry(hash)
+		return ok && entry != nil && entry.IsHealthy() && !pool.IsNodeDisabled(hash) && plat.ContainsViewEntry(hash, entry)
+	})
 }
 
 func randomRouteFiltered(
@@ -65,15 +66,20 @@ func randomRouteFiltered(
 				return h, true
 			}
 		}
-		var selected node.Hash
+		// Do not invoke eligible while a view shard is read-locked. Identity
+		// validation takes Platform's publication lock, and FullRebuild takes
+		// that lock before touching the view shards.
+		candidates := make([]node.Hash, 0, size)
 		view.Range(func(h node.Hash) bool {
-			if eligible(h) {
-				selected = h
-				return false
-			}
+			candidates = append(candidates, h)
 			return true
 		})
-		return selected, selected != node.Zero
+		for _, h := range candidates {
+			if eligible(h) {
+				return h, true
+			}
+		}
+		return node.Zero, false
 	}
 
 	// Pick 1st candidate.
@@ -162,6 +168,9 @@ func compareLatencies(
 }
 
 func isRecent(t time.Time, now time.Time, window time.Duration) bool {
+	if t.After(now) {
+		return false
+	}
 	return now.Sub(t) <= window
 }
 

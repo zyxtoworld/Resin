@@ -2,6 +2,7 @@ package platform
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -155,6 +156,19 @@ func (rules ResponseRules) NeedsBody() bool {
 	return false
 }
 
+// NeedsBodyForStatus reports whether any rule for statusCode needs response
+// body inspection. Rules for other statuses must not force the proxy to drain
+// an unrelated response body.
+func (rules ResponseRules) NeedsBodyForStatus(statusCode int) bool {
+	for _, rule := range rules {
+		if containsStatusCode(rule.StatusCodes, statusCode) &&
+			(rule.ResponseRegex != nil || rule.ExpiryRegex != nil) {
+			return true
+		}
+	}
+	return false
+}
+
 // Match applies the first matching rule and resolves its quarantine deadline.
 // Retry-After is authoritative when present; the body expiry capture and the
 // explicitly configured fixed cooldown are fallbacks. If the response does
@@ -210,7 +224,16 @@ func responseRuleDeadline(rule ResponseRule, body []byte, headers http.Header, n
 
 func parseRetryAfter(raw string, now time.Time) (time.Time, bool) {
 	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
-		return now.Add(time.Duration(seconds) * time.Second), true
+		// A valid delta-seconds value can exceed time.Duration's roughly
+		// 292-year range. Add it in Unix seconds so it remains exact instead
+		// of overflowing during seconds-to-nanoseconds conversion. If the
+		// resulting Unix timestamp cannot be represented, report it as an
+		// invalid deadline so the caller can use its configured fallbacks.
+		unixSeconds := now.Unix()
+		if unixSeconds > math.MaxInt64-seconds {
+			return time.Time{}, false
+		}
+		return time.Unix(unixSeconds+seconds, int64(now.Nanosecond())).In(now.Location()), true
 	}
 	if when, err := http.ParseTime(raw); err == nil {
 		return when, true

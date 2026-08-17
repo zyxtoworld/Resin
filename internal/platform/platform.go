@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/node"
 )
@@ -42,10 +43,19 @@ type Platform struct {
 	PassiveCircuitBreakerDisabled    bool
 	ResponseRules                    ResponseRules
 
-	// Routable view & its lock.
-	// viewMu serializes both FullRebuild and NotifyDirty.
-	view   *RoutableView
-	viewMu sync.Mutex
+	// Routable view & its publication lock.
+	// viewMu serializes publishers while allowing concurrent identity reads.
+	view        atomic.Pointer[RoutableView]
+	viewEntries map[node.Hash]*node.NodeEntry
+	viewMu      sync.RWMutex
+}
+
+// RoutableViewEntry pairs a view hash with the exact NodeEntry that satisfied
+// the platform filters when the hash was published. Consumers that need to
+// survive node replacement can reject a stale hash by comparing pointers.
+type RoutableViewEntry struct {
+	Hash  node.Hash
+	Entry *node.NodeEntry
 }
 
 // NewPlatform creates a Platform with an empty routable view.
@@ -56,23 +66,103 @@ func NewPlatform(id, name string, regexFilters []*regexp.Regexp, regionFilters [
 
 // NewPlatformWithTagFilter creates a Platform with compiled line-oriented tag rules.
 func NewPlatformWithTagFilter(id, name string, regexFilters node.TagFilter, regionFilters []string) *Platform {
-	return &Platform{
+	p := &Platform{
 		ID:            id,
 		Name:          name,
 		RegexFilters:  regexFilters,
 		RegionFilters: regionFilters,
-		view:          NewRoutableView(),
+		viewEntries:   make(map[node.Hash]*node.NodeEntry),
 	}
+	p.view.Store(NewRoutableView())
+	return p
 }
 
 // View returns the platform's routable view as a read-only interface.
 // External callers cannot Add/Remove/Clear — only FullRebuild and NotifyDirty can mutate.
 func (p *Platform) View() ReadOnlyView {
-	return p.view
+	if p == nil {
+		return nil
+	}
+	return p.view.Load()
 }
 
-// FullRebuild clears the routable view and re-evaluates all nodes from the pool.
-// Acquires viewMu — any concurrent NotifyDirty calls block until rebuild completes.
+// SnapshotView returns a consistent copy of the current routable hashes.
+// FullRebuild and NotifyDirty publish/mutate the view under viewMu; taking the
+// same lock here keeps the hash snapshot aligned with viewEntries.
+func (p *Platform) SnapshotView() []node.Hash {
+	entries := p.SnapshotViewEntries()
+	hashes := make([]node.Hash, 0, len(entries))
+	for _, entry := range entries {
+		hashes = append(hashes, entry.Hash)
+	}
+	return hashes
+}
+
+// SnapshotViewEntries returns a consistent copy of the routable hashes and
+// the exact node entries that were published with them.
+func (p *Platform) SnapshotViewEntries() []RoutableViewEntry {
+	if p == nil {
+		return nil
+	}
+	p.viewMu.RLock()
+	defer p.viewMu.RUnlock()
+	view := p.view.Load()
+	if view == nil {
+		return nil
+	}
+
+	entries := make([]RoutableViewEntry, 0, view.Size())
+	view.Range(func(hash node.Hash) bool {
+		if entry, ok := p.viewEntries[hash]; ok && entry != nil {
+			entries = append(entries, RoutableViewEntry{Hash: hash, Entry: entry})
+		}
+		return true
+	})
+	return entries
+}
+
+// ContainsViewEntry reports whether entry is still the exact NodeEntry that
+// was published for hash. The identity check is the routing contract: a hash
+// can be reused by the pool while the old platform view is still pending its
+// dirty notification.
+func (p *Platform) ContainsViewEntry(hash node.Hash, entry *node.NodeEntry) bool {
+	if p == nil || entry == nil {
+		return false
+	}
+	p.viewMu.RLock()
+	defer p.viewMu.RUnlock()
+	if p.view.Load() == nil {
+		return false
+	}
+	return p.viewEntries[hash] == entry
+}
+
+// RangeViewEntries visits the currently published hash/entry pairs while the
+// view publication lock is held. The callback must not call back into this
+// Platform's view methods; it is intended for short pool/node reads.
+func (p *Platform) RangeViewEntries(fn func(node.Hash, *node.NodeEntry) bool) {
+	if p == nil || fn == nil {
+		return
+	}
+	p.viewMu.RLock()
+	defer p.viewMu.RUnlock()
+	view := p.view.Load()
+	if view == nil {
+		return
+	}
+
+	view.Range(func(hash node.Hash) bool {
+		entry := p.viewEntries[hash]
+		if entry == nil {
+			return true
+		}
+		return fn(hash, entry)
+	})
+}
+
+// FullRebuild builds a complete candidate and publishes it atomically after
+// every node has been evaluated. Readers keep seeing the previous complete
+// view until that publication point.
 func (p *Platform) FullRebuild(
 	poolRange PoolRangeFunc,
 	subLookup node.SubLookupFunc,
@@ -81,13 +171,17 @@ func (p *Platform) FullRebuild(
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
 
-	p.view.Clear()
+	nextView := NewRoutableView()
+	nextEntries := make(map[node.Hash]*node.NodeEntry)
 	poolRange(func(h node.Hash, entry *node.NodeEntry) bool {
 		if p.evaluateNode(entry, subLookup, geoLookup) {
-			p.view.Add(h)
+			nextView.Add(h)
+			nextEntries[h] = entry
 		}
 		return true
 	})
+	p.viewEntries = nextEntries
+	p.view.Store(nextView)
 }
 
 // NotifyDirty re-evaluates a single node and adds/removes it from the view.
@@ -100,18 +194,29 @@ func (p *Platform) NotifyDirty(
 ) {
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
+	view := p.view.Load()
+	if view == nil {
+		view = NewRoutableView()
+		p.view.Store(view)
+	}
 
 	entry, ok := getEntry(h)
 	if !ok {
 		// Node was deleted from pool.
-		p.view.Remove(h)
+		view.Remove(h)
+		delete(p.viewEntries, h)
 		return
 	}
 
 	if p.evaluateNode(entry, subLookup, geoLookup) {
-		p.view.Add(h)
+		view.Add(h)
+		if p.viewEntries == nil {
+			p.viewEntries = make(map[node.Hash]*node.NodeEntry)
+		}
+		p.viewEntries[h] = entry
 	} else {
-		p.view.Remove(h)
+		view.Remove(h)
+		delete(p.viewEntries, h)
 	}
 }
 

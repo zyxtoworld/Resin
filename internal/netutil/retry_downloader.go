@@ -8,6 +8,14 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 )
 
+// NodeSelection carries the exact pool entry that passed a picker’s filters.
+// The entry is an identity token, not a resource lease; the fetcher must
+// compare it with a fresh pool lookup before loading any outbound.
+type NodeSelection struct {
+	Hash  node.Hash
+	Entry *node.NodeEntry
+}
+
 // RetryDownloader decorates a Downloader with proxy retry logic.
 type RetryDownloader struct {
 	Direct Downloader
@@ -15,8 +23,8 @@ type RetryDownloader struct {
 	// If <= 0, it falls back to DirectDownloader's dynamic timeout when available,
 	// otherwise 30s.
 	ProxyAttemptTimeout time.Duration
-	NodePicker          func(target string) (node.Hash, error)
-	ProxyFetch          func(ctx context.Context, hash node.Hash, url string) ([]byte, error)
+	NodePicker          func(ctx context.Context, target string) (NodeSelection, error)
+	ProxyFetch          func(ctx context.Context, selection NodeSelection, url string) ([]byte, error)
 }
 
 // Download attempts direct download first, then falls back to proxy retries.
@@ -51,8 +59,14 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 			return nil, err
 		}
 
-		hash, pickErr := r.NodePicker(url)
+		selection, pickErr := r.NodePicker(ctx, url)
 		if pickErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if errors.Is(pickErr, context.Canceled) || errors.Is(pickErr, context.DeadlineExceeded) {
+				return nil, pickErr
+			}
 			continue
 		}
 
@@ -61,13 +75,22 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 		if attemptTimeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
 		}
-		body, fetchErr := r.ProxyFetch(attemptCtx, hash, url)
+		body, fetchErr := r.ProxyFetch(attemptCtx, selection, url)
 		cancel()
 		if fetchErr == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			return body, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 	}
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	return nil, err
 }
 

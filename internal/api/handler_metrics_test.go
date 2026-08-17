@@ -77,22 +77,26 @@ func newTestMetricsManagerWithNodeLatency(
 		platforms[id] = struct{}{}
 	}
 
-	return metrics.NewManager(metrics.ManagerConfig{
-		Repo:                        repo,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		BucketSeconds:               3600,
-		ThroughputRealtimeCapacity:  16,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 16,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      16,
-		LeasesIntervalSec:           7,
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    repo,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		BucketSeconds:           3600,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       7,
 		RuntimeStats: testRuntimeStatsProvider{
 			testPlatformStats:   testPlatformStats{platforms: platforms},
 			testNodeLatencyData: provider,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return mgr
 }
 
 type testRuntimeStatsProvider struct {
@@ -346,8 +350,15 @@ func TestMetricsHandlers_SnapshotNodePool_IncludesHealthyEgressIPCount(t *testin
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 
-	mgr := metrics.NewManager(metrics.ManagerConfig{
-		Repo: repo,
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    repo,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  1,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 1,
+		ConnectionsIntervalSec:  1,
+		LeasesRetentionSec:      1,
+		LeasesIntervalSec:       1,
 		RuntimeStats: testRuntimeStatsProvider{
 			testPlatformStats: testPlatformStats{
 				totalNodes:           20,
@@ -357,6 +368,9 @@ func TestMetricsHandlers_SnapshotNodePool_IncludesHealthyEgressIPCount(t *testin
 			},
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/snapshots/node-pool", nil)
 	rec := httptest.NewRecorder()
@@ -500,6 +514,65 @@ func TestMetricsHandlers_SnapshotNodeLatencyDistribution_NoDuplicateOverflowBoun
 	}
 }
 
+func TestMetricsHandlers_SnapshotNodeLatencyDistribution_ExtremeHistogramBounds(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	binMs := maxInt/2 + 1
+	overflowMs := maxInt
+
+	repo, err := metrics.NewMetricsRepo(filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatalf("NewMetricsRepo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    repo,
+		LatencyBinMs:            binMs,
+		LatencyOverflowMs:       overflowMs,
+		BucketSeconds:           3600,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       7,
+		RuntimeStats: testRuntimeStatsProvider{
+			testNodeLatencyData: testNodeLatencyProvider{global: []float64{0}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	HandleSnapshotNodeLatencyDistribution(mgr).ServeHTTP(rec, httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/metrics/snapshots/node-latency-distribution",
+		nil,
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		Buckets []map[string]any `json:"buckets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if len(body.Buckets) != 2 {
+		t.Fatalf("regular bucket count: got %d, want 2 for overflow=%d/bin=%d", len(body.Buckets), overflowMs, binMs)
+	}
+
+	bounds, _ := buildLatencyHistogram([]int64{0, 0}, 0, binMs, overflowMs)
+	if got := bounds[0]["le_ms"]; got != binMs-1 {
+		t.Fatalf("first extreme bucket boundary: got %v, want %d", got, binMs-1)
+	}
+	if got := bounds[1]["le_ms"]; got != overflowMs-1 {
+		t.Fatalf("last extreme bucket boundary: got %v, want %d", got, overflowMs-1)
+	}
+}
+
 func TestMetricsHandlers_HistoryTraffic_IncludesCurrentUnflushedBucket(t *testing.T) {
 	mgr := newTestMetricsManager(t, "existing-platform")
 	mgr.OnTrafficDelta(100, 200)
@@ -568,13 +641,36 @@ func TestMetricsHandlers_HistoryTraffic_IncludesCurrentUnflushedZeroBucket(t *te
 }
 
 func TestMetricsHandlers_HistoryTraffic_MergesPersistedAndCurrentBucket(t *testing.T) {
-	mgr := newTestMetricsManager(t, "existing-platform")
+	stopped := newTestMetricsManager(t, "existing-platform")
 
 	// Persist one partial bucket first.
-	mgr.OnTrafficDelta(50, 70)
-	mgr.Stop()
+	stopped.OnTrafficDelta(50, 70)
+	stopped.Stop()
 
-	// Add more traffic into the same (unflushed) current bucket.
+	// A stopped Manager rejects new events. A new runtime sharing the same
+	// metrics DB represents the next live process and owns the current bucket.
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    stopped.Repo(),
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		BucketSeconds:           3600,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       7,
+		RuntimeStats: testRuntimeStatsProvider{
+			testPlatformStats: testPlatformStats{platforms: map[string]struct{}{
+				"existing-platform": {},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// Add more traffic into the same current bucket of the new runtime.
 	mgr.OnTrafficDelta(100, 200)
 
 	now := time.Now().UTC()

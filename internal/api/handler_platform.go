@@ -122,7 +122,7 @@ func HandleCreatePlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeDecodeBodyError(w, err)
 			return
 		}
-		p, err := cp.CreatePlatform(req)
+		p, err := cp.CreatePlatformContext(r.Context(), req)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -143,7 +143,7 @@ func HandleUpdatePlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		p, err := cp.UpdatePlatform(id, body)
+		p, err := cp.UpdatePlatformContext(r.Context(), id, body)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -159,7 +159,7 @@ func HandleDeletePlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if err := cp.DeletePlatform(id); err != nil {
+		if err := cp.DeletePlatformContext(r.Context(), id); err != nil {
 			writeServiceError(w, err)
 			return
 		}
@@ -174,7 +174,7 @@ func HandleResetPlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		p, err := cp.ResetPlatformToDefault(id)
+		p, err := cp.ResetPlatformToDefaultContext(r.Context(), id)
 		if err != nil {
 			writeServiceError(w, err)
 			return

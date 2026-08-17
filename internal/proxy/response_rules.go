@@ -20,7 +20,7 @@ func applyResponseRules(router *routing.Router, route routing.RouteResult, resp 
 	}
 
 	var body []byte
-	if route.ResponseRules.NeedsBody() {
+	if route.ResponseRules.NeedsBodyForStatus(resp.StatusCode) {
 		body = inspectResponseRuleBody(resp)
 	}
 	match, ok := route.ResponseRules.Match(resp.StatusCode, body, resp.Header, time.Now())
@@ -51,9 +51,13 @@ func inspectResponseRuleBody(resp *http.Response) []byte {
 	}
 
 	prefix := append([]byte(nil), data[:responseRuleBodyInspectLimit]...)
+	rest := io.Reader(bytes.NewReader(data[responseRuleBodyInspectLimit:]))
+	if readErr == nil {
+		rest = io.MultiReader(rest, original)
+	}
 	resp.Body = &replayReadCloser{
 		prefix:   bytes.NewReader(prefix),
-		rest:     io.MultiReader(bytes.NewReader(data[responseRuleBodyInspectLimit:]), original),
+		rest:     rest,
 		terminal: readErr,
 		closer:   original,
 	}
@@ -68,11 +72,22 @@ type replayReadCloser struct {
 }
 
 func (r *replayReadCloser) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if r.prefix != nil && r.prefix.Len() > 0 {
 		return r.prefix.Read(p)
 	}
 	if r.rest != nil {
-		return r.rest.Read(p)
+		n, err := r.rest.Read(p)
+		if err == io.EOF {
+			r.rest = nil
+			if r.terminal != nil {
+				err = r.terminal
+				r.terminal = nil
+			}
+		}
+		return n, err
 	}
 	if r.terminal != nil {
 		err := r.terminal

@@ -92,7 +92,7 @@ func newMajorFlowHarness(t *testing.T, subscriptionUserAgent string) *majorFlowH
 		Pool:            pool,
 		Authorities:     func() []string { return []string{"example.com"} },
 		P2CWindow:       func() time.Duration { return 10 * time.Minute },
-		NodeTagResolver: pool.ResolveNodeDisplayTag,
+		NodeTagResolver: pool.ResolveNodeDisplayTagForEntry,
 	})
 
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
@@ -152,11 +152,20 @@ func newMajorFlowHarness(t *testing.T, subscriptionUserAgent string) *majorFlowH
 
 	emitter := proxy.ConfigAwareEventEmitter{
 		Base: requestLogOnlyEmitter{svc: reqSvc},
-		RequestLogEnabled: func() bool {
+		RequestLogConfigProvider: func() proxy.RequestLogRuntimeConfig {
 			snap := runtimeCfg.Load()
-			return snap != nil && snap.RequestLogEnabled
+			if snap == nil {
+				return proxy.RequestLogRuntimeConfig{}
+			}
+			return proxy.RequestLogRuntimeConfig{
+				Enabled:             snap.RequestLogEnabled,
+				DetailEnabled:       snap.ReverseProxyLogDetailEnabled,
+				ReqHeadersMaxBytes:  snap.ReverseProxyLogReqHeadersMaxBytes,
+				ReqBodyMaxBytes:     snap.ReverseProxyLogReqBodyMaxBytes,
+				RespHeadersMaxBytes: snap.ReverseProxyLogRespHeadersMaxBytes,
+				RespBodyMaxBytes:    snap.ReverseProxyLogRespBodyMaxBytes,
+			}
 		},
-		ReverseProxyLogDetailEnabled: func() bool { return false },
 	}
 
 	forward := proxy.NewForwardProxy(proxy.ForwardProxyConfig{

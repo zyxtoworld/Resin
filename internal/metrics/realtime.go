@@ -26,14 +26,14 @@ type RealtimeRing struct {
 }
 
 // NewRealtimeRing creates a ring buffer with the given capacity.
-func NewRealtimeRing(capacity int) *RealtimeRing {
-	if capacity <= 0 {
-		capacity = 3600 // 1 hour at 1s interval
+func NewRealtimeRing(capacity int) (*RealtimeRing, error) {
+	if err := ValidateRealtimeRingCapacity(capacity); err != nil {
+		return nil, err
 	}
 	return &RealtimeRing{
 		samples: make([]RealtimeSample, capacity),
 		cap:     capacity,
-	}
+	}, nil
 }
 
 // Push adds a sample to the ring buffer, overwriting the oldest if full.

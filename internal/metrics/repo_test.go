@@ -1,11 +1,84 @@
 package metrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestMetricsRepo_AcquireContextConnCapsBusyTimeout(t *testing.T) {
+	repo, err := NewMetricsRepo(filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatalf("NewMetricsRepo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, release, err := repo.acquireContextConn(ctx)
+	if err != nil {
+		t.Fatalf("acquireContextConn: %v", err)
+	}
+	defer release()
+
+	var busyTimeoutMs int
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&busyTimeoutMs); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if busyTimeoutMs != 5000 {
+		t.Fatalf("busy_timeout = %dms, want capped 5000ms", busyTimeoutMs)
+	}
+}
+
+func TestMetricsRepo_ContextConnRestoreFailureDoesNotPoisonPool(t *testing.T) {
+	repo, err := NewMetricsRepo(filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatalf("NewMetricsRepo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	repo.db.SetMaxOpenConns(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	conn, release, err := repo.acquireContextConn(ctx)
+	if err != nil {
+		t.Fatalf("acquireContextConn: %v", err)
+	}
+	if err := conn.Raw(func(driverConn any) error {
+		closer, ok := driverConn.(interface{ Close() error })
+		if !ok {
+			t.Fatalf("driver connection %T does not expose Close", driverConn)
+		}
+		return closer.Close()
+	}); err != nil {
+		t.Fatalf("close raw driver connection: %v", err)
+	}
+	// The restore PRAGMA now runs against a closed driver connection. The
+	// release path must discard it instead of returning it to database/sql's
+	// idle pool.
+	release()
+
+	if err := repo.WriteBucket(&BucketFlushData{
+		BucketStartUnix: 1,
+		Traffic:         trafficAccum{IngressBytes: 1, EgressBytes: 2},
+	}); err != nil {
+		t.Fatalf("ordinary write after failed restore: %v", err)
+	}
+	backgroundConn, err := repo.db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire ordinary connection after failed restore: %v", err)
+	}
+	defer backgroundConn.Close()
+	var busyTimeoutMs int
+	if err := backgroundConn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&busyTimeoutMs); err != nil {
+		t.Fatalf("read ordinary busy_timeout: %v", err)
+	}
+	if busyTimeoutMs != int(defaultSQLiteBusyTimeoutMs) {
+		t.Fatalf("ordinary busy_timeout = %dms, want %dms", busyTimeoutMs, defaultSQLiteBusyTimeoutMs)
+	}
+}
 
 func TestMetricsRepo_WriteAndQuery(t *testing.T) {
 	repo, err := NewMetricsRepo(filepath.Join(t.TempDir(), "metrics.db"))

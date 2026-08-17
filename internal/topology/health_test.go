@@ -2,6 +2,7 @@ package topology
 
 import (
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -242,6 +243,81 @@ func TestRecordPassiveResult_EnabledPlatformCountsFailures(t *testing.T) {
 	}
 }
 
+func TestRecordPassiveResultForEntry_DoesNotUseRecreatedPlatformPolicy(t *testing.T) {
+	pool, subMgr := newHealthTestPool(3)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"passive-platform-generation"}`)
+	entry, ok := pool.GetEntry(h)
+	if !ok {
+		t.Fatal("node entry not found")
+	}
+	pool.RecordResult(h, true)
+
+	oldPlat := platform.NewPlatform("p-passive-generation", "Old", nil, nil)
+	oldPlat.PassiveCircuitBreakerDisabled = true
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+
+	nextPlat := platform.NewPlatform("p-passive-generation", "New", nil, nil)
+	nextPlat.PassiveCircuitBreakerDisabled = false
+
+	rebuildEntered := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	callbackStarted := make(chan struct{})
+	callbackDone := make(chan bool, 1)
+	pool.afterPlatformRebuildHook = func() {
+		close(rebuildEntered)
+		go func() {
+			close(callbackStarted)
+			callbackDone <- pool.RecordPassiveResultForRoute(
+				oldPlat.ID,
+				oldPlat.PassiveCircuitBreakerDisabled,
+				h,
+				entry,
+				false,
+			)
+		}()
+		<-allowRebuild
+	}
+	defer func() { pool.afterPlatformRebuildHook = nil }()
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+
+	select {
+	case <-rebuildEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("platform replacement did not reach rebuild boundary")
+	}
+	select {
+	case <-callbackStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("passive callback did not start before replacement publish")
+	}
+	close(allowRebuild)
+
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("platform replacement did not complete")
+	}
+	select {
+	case applied := <-callbackDone:
+		if applied {
+			t.Fatal("stale passive callback was applied under recreated platform policy")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("passive callback did not complete")
+	}
+	if got := entry.FailureCount.Load(); got != 0 {
+		t.Fatalf("stale passive failure changed the node: failure count=%d, want 0", got)
+	}
+}
+
 // --- RecordLatency tests ---
 
 func TestRecordLatency_NormalizesDomain(t *testing.T) {
@@ -284,6 +360,99 @@ func TestRecordLatency_FirstRecord_PlatformDirty(t *testing.T) {
 	pool.RecordLatency(h, "example.com", &latency)
 	if latencyCBCount.Load() != 1 {
 		t.Fatalf("expected 1 latency callback, got %d", latencyCBCount.Load())
+	}
+}
+
+func TestRecordLatency_BoundsAndCanonicalizesAuthorityPartition(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "url", true, false)
+	subMgr.Register(sub)
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return []string{"example.com"} },
+	})
+	h := addTestNode(pool, sub, `{"type":"ss","n":"authority-budget"}`)
+	entry, ok := pool.GetEntry(h)
+	if !ok || entry.LatencyTable == nil {
+		t.Fatal("expected latency table")
+	}
+
+	for i := 0; i <= node.MaxLatencyAuthorityEntries; i++ {
+		variant := []byte("example")
+		for bit := range variant {
+			if i&(1<<bit) != 0 {
+				variant[bit] -= 'a' - 'A'
+			}
+		}
+		latency := time.Duration(i+1) * time.Millisecond
+		if !pool.RecordLatencyForEntry(h, entry, string(variant)+".com", &latency) {
+			t.Fatalf("RecordLatencyForEntry(%d) was rejected", i)
+		}
+	}
+
+	var domains []string
+	entry.LatencyTable.Range(func(domain string, _ node.DomainLatencyStats) bool {
+		domains = append(domains, domain)
+		return true
+	})
+	if len(domains) != 1 || domains[0] != "example.com" {
+		t.Fatalf("authority variants were not canonicalized: got %v", domains)
+	}
+}
+
+func TestRecordLatency_AuthorityRotationPublishesEviction(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "url", true, false)
+	subMgr.Register(sub)
+	authorities := make([]string, node.MaxLatencyAuthorityEntries)
+	for i := range authorities {
+		authorities[i] = "old-" + strconv.Itoa(i) + ".com"
+	}
+	var latencyEvents []string
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return authorities },
+		OnNodeLatencyChanged: func(_ node.Hash, domain string) {
+			latencyEvents = append(latencyEvents, domain)
+		},
+	})
+	h := addTestNode(pool, sub, `{"type":"ss","n":"authority-rotation"}`)
+	entry, ok := pool.GetEntry(h)
+	if !ok || entry.LatencyTable == nil {
+		t.Fatal("expected latency table")
+	}
+
+	base := time.Unix(456, 0)
+	for i, domain := range authorities {
+		if evictedDomain, evicted := entry.LatencyTable.LoadEntryClassified(
+			domain,
+			node.DomainLatencyStats{Ewma: time.Millisecond, LastUpdated: base.Add(time.Duration(i) * time.Second)},
+			true,
+		); evicted || evictedDomain != "" {
+			t.Fatalf("initial authority load unexpectedly evicted %q", evictedDomain)
+		}
+	}
+	latencyEvents = nil
+	authorities = []string{"new.com"}
+	latency := 2 * time.Millisecond
+	if !pool.RecordLatencyForEntry(h, entry, "new.com", &latency) {
+		t.Fatal("new authority latency was rejected")
+	}
+
+	if _, ok := entry.LatencyTable.GetDomainStats("new.com"); !ok {
+		t.Fatal("new authority was not queryable after rotation")
+	}
+	if _, ok := entry.LatencyTable.GetDomainStats("old-0.com"); ok {
+		t.Fatal("old authority remained after rotation")
+	}
+	if len(latencyEvents) != 2 || latencyEvents[0] != "new.com" || latencyEvents[1] != "old-0.com" {
+		t.Fatalf("authority rotation events: got %v, want new upsert then old delete", latencyEvents)
 	}
 }
 

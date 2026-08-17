@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/proxy"
+	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
@@ -80,6 +82,14 @@ func TestValidateRuntimeConfig_NegativeByteFields(t *testing.T) {
 	cfg.ReverseProxyLogRespBodyMaxBytes = -1
 	if err := validateRuntimeConfig(cfg); err == nil {
 		t.Error("expected error for negative ReverseProxyLogRespBodyMaxBytes")
+	}
+}
+
+func TestValidateRuntimeConfig_RejectsOversizedPayloadCapture(t *testing.T) {
+	cfg := newDefaultCfg()
+	cfg.ReverseProxyLogRespBodyMaxBytes = config.MaxReverseProxyLogCaptureBytes + 1
+	if err := validateRuntimeConfig(cfg); err == nil {
+		t.Fatal("expected oversized response-body capture limit to be rejected")
 	}
 }
 
@@ -168,6 +178,18 @@ func TestValidateRuntimeConfig_LatencyURLDoesNotDuplicateAuthority(t *testing.T)
 	}
 	if len(cfg.LatencyAuthorities) != 1 {
 		t.Fatalf("expected no duplicate authority, got %v", cfg.LatencyAuthorities)
+	}
+}
+
+func TestValidateRuntimeConfig_RejectsTooManyLatencyAuthorities(t *testing.T) {
+	cfg := newDefaultCfg()
+	cfg.LatencyAuthorities = make([]string, 33)
+	for i := range cfg.LatencyAuthorities {
+		cfg.LatencyAuthorities[i] = "authority-" + strconv.Itoa(i) + ".example"
+	}
+
+	if err := validateRuntimeConfig(cfg); err == nil {
+		t.Fatal("expected too many latency authorities to be rejected")
 	}
 }
 
@@ -613,6 +635,138 @@ func TestDeleteSubscription_PersistFailureDoesNotMutateRuntimeState(t *testing.T
 	}
 }
 
+func TestDeleteSubscription_MissingPoolFailsBeforePersistence(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, false)
+	raw := []byte(`{"type":"ss","server":"198.51.100.30","port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	pool := f.cp.Pool
+	pool.AddNodeFromSub(hash, raw, f.sub.ID)
+	f.sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"managed"}})
+
+	// Simulate a control-plane runtime that lost its topology owner. Deleting
+	// the state row first would leave both the manager and pool pointing at a
+	// subscription that can no longer be durably reconciled.
+	f.cp.Pool = nil
+	err, panicked := callDeleteSubscriptionRecover(f.cp, f.sub.ID)
+	if panicked {
+		t.Fatal("DeleteSubscription panicked after persistence instead of failing closed")
+	}
+	if err == nil {
+		t.Fatal("DeleteSubscription unexpectedly succeeded without a runtime pool")
+	}
+	rows, dbErr := f.engine.ListSubscriptions()
+	if dbErr != nil {
+		t.Fatalf("ListSubscriptions: %v", dbErr)
+	}
+	found := false
+	for _, row := range rows {
+		if row.ID == f.sub.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("missing runtime pool deleted persisted subscription")
+	}
+	if got := f.cp.SubMgr.Lookup(f.sub.ID); got != f.sub {
+		t.Fatalf("runtime subscription changed on preflight failure: got %p want %p", got, f.sub)
+	}
+	if _, ok := pool.GetEntry(hash); !ok {
+		t.Fatal("runtime node changed on preflight failure")
+	}
+}
+
+func TestCreateSubscription_MissingManagerFailsBeforePersistence(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, false)
+	before, err := f.engine.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("ListSubscriptions before create: %v", err)
+	}
+	f.cp.SubMgr = nil
+	name := "missing-subscription-manager"
+	url := "https://example.com/missing-manager"
+	_, createErr, panicked := callCreateSubscriptionRecover(f.cp, CreateSubscriptionRequest{
+		Name: &name,
+		URL:  &url,
+	})
+	if panicked {
+		t.Fatal("CreateSubscription panicked after persistence instead of failing closed")
+	}
+	if createErr == nil {
+		t.Fatal("CreateSubscription unexpectedly succeeded without a subscription manager")
+	}
+	after, err := f.engine.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("ListSubscriptions after create: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("missing runtime manager left %d persisted subscription rows, want %d", len(after), len(before))
+	}
+	for _, row := range after {
+		if row.Name == name {
+			t.Fatal("missing runtime manager left a persisted subscription orphan")
+		}
+	}
+}
+
+func TestUpdateSubscription_MissingManagerFailsClosed(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, false)
+	f.cp.SubMgr = nil
+	_, err, panicked := callUpdateSubscriptionRecover(f.cp, f.sub.ID, []byte(`{"name":"missing-manager-update"}`))
+	if panicked {
+		t.Fatal("UpdateSubscription panicked without a subscription manager")
+	}
+	if err == nil {
+		t.Fatal("UpdateSubscription unexpectedly succeeded without a subscription manager")
+	}
+	rows, listErr := f.engine.ListSubscriptions()
+	if listErr != nil {
+		t.Fatalf("ListSubscriptions: %v", listErr)
+	}
+	for _, row := range rows {
+		if row.ID == f.sub.ID && row.Name != f.sub.Name() {
+			t.Fatalf("update changed persisted subscription on preflight failure: %q", row.Name)
+		}
+	}
+}
+
+func callDeleteSubscriptionRecover(cp *ControlPlaneService, id string) (err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	err = cp.DeleteSubscription(id)
+	return err, false
+}
+
+func callCreateSubscriptionRecover(
+	cp *ControlPlaneService,
+	req CreateSubscriptionRequest,
+) (resp *SubscriptionResponse, err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	resp, err = cp.CreateSubscription(req)
+	return resp, err, false
+}
+
+func callUpdateSubscriptionRecover(
+	cp *ControlPlaneService,
+	id string,
+	patch []byte,
+) (resp *SubscriptionResponse, err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+		}
+	}()
+	resp, err = cp.UpdateSubscription(id, patch)
+	return resp, err, false
+}
+
 func TestGetSubscription_NodeCountExcludesEvictedManagedNodes(t *testing.T) {
 	subMgr := topology.NewSubscriptionManager()
 	pool := topology.NewGlobalNodePool(topology.PoolConfig{
@@ -895,6 +1049,7 @@ func TestDeletePlatform_DoesNotDecodeCorruptPersistedFiltersJSON(t *testing.T) {
 	cp := &ControlPlaneService{
 		Engine: engine,
 		Pool:   pool,
+		Router: routing.NewRouter(routing.RouterConfig{Pool: pool}),
 	}
 
 	if err := cp.DeletePlatform(platformRow.ID); err != nil {

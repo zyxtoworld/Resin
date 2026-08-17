@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,67 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/topology"
 )
+
+func TestAPIContract_SubscriptionRefreshAction_HonorsRequestCancellation(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+
+	fetchStarted := make(chan struct{})
+	releaseFetch := make(chan struct{})
+	cp.Scheduler.Fetcher = func(ctx context.Context, _ string) ([]byte, error) {
+		close(fetchStarted)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-releaseFetch:
+			return nil, context.Canceled
+		}
+	}
+	defer close(releaseFetch)
+
+	createRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions", map[string]any{
+		"name": "sub-refresh-cancel",
+		"url":  "https://example.com/sub",
+	}, true)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create subscription status: got %d, body=%s", createRec.Code, createRec.Body.String())
+	}
+	subID, _ := decodeJSONMap(t, createRec)["id"].(string)
+	if subID == "" {
+		t.Fatal("create subscription missing id")
+	}
+	sub := cp.SubMgr.Lookup(subID)
+	if sub == nil {
+		t.Fatal("created subscription missing from manager")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/subscriptions/"+subID+"/actions/refresh",
+		nil,
+	).WithContext(requestCtx)
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		srv.Handler().ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refresh fetch did not start")
+	}
+	cancel()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("refresh handler ignored the canceled request context")
+	}
+}
 
 func TestAPIContract_SubscriptionRefreshAction_E2EHTTPSource(t *testing.T) {
 	srv, cp, _ := newControlPlaneTestServer(t)

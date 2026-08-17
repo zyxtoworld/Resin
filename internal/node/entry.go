@@ -43,6 +43,12 @@ type NodeEntry struct {
 	subscriptionIDs []string
 	LastError       string
 
+	// healthEventMu orders a health mutation and its persistence callbacks
+	// against removal of this exact entry. A probe can finish its Compute before
+	// its callback runs; removal must not publish a delete in that gap and then
+	// allow the probe callback to publish a late upsert.
+	healthEventMu sync.Mutex
+
 	// Atomic dynamic fields for concurrent hot-path reads.
 	FailureCount     atomic.Int32
 	CircuitOpenSince atomic.Int64               // unix-nano; 0 = not open
@@ -58,6 +64,29 @@ type NodeEntry struct {
 
 	// Outbound instance for this node.
 	Outbound atomic.Pointer[adapter.Outbound]
+
+	// outboundMu owns the use-period protocol for Outbound. Removal marks the
+	// entry retiring and clears the published pointer without waiting for
+	// active network operations. The last released operation closes the old
+	// adapter exactly once.
+	outboundMu        sync.Mutex
+	outboundUsers     int
+	outboundRetiring  bool
+	outboundRetired   bool
+	retiringOutbound  adapter.Outbound
+	outboundCloseDone chan struct{}
+}
+
+// LockHealthEvent acquires the entry-local owner for a health mutation and
+// its synchronous callbacks. Pool lifecycle code uses this to order health
+// writeback with removal without serializing unrelated node entries.
+func (e *NodeEntry) LockHealthEvent() {
+	e.healthEventMu.Lock()
+}
+
+// UnlockHealthEvent releases the entry-local health event owner.
+func (e *NodeEntry) UnlockHealthEvent() {
+	e.healthEventMu.Unlock()
 }
 
 // NewNodeEntry creates a NodeEntry with the given static fields.

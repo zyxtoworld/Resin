@@ -22,13 +22,13 @@ func DirectFetcher(timeout func() time.Duration) Fetcher {
 		// Disable redirect following for trace endpoint handled below.
 	}
 
-	return func(_ node.Hash, url string) ([]byte, time.Duration, error) {
+	return func(parent context.Context, _ *node.NodeEntry, url string) ([]byte, time.Duration, error) {
 		t := timeout()
 		if t <= 0 {
 			return nil, 0, fmt.Errorf("probe: invalid timeout %v", t)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), t)
+		ctx, cancel := context.WithTimeout(parent, t)
 		defer cancel()
 
 		var tlsStart, tlsDone, firstByte time.Time

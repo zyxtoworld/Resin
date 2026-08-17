@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -137,5 +139,59 @@ func TestAPIContract_SubscriptionCleanupAction_E2E(t *testing.T) {
 	secondBody := decodeJSONMap(t, secondCleanupRec)
 	if got := secondBody["cleaned_count"]; got != float64(0) {
 		t.Fatalf("second cleanup cleaned_count: got %v, want 0", got)
+	}
+}
+
+func TestAPIContract_SubscriptionCleanupAction_HonorsCanceledRequestWhileOpLocked(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	subID := "11111111-1111-1111-1111-111111111111"
+	sub := subscription.NewSubscription(subID, "cleanup-cancel", "https://example.com/sub", true, false)
+	cp.SubMgr.Register(sub)
+
+	lockEntered := make(chan struct{})
+	allowUnlock := make(chan struct{})
+	lockDone := make(chan struct{})
+	go func() {
+		defer close(lockDone)
+		sub.WithOpLock(func() {
+			close(lockEntered)
+			<-allowUnlock
+		})
+	}()
+	<-lockEntered
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/subscriptions/"+subID+"/actions/cleanup-circuit-open-nodes",
+		nil,
+	)
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+
+	returned := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		returned <- rec
+	}()
+
+	select {
+	case rec := <-returned:
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("canceled cleanup status: got %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+		close(allowUnlock)
+		<-lockDone
+	case <-time.After(time.Second):
+		close(allowUnlock)
+		<-lockDone
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("cleanup handler did not finish after releasing subscription op lock")
+		}
+		t.Fatal("canceled cleanup request did not return before the op lock was released")
 	}
 }

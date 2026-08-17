@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"testing"
 	"time"
@@ -235,7 +237,7 @@ func TestHandleProbeEgress_ReturnsRegion(t *testing.T) {
 
 	cp.ProbeMgr = probe.NewProbeManager(probe.ProbeConfig{
 		Pool: cp.Pool,
-		Fetcher: func(_ node.Hash, _ string) ([]byte, time.Duration, error) {
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
 			return []byte("ip=203.0.113.88\nloc=JP"), 25 * time.Millisecond, nil
 		},
 	})
@@ -251,6 +253,119 @@ func TestHandleProbeEgress_ReturnsRegion(t *testing.T) {
 	if body["region"] != "jp" {
 		t.Fatalf("region: got %v, want %q", body["region"], "jp")
 	}
+}
+
+func testProbeHandlerHonorsRequestCancellation(
+	t *testing.T,
+	path string,
+	handler func(*service.ControlPlaneService) http.HandlerFunc,
+) {
+	t.Helper()
+	_, cp, _ := newControlPlaneTestServer(t)
+
+	sub := subscription.NewSubscription("11111111-1111-1111-1111-111111111111", "sub-a", "https://example.com/a", true, false)
+	cp.SubMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"1.1.1.1","port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	cp.Pool.AddNodeFromSub(hash, raw, sub.ID)
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+	entry, ok := cp.Pool.GetEntry(hash)
+	if !ok {
+		t.Fatalf("node %s missing after add", hash.Hex())
+	}
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.FailureCount.Store(1)
+	entry.CircuitOpenSince.Store(0)
+	entry.SetEgressIP(netip.MustParseAddr("203.0.113.10"))
+	entry.SetEgressRegion("us")
+	beforeStats := node.DomainLatencyStats{
+		Ewma:        80 * time.Millisecond,
+		LastUpdated: time.Unix(100, 0),
+	}
+	entry.LatencyTable.LoadEntry("cloudflare.com", beforeStats)
+	entry.LatencyTable.LoadEntry("gstatic.com", beforeStats)
+
+	fetchStarted := make(chan struct{})
+	mgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: cp.Pool,
+		Fetcher: func(ctx context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			close(fetchStarted)
+			<-ctx.Done()
+			return nil, 0, ctx.Err()
+		},
+	})
+	cp.ProbeMgr = mgr
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, path, nil).WithContext(requestCtx)
+	req.SetPathValue("hash", hash.Hex())
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler(cp).ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe handler did not enter the real fetcher")
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		// Keep the test bounded under the old implementation so the failure
+		// reports the missing request-context propagation instead of hanging.
+		mgr.Stop()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("probe handler remained blocked even after manager shutdown")
+		}
+		t.Fatal("probe handler ignored the canceled request context")
+	}
+	mgr.Stop()
+	if got := entry.FailureCount.Load(); got != 1 {
+		t.Fatalf("failure count after request cancellation: got %d, want 1", got)
+	}
+	if got := entry.CircuitOpenSince.Load(); got != 0 {
+		t.Fatalf("circuit state after request cancellation: got %d, want closed", got)
+	}
+	if got := entry.GetEgressIP(); got != netip.MustParseAddr("203.0.113.10") {
+		t.Fatalf("egress IP after request cancellation: got %v, want 203.0.113.10", got)
+	}
+	if got := entry.GetEgressRegion(); got != "us" {
+		t.Fatalf("egress region after request cancellation: got %q, want us", got)
+	}
+	for _, domain := range []string{"cloudflare.com", "gstatic.com"} {
+		got, ok := entry.LatencyTable.GetDomainStats(domain)
+		if !ok {
+			t.Fatalf("latency for %s disappeared after request cancellation", domain)
+		}
+		if got != beforeStats {
+			t.Fatalf("latency for %s after request cancellation: got %+v, want %+v", domain, got, beforeStats)
+		}
+	}
+}
+
+func TestHandleProbeEgressHonorsRequestCancellation(t *testing.T) {
+	testProbeHandlerHonorsRequestCancellation(
+		t,
+		"/api/v1/nodes/test/actions/probe-egress",
+		HandleProbeEgress,
+	)
+}
+
+func TestHandleProbeLatencyHonorsRequestCancellation(t *testing.T) {
+	testProbeHandlerHonorsRequestCancellation(
+		t,
+		"/api/v1/nodes/test/actions/probe-latency",
+		HandleProbeLatency,
+	)
 }
 
 func TestHandleListNodes_EnabledFilter(t *testing.T) {

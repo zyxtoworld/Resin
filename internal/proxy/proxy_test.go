@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,8 @@ func (m *mockPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
 	return m.entry, true
 }
 
+func (m *mockPool) IsNodeDisabled(node.Hash) bool { return false }
+
 func (m *mockPool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {}
 
 func (m *mockPool) GetPlatform(id string) (*platform.Platform, bool) {
@@ -49,17 +52,23 @@ type mockHealthRecorder struct {
 	lastSuccess  atomic.Int32 // 1=true, 0=false
 }
 
-func (m *mockHealthRecorder) RecordResult(hash node.Hash, success bool) {
+func (m *mockHealthRecorder) RecordResultForEntry(_ node.Hash, _ *node.NodeEntry, success bool) bool {
 	m.resultCalls.Add(1)
 	if success {
 		m.lastSuccess.Store(1)
 	} else {
 		m.lastSuccess.Store(0)
 	}
+	return true
 }
 
-func (m *mockHealthRecorder) RecordLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
+func (m *mockHealthRecorder) RecordLatencyForEntry(_ node.Hash, _ *node.NodeEntry, _ string, _ *time.Duration) bool {
 	m.latencyCalls.Add(1)
+	return true
+}
+
+func (m *mockHealthRecorder) RecordPassiveResultForEntry(_ string, hash node.Hash, entry *node.NodeEntry, success bool) bool {
+	return m.RecordResultForEntry(hash, entry, success)
 }
 
 type mockPassiveHealthRecorder struct {
@@ -71,7 +80,7 @@ type mockPassiveHealthRecorder struct {
 	done         chan struct{}
 }
 
-func (m *mockPassiveHealthRecorder) RecordPassiveResult(platformID string, hash node.Hash, success bool) {
+func (m *mockPassiveHealthRecorder) RecordPassiveResultForEntry(platformID string, hash node.Hash, _ *node.NodeEntry, success bool) bool {
 	m.passiveCalls.Add(1)
 	m.platformID = platformID
 	m.nodeHash = hash
@@ -79,6 +88,7 @@ func (m *mockPassiveHealthRecorder) RecordPassiveResult(platformID string, hash 
 	if m.done != nil {
 		m.done <- struct{}{}
 	}
+	return true
 }
 
 type mockEventEmitter struct {
@@ -116,6 +126,10 @@ func (m *mockOutbound) DialContext(ctx context.Context, network string, dest M.S
 
 func (m *mockOutbound) Tag() string  { return "mock" }
 func (m *mockOutbound) Type() string { return "mock" }
+func (m *mockOutbound) Network() []string {
+	return []string{"tcp", "udp"}
+}
+func (m *mockOutbound) Dependencies() []string { return nil }
 
 // --- Helper ---
 
@@ -132,7 +146,7 @@ func TestRecordPassiveResultAsync_UsesPlatformAwareRecorder(t *testing.T) {
 	recordPassiveResultAsync(rec, routing.RouteResult{
 		PlatformID: "plat-1",
 		NodeHash:   h,
-	}, false)
+	}, nil, false)
 
 	select {
 	case <-rec.done:
@@ -634,6 +648,9 @@ func TestMapRouteError(t *testing.T) {
 	}
 	if pe := mapRouteError(routing.ErrNoAvailableNodes); pe != ErrNoAvailableNodes {
 		t.Fatalf("expected ErrNoAvailableNodes, got %v", pe)
+	}
+	if pe := mapRouteError(routing.ErrRuntimeGenerationBusy); pe != ErrNoAvailableNodes {
+		t.Fatalf("expected ErrNoAvailableNodes for busy runtime generation, got %v", pe)
 	}
 	if pe := mapRouteError(io.ErrUnexpectedEOF); pe != ErrInternalError {
 		t.Fatalf("expected ErrInternalError for unknown, got %v", pe)
@@ -1145,10 +1162,10 @@ func TestHealthRecorderAsyncCall(t *testing.T) {
 	hash := node.Hash{1}
 
 	// Simulate async dispatch as done in proxy code.
-	go h.RecordResult(hash, true)
-	go h.RecordResult(hash, false)
+	go h.RecordResultForEntry(hash, nil, true)
+	go h.RecordResultForEntry(hash, nil, false)
 	latency := 10 * time.Millisecond
-	go h.RecordLatency(hash, "example.com", &latency)
+	go h.RecordLatencyForEntry(hash, nil, "example.com", &latency)
 
 	// Give goroutines time to complete.
 	time.Sleep(50 * time.Millisecond)
@@ -1158,6 +1175,272 @@ func TestHealthRecorderAsyncCall(t *testing.T) {
 	}
 	if h.latencyCalls.Load() != 1 {
 		t.Fatalf("expected 1 latency call, got %d", h.latencyCalls.Load())
+	}
+}
+
+type blockingPassiveHealthRecorder struct {
+	entered       chan struct{}
+	release       chan struct{}
+	done          chan struct{}
+	secondEntered chan struct{}
+	calls         atomic.Int32
+	once          sync.Once
+}
+
+type blockingLatencyHealthRecorder struct {
+	entered chan struct{}
+	release chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingLatencyHealthRecorder) RecordResultForEntry(_ node.Hash, _ *node.NodeEntry, _ bool) bool {
+	return true
+}
+
+func (r *blockingLatencyHealthRecorder) RecordLatencyForEntry(
+	_ node.Hash,
+	_ *node.NodeEntry,
+	_ string,
+	_ *time.Duration,
+) bool {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	close(r.done)
+	return true
+}
+
+func (r *blockingLatencyHealthRecorder) RecordPassiveResultForEntry(_ string, _ node.Hash, _ *node.NodeEntry, _ bool) bool {
+	return true
+}
+
+func (r *blockingPassiveHealthRecorder) RecordResultForEntry(_ node.Hash, _ *node.NodeEntry, _ bool) bool {
+	return true
+}
+
+func (r *blockingPassiveHealthRecorder) RecordLatencyForEntry(
+	_ node.Hash,
+	_ *node.NodeEntry,
+	_ string,
+	_ *time.Duration,
+) bool {
+	return true
+}
+
+func (r *blockingPassiveHealthRecorder) RecordPassiveResultForEntry(
+	_ string,
+	_ node.Hash,
+	_ *node.NodeEntry,
+	_ bool,
+) bool {
+	if r.calls.Add(1) == 1 {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+		close(r.done)
+		return true
+	}
+	close(r.secondEntered)
+	return true
+}
+
+func TestForwardProxy_HealthWritebackIsIncludedInLifecycleBarrier(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("health-barrier"))
+	}))
+	defer upstream.Close()
+
+	target := &blockingPassiveHealthRecorder{
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+		done:          make(chan struct{}),
+		secondEntered: make(chan struct{}),
+	}
+	owner := NewHealthWriteOwner(target)
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     owner,
+		Events:     NoOpEventEmitter{},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/health-barrier", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	w := httptest.NewRecorder()
+	requestDone := make(chan struct{})
+	go func() {
+		fp.ServeHTTP(w, req)
+		close(requestDone)
+	}()
+
+	select {
+	case <-target.entered:
+	case <-time.After(time.Second):
+		t.Fatal("forward proxy did not produce a passive health write")
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(waitDone)
+	}()
+	select {
+	case <-owner.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("health lifecycle barrier did not start")
+	}
+	select {
+	case <-waitDone:
+		t.Fatal("health lifecycle barrier returned before the passive write completed")
+	default:
+	}
+
+	close(target.release)
+	select {
+	case <-target.done:
+	case <-time.After(time.Second):
+		t.Fatal("passive health write did not finish after release")
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("health lifecycle barrier did not finish")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("forward proxy request did not finish")
+	}
+	recordPassiveResultAsync(owner, routing.RouteResult{
+		PlatformID: "plat-id",
+		NodeHash:   node.Hash{9},
+	}, nil, true)
+	select {
+	case <-target.secondEntered:
+		t.Fatal("health write started after owner admission closed")
+	default:
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("forward status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestReverseLatencyHealthWritebackUsesLifecycleBarrier(t *testing.T) {
+	target := &blockingLatencyHealthRecorder{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	owner := NewHealthWriteOwner(target)
+	reporter := newReverseLatencyReporter(owner, node.Hash{1}, nil, "example.com")
+	reporter.clientTrace().GotFirstResponseByte()
+
+	select {
+	case <-target.entered:
+	case <-time.After(time.Second):
+		t.Fatal("reverse latency callback did not enter health owner")
+	}
+
+	ownerDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(ownerDone)
+	}()
+	select {
+	case <-owner.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("health owner did not close admission")
+	}
+	select {
+	case <-ownerDone:
+		t.Fatal("owner returned before reverse latency write completed")
+	default:
+	}
+
+	close(target.release)
+	select {
+	case <-target.done:
+	case <-time.After(time.Second):
+		t.Fatal("reverse latency write did not finish")
+	}
+	select {
+	case <-ownerDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner did not drain reverse latency write")
+	}
+}
+
+func TestTunnelTLSLatencyHealthWritebackUsesLifecycleBarrier(t *testing.T) {
+	target := &blockingLatencyHealthRecorder{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	owner := NewHealthWriteOwner(target)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	conn := newTLSLatencyConn(client, func(latency time.Duration) {
+		targetRecorder := directHealthRecorder(owner)
+		submitHealthWrite(owner, func() {
+			targetRecorder.RecordLatencyForEntry(node.Hash{2}, nil, "example.com", &latency)
+		})
+	})
+	serverRead := make(chan struct{})
+	go func() {
+		buf := make([]byte, 32)
+		if n, err := server.Read(buf); n > 0 && err == nil {
+			_, _ = server.Write([]byte("server hello"))
+		}
+		close(serverRead)
+	}()
+	if _, err := conn.Write([]byte("client hello")); err != nil {
+		t.Fatalf("TLS latency write: %v", err)
+	}
+	buf := make([]byte, 32)
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("TLS latency read: %v", err)
+	}
+	select {
+	case <-target.entered:
+	case <-time.After(time.Second):
+		t.Fatal("tunnel TLS callback did not enter health owner")
+	}
+
+	ownerDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(ownerDone)
+	}()
+	select {
+	case <-owner.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("health owner did not close admission")
+	}
+	select {
+	case <-ownerDone:
+		t.Fatal("owner returned before tunnel TLS write completed")
+	default:
+	}
+
+	close(target.release)
+	select {
+	case <-target.done:
+	case <-time.After(time.Second):
+		t.Fatal("tunnel TLS health write did not finish")
+	}
+	select {
+	case <-ownerDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner did not drain tunnel TLS write")
+	}
+	select {
+	case <-serverRead:
+	case <-time.After(time.Second):
+		t.Fatal("TLS latency server did not finish")
 	}
 }
 
@@ -1231,6 +1514,78 @@ func TestTLSLatencyConn_WriteReadFlow(t *testing.T) {
 	conn.Close()
 }
 
+func TestTLSLatencyConn_ReadWaitsForHealthSubmission(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	owner := NewHealthWriteOwner(&mockHealthRecorder{})
+	defer owner.CloseAndWait()
+
+	callbackEntered := make(chan struct{})
+	allowSubmission := make(chan struct{})
+	var allowOnce sync.Once
+	allow := func() { allowOnce.Do(func() { close(allowSubmission) }) }
+	defer allow()
+	submitted := make(chan struct{})
+	conn := newTLSLatencyConn(client, func(latency time.Duration) {
+		close(callbackEntered)
+		<-allowSubmission
+		target := directHealthRecorder(owner)
+		submitHealthWrite(owner, func() {
+			target.RecordLatencyForEntry(node.Hash{3}, nil, "example.com", &latency)
+		})
+		close(submitted)
+	})
+	defer conn.Close()
+
+	go func() {
+		buf := make([]byte, 32)
+		if n, err := server.Read(buf); n > 0 && err == nil {
+			_, _ = server.Write([]byte("server hello"))
+		}
+	}()
+	if _, err := conn.Write([]byte("client hello")); err != nil {
+		t.Fatalf("TLS latency write: %v", err)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 32)
+		_, err := conn.Read(buf)
+		readDone <- err
+	}()
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("TLS latency callback did not enter")
+	}
+
+	// The callback is deliberately blocked before submitHealthWrite. Read must
+	// remain in the handler's synchronous path until that submission is done;
+	// the old `go c.onLatency` implementation returned here and failed this
+	// assertion deterministically.
+	select {
+	case <-readDone:
+		t.Fatal("Read returned before the health write was submitted")
+	case <-time.After(time.Second):
+	}
+
+	allow()
+	select {
+	case <-submitted:
+	case <-time.After(time.Second):
+		t.Fatal("health write was not submitted")
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("TLS latency read: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TLS latency Read did not finish after health submission")
+	}
+}
+
 func TestReverseProxy_AccountExtraction_WithMatcher(t *testing.T) {
 	// Integration: matcher returns headers, extractAccountFromHeaders picks first non-empty.
 	req := httptest.NewRequest("GET", "/", nil)
@@ -1272,9 +1627,17 @@ func TestReverseProxy_ParseError_EmitsNoEvents(t *testing.T) {
 	rp := &ReverseProxy{
 		token: "tok",
 		events: ConfigAwareEventEmitter{
-			Base:                         emitter,
-			RequestLogEnabled:            func() bool { return true },
-			ReverseProxyLogDetailEnabled: func() bool { return true },
+			Base: emitter,
+			RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+				return RequestLogRuntimeConfig{
+					Enabled:             true,
+					DetailEnabled:       true,
+					ReqHeadersMaxBytes:  -1,
+					ReqBodyMaxBytes:     -1,
+					RespHeadersMaxBytes: -1,
+					RespBodyMaxBytes:    -1,
+				}
+			},
 		},
 	}
 	req := httptest.NewRequest("GET", "/tok", nil)

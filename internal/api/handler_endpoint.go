@@ -39,7 +39,7 @@ func HandleCreateEndpoint(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeDecodeBodyError(w, err)
 			return
 		}
-		endpoint, err := cp.CreateEndpoint(req)
+		endpoint, err := cp.CreateEndpointContext(r.Context(), req)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -54,7 +54,7 @@ func HandleUpdateEndpoint(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		endpoint, err := cp.UpdateEndpoint(PathParam(r, "id"), body)
+		endpoint, err := cp.UpdateEndpointContext(r.Context(), PathParam(r, "id"), body)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -65,7 +65,7 @@ func HandleUpdateEndpoint(cp *service.ControlPlaneService) http.HandlerFunc {
 
 func HandleDeleteEndpoint(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := cp.DeleteEndpoint(PathParam(r, "id")); err != nil {
+		if err := cp.DeleteEndpointContext(r.Context(), PathParam(r, "id")); err != nil {
 			writeServiceError(w, err)
 			return
 		}

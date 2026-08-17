@@ -1,8 +1,11 @@
 package state
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -11,6 +14,12 @@ import (
 // CacheRepo wraps cache.db and provides batch read/write for weak-persist data.
 type CacheRepo struct {
 	db *sql.DB
+
+	// Package-private test seam for invalidating an interruptible connection
+	// immediately before its busy-timeout restoration.
+	beforeContextConnResetHook func(*sql.Conn)
+	// Package-private test seam for coordinating the real transaction begin.
+	beforeContextTxBeginHook func()
 }
 
 // newCacheRepo creates a CacheRepo for the given cache.db connection.
@@ -292,17 +301,28 @@ func (r *CacheRepo) LoadAllSubscriptionNodes() ([]model.SubscriptionNode, error)
 
 // bulkExecTx runs a prepared statement within an existing transaction for n rows.
 func bulkExecTx(tx *sql.Tx, query string, n int, execFn func(stmt *sql.Stmt, i int) error) error {
+	return bulkExecTxContext(context.Background(), tx, query, n, execFn)
+}
+
+func bulkExecTxContext(ctx context.Context, tx *sql.Tx, query string, n int, execFn func(stmt *sql.Stmt, i int) error) error {
 	if n == 0 {
 		return nil
 	}
 
-	stmt, err := tx.Prepare(query)
+	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
-	defer stmt.Close()
+	defer func() {
+		if ctx.Err() == nil {
+			_ = stmt.Close()
+		}
+	}()
 
 	for i := 0; i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := execFn(stmt, i); err != nil {
 			return fmt.Errorf("exec row %d: %w", i, err)
 		}
@@ -359,11 +379,75 @@ type FlushOps struct {
 // Upsert order: nodes_static → subscription_nodes → nodes_dynamic → node_latency → leases
 // Delete order: leases → node_latency → nodes_dynamic → subscription_nodes → nodes_static
 func (r *CacheRepo) FlushTx(ops FlushOps) error {
-	tx, err := r.db.Begin()
+	return r.flushTx(context.Background(), ops, false)
+}
+
+// FlushTxContext executes a cache flush with cancellation-aware transaction
+// setup and statement execution. A canceled flush leaves its dirty batch for
+// the caller to re-merge.
+func (r *CacheRepo) FlushTxContext(ctx context.Context, ops FlushOps) error {
+	return r.flushTx(ctx, ops, true)
+}
+
+func (r *CacheRepo) flushTx(ctx context.Context, ops FlushOps, interruptible bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var (
+		tx   *sql.Tx
+		conn *sql.Conn
+		err  error
+	)
+	if interruptible {
+		conn, err = r.db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("acquire flush connection: %w", err)
+		}
+		busyTimeoutMs, timeoutErr := SQLiteBusyTimeoutMs(ctx)
+		if timeoutErr != nil {
+			_ = conn.Close()
+			return fmt.Errorf("compute flush busy timeout: %w", timeoutErr)
+		}
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("set flush busy timeout: %w", err)
+		}
+		defer func() {
+			if hook := r.beforeContextConnResetHook; hook != nil {
+				hook(conn)
+			}
+			if ctx.Err() != nil {
+				// A canceled transaction can still be blocked by the same
+				// SQLite writer lock. Skip the non-cancelable reset and discard
+				// this connection instead of returning it to the pool.
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			} else if !resetSQLiteBusyTimeout(conn) {
+				// Returning driver.ErrBadConn from Raw makes database/sql discard
+				// the underlying connection instead of returning it to the idle pool.
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
+			_ = conn.Close()
+		}()
+		if hook := r.beforeContextTxBeginHook; hook != nil {
+			hook()
+		}
+		tx, err = conn.BeginTx(ctx, nil)
+	} else {
+		tx, err = r.db.BeginTx(ctx, nil)
+	}
 	if err != nil {
 		return fmt.Errorf("begin flush tx: %w", err)
 	}
-	defer tx.Rollback()
+	rollback := true
+	committed := false
+	defer func() {
+		// database/sql rolls a context-canceled transaction back through the
+		// context watcher. Calling Rollback here can itself wait on the same
+		// SQLite lock that caused cancellation, defeating the deadline.
+		if rollback && !committed {
+			_ = tx.Rollback()
+		}
+	}()
 
 	// Upserts in dependency order.
 	steps := []struct {
@@ -374,7 +458,7 @@ func (r *CacheRepo) FlushTx(ops FlushOps) error {
 	}{
 		{"upsert_nodes_static", upsertNodesStaticSQL, len(ops.UpsertNodesStatic), func(s *sql.Stmt, i int) error {
 			n := ops.UpsertNodesStatic[i]
-			_, err := s.Exec(n.Hash, string(n.RawOptions), n.CreatedAtNs)
+			_, err := s.ExecContext(ctx, n.Hash, string(n.RawOptions), n.CreatedAtNs)
 			return err
 		}},
 		{"upsert_subscription_nodes", upsertSubscriptionNodesSQL, len(ops.UpsertSubscriptionNodes), func(s *sql.Stmt, i int) error {
@@ -383,12 +467,12 @@ func (r *CacheRepo) FlushTx(ops FlushOps) error {
 			if err != nil {
 				return fmt.Errorf("encode subscription node tags: %w", err)
 			}
-			_, err = s.Exec(sn.SubscriptionID, sn.NodeHash, tagsJSON, sn.Evicted)
+			_, err = s.ExecContext(ctx, sn.SubscriptionID, sn.NodeHash, tagsJSON, sn.Evicted)
 			return err
 		}},
 		{"upsert_nodes_dynamic", upsertNodesDynamicSQL, len(ops.UpsertNodesDynamic), func(s *sql.Stmt, i int) error {
 			n := ops.UpsertNodesDynamic[i]
-			_, err := s.Exec(
+			_, err := s.ExecContext(ctx,
 				n.Hash,
 				n.FailureCount,
 				n.CircuitOpenSince,
@@ -403,44 +487,64 @@ func (r *CacheRepo) FlushTx(ops FlushOps) error {
 		}},
 		{"upsert_node_latency", upsertNodeLatencySQL, len(ops.UpsertNodeLatency), func(s *sql.Stmt, i int) error {
 			e := ops.UpsertNodeLatency[i]
-			_, err := s.Exec(e.NodeHash, e.Domain, e.EwmaNs, e.LastUpdatedNs)
+			_, err := s.ExecContext(ctx, e.NodeHash, e.Domain, e.EwmaNs, e.LastUpdatedNs)
 			return err
 		}},
 		{"upsert_leases", upsertLeasesSQL, len(ops.UpsertLeases), func(s *sql.Stmt, i int) error {
 			l := ops.UpsertLeases[i]
-			_, err := s.Exec(l.PlatformID, l.Account, l.NodeHash, l.EgressIP, l.CreatedAtNs, l.ExpiryNs, l.LastAccessedNs)
+			_, err := s.ExecContext(ctx, l.PlatformID, l.Account, l.NodeHash, l.EgressIP, l.CreatedAtNs, l.ExpiryNs, l.LastAccessedNs)
 			return err
 		}},
 		// Deletes in reverse dependency order.
 		{"delete_leases", deleteLeasesSQL, len(ops.DeleteLeases), func(s *sql.Stmt, i int) error {
-			_, err := s.Exec(ops.DeleteLeases[i].PlatformID, ops.DeleteLeases[i].Account)
+			_, err := s.ExecContext(ctx, ops.DeleteLeases[i].PlatformID, ops.DeleteLeases[i].Account)
 			return err
 		}},
 		{"delete_node_latency", deleteNodeLatencySQL, len(ops.DeleteNodeLatency), func(s *sql.Stmt, i int) error {
-			_, err := s.Exec(ops.DeleteNodeLatency[i].NodeHash, ops.DeleteNodeLatency[i].Domain)
+			_, err := s.ExecContext(ctx, ops.DeleteNodeLatency[i].NodeHash, ops.DeleteNodeLatency[i].Domain)
 			return err
 		}},
 		{"delete_nodes_dynamic", deleteNodesDynamicSQL, len(ops.DeleteNodesDynamic), func(s *sql.Stmt, i int) error {
-			_, err := s.Exec(ops.DeleteNodesDynamic[i])
+			_, err := s.ExecContext(ctx, ops.DeleteNodesDynamic[i])
 			return err
 		}},
 		{"delete_subscription_nodes", deleteSubscriptionNodesSQL, len(ops.DeleteSubscriptionNodes), func(s *sql.Stmt, i int) error {
-			_, err := s.Exec(ops.DeleteSubscriptionNodes[i].SubscriptionID, ops.DeleteSubscriptionNodes[i].NodeHash)
+			_, err := s.ExecContext(ctx, ops.DeleteSubscriptionNodes[i].SubscriptionID, ops.DeleteSubscriptionNodes[i].NodeHash)
 			return err
 		}},
 		{"delete_nodes_static", deleteNodesStaticSQL, len(ops.DeleteNodesStatic), func(s *sql.Stmt, i int) error {
-			_, err := s.Exec(ops.DeleteNodesStatic[i])
+			_, err := s.ExecContext(ctx, ops.DeleteNodesStatic[i])
 			return err
 		}},
 	}
 
 	for _, step := range steps {
-		if err := bulkExecTx(tx, step.query, step.n, step.exec); err != nil {
+		if err := bulkExecTxContext(ctx, tx, step.query, step.n, step.exec); err != nil {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				rollback = false
+			}
 			return fmt.Errorf("%s: %w", step.name, err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			rollback = false
+		}
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func resetSQLiteBusyTimeout(conn *sql.Conn) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	_, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+	return err == nil
 }
 
 // SQL constants for FlushTx. Extracted to avoid string duplication.

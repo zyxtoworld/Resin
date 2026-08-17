@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
@@ -105,6 +106,11 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 	}
 	if err := ValidateRegionFilters(mp.RegionFilters); err != nil {
 		return nil, err
+	}
+	if mp.StickyTTLNs > 0 {
+		if _, err := StickyLeaseExpiryUnixNano(time.Now(), mp.StickyTTLNs); err != nil {
+			return nil, fmt.Errorf("decode platform %s sticky_ttl_ns: %w", mp.ID, err)
+		}
 	}
 	emptyAccountBehavior := mp.ReverseProxyEmptyAccountBehavior
 	if !ReverseProxyEmptyAccountBehavior(emptyAccountBehavior).IsValid() {

@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { Activity, AlertTriangle, Clock3, Layers, Link2, ShieldCheck, Waypoints } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Bar, BarChart, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import type { TooltipPayloadEntry } from "recharts";
 import { Badge } from "../../components/ui/Badge";
 import { Card } from "../../components/ui/Card";
 import { Select } from "../../components/ui/Select";
@@ -62,6 +63,8 @@ type HistogramBarPoint = {
   label: string;
   count: number;
 };
+
+type ChartTooltipPayload = ReadonlyArray<TooltipPayloadEntry>;
 
 type LatencyHistogramProps = {
   buckets: LatencyBucket[];
@@ -465,8 +468,8 @@ async function fetchPlatformSnapshotNodeLatency(platformId: string): Promise<Sna
 
 type TrendTooltipContentProps = {
   active?: boolean;
-  payload?: any[];
-  label?: string;
+  payload?: ChartTooltipPayload;
+  label?: ReactNode;
   lines: TrendLineDefinition[];
   valueFormatter: (value: number) => string;
 };
@@ -500,7 +503,7 @@ function TrendTooltipContent({ active, payload, label, lines, valueFormatter }: 
   );
 }
 
-function HistogramTooltipContent({ active, payload }: any) {
+function HistogramTooltipContent({ active, payload }: { active?: boolean; payload?: ChartTooltipPayload }) {
   const { t } = useI18n();
 
   if (!active || !payload?.length) {

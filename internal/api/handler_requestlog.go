@@ -88,7 +88,7 @@ func HandleListRequestLogs(repo *requestlog.Repo) http.Handler {
 			f.Fuzzy = *fuzzy
 		}
 
-		rows, hasMore, nextCursor, err := repo.List(f)
+		rows, hasMore, nextCursor, err := repo.ListContext(r.Context(), f)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -179,7 +179,7 @@ func HandleGetRequestLog(repo *requestlog.Repo) http.Handler {
 			return
 		}
 
-		row, err := repo.GetByID(logID)
+		row, err := repo.GetByIDContext(r.Context(), logID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -203,7 +203,7 @@ func HandleGetRequestLogPayloads(repo *requestlog.Repo) http.Handler {
 			return
 		}
 
-		logRow, err := repo.GetByID(logID)
+		logRow, err := repo.GetByIDContext(r.Context(), logID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -213,7 +213,7 @@ func HandleGetRequestLogPayloads(repo *requestlog.Repo) http.Handler {
 			return
 		}
 
-		payload, err := repo.GetPayloads(logID)
+		payload, err := repo.GetPayloadsContext(r.Context(), logID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return

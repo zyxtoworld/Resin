@@ -27,11 +27,11 @@ func TestRetryDownloader_RetryOnSelectedHTTPStatusError(t *testing.T) {
 				Direct: downloaderFunc(func(_ context.Context, url string) ([]byte, error) {
 					return nil, &HTTPStatusError{StatusCode: statusCode, URL: url}
 				}),
-				NodePicker: func(_ string) (node.Hash, error) {
+				NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 					pickerCalls++
-					return node.HashFromRawOptions([]byte(`{"id":"retry-node"}`)), nil
+					return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node"}`))}, nil
 				},
-				ProxyFetch: func(_ context.Context, _ node.Hash, _ string) ([]byte, error) {
+				ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
 					proxyCalls++
 					return []byte("proxy"), nil
 				},
@@ -58,11 +58,11 @@ func TestRetryDownloader_NoRetryOnNonRetryableHTTPStatusError(t *testing.T) {
 		Direct: downloaderFunc(func(_ context.Context, url string) ([]byte, error) {
 			return nil, &HTTPStatusError{StatusCode: 404, URL: url}
 		}),
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.Zero, nil
+			return NodeSelection{}, nil
 		},
-		ProxyFetch: func(_ context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			return []byte("proxy"), nil
 		},
@@ -85,11 +85,11 @@ func TestRetryDownloader_NoRetryOnNonRetryableError(t *testing.T) {
 		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
 			return nil, &NonRetryableError{Err: inner}
 		}),
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.Zero, nil
+			return NodeSelection{}, nil
 		},
-		ProxyFetch: func(_ context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			return []byte("proxy"), nil
 		},
@@ -114,11 +114,11 @@ func TestRetryDownloader_RetryOnNetworkError(t *testing.T) {
 		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
 			return nil, context.DeadlineExceeded
 		}),
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.HashFromRawOptions([]byte(`{"id":"retry-node"}`)), nil
+			return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node"}`))}, nil
 		},
-		ProxyFetch: func(_ context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			return []byte("via-proxy"), nil
 		},
@@ -145,9 +145,9 @@ func TestRetryDownloader_NoRetryWhenContextDone(t *testing.T) {
 		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
 			return nil, context.Canceled
 		}),
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.Zero, nil
+			return NodeSelection{}, nil
 		},
 	}
 
@@ -160,6 +160,59 @@ func TestRetryDownloader_NoRetryWhenContextDone(t *testing.T) {
 	}
 }
 
+func TestRetryDownloader_CancelInterruptsBlockedNodePicker(t *testing.T) {
+	pickerEntered := make(chan struct{})
+	releasePicker := make(chan struct{})
+	pickerCalls := 0
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(_ context.Context, url string) ([]byte, error) {
+			return nil, &HTTPStatusError{StatusCode: 503, URL: url}
+		}),
+		NodePicker: func(ctx context.Context, _ string) (NodeSelection, error) {
+			pickerCalls++
+			if pickerCalls == 1 {
+				close(pickerEntered)
+			}
+			select {
+			case <-releasePicker:
+				return NodeSelection{}, nil
+			case <-ctx.Done():
+				return NodeSelection{}, ctx.Err()
+			}
+		},
+		ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
+			return nil, errors.New("proxy failed")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.Download(ctx, "https://example.com")
+		result <- err
+	}()
+	select {
+	case <-pickerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("node picker did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Download error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		close(releasePicker)
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("Download remained blocked in NodePicker after context cancellation")
+	}
+}
+
 func TestRetryDownloader_ProxyRetriesExhaustedReturnsDirectError(t *testing.T) {
 	var pickerCalls, proxyCalls int
 	directErr := context.DeadlineExceeded
@@ -168,11 +221,11 @@ func TestRetryDownloader_ProxyRetriesExhaustedReturnsDirectError(t *testing.T) {
 		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
 			return nil, directErr
 		}),
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.HashFromRawOptions([]byte(`{"id":"retry-node"}`)), nil
+			return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node"}`))}, nil
 		},
-		ProxyFetch: func(_ context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(_ context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			return nil, errors.New("proxy failed")
 		},
@@ -199,11 +252,11 @@ func TestRetryDownloader_NoRetryWhenCallerDeadlineExceeded(t *testing.T) {
 			return nil, ctx.Err()
 		}),
 		ProxyAttemptTimeout: 100 * time.Millisecond,
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.HashFromRawOptions([]byte(`{"id":"retry-node-deadline"}`)), nil
+			return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node-deadline"}`))}, nil
 		},
-		ProxyFetch: func(ctx context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(ctx context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -232,11 +285,11 @@ func TestRetryDownloader_ProxyAttemptTimeoutStillApplies(t *testing.T) {
 			return nil, context.DeadlineExceeded
 		}),
 		ProxyAttemptTimeout: 20 * time.Millisecond,
-		NodePicker: func(_ string) (node.Hash, error) {
+		NodePicker: func(_ context.Context, _ string) (NodeSelection, error) {
 			pickerCalls++
-			return node.HashFromRawOptions([]byte(`{"id":"retry-node-attempt-timeout"}`)), nil
+			return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node-attempt-timeout"}`))}, nil
 		},
-		ProxyFetch: func(ctx context.Context, _ node.Hash, _ string) ([]byte, error) {
+		ProxyFetch: func(ctx context.Context, _ NodeSelection, _ string) ([]byte, error) {
 			proxyCalls++
 			if _, ok := ctx.Deadline(); !ok {
 				return nil, errors.New("missing per-attempt deadline")

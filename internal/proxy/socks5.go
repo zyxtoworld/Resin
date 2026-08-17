@@ -150,6 +150,7 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 	}
 
 	relay := pumpPreparedTunnel(conn, reader, prepare.session, tunnelPumpOptions{
+		ctx:                baseCtx,
 		onFirstIngressByte: lifecycle.markFirstByteReceived,
 	})
 	lifecycle.addIngressBytes(relay.ingressBytes)
@@ -159,7 +160,9 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !relay.canceled {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 func (s *Socks5Inbound) performHandshake(conn net.Conn, reader *bufio.Reader, requireAuthInfo bool) socks5HandshakeResult {

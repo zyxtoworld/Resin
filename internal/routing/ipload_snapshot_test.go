@@ -12,6 +12,7 @@ import (
 type snapshotTestPool struct{}
 
 func (snapshotTestPool) GetEntry(node.Hash) (*node.NodeEntry, bool)          { return nil, false }
+func (snapshotTestPool) IsNodeDisabled(node.Hash) bool                       { return false }
 func (snapshotTestPool) GetPlatform(string) (*platform.Platform, bool)       { return nil, false }
 func (snapshotTestPool) GetPlatformByName(string) (*platform.Platform, bool) { return nil, false }
 func (snapshotTestPool) RangePlatforms(func(*platform.Platform) bool)        {}
@@ -47,6 +48,18 @@ func TestIPLoadStatsSnapshot(t *testing.T) {
 	again := stats.Snapshot()
 	if got := again[ip1]; got != 2 {
 		t.Fatalf("second snapshot[%v] = %d, want 2", ip1, got)
+	}
+}
+
+func TestIPLoadStats_DecRemovesZeroCounter(t *testing.T) {
+	stats := NewIPLoadStats()
+	ip := netip.MustParseAddr("4.4.4.4")
+
+	stats.Inc(ip)
+	stats.Dec(ip)
+
+	if _, ok := stats.counts.Load(ip); ok {
+		t.Fatal("zero IP counter was retained")
 	}
 }
 

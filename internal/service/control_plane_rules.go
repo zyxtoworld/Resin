@@ -3,7 +3,6 @@ package service
 import (
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -54,6 +53,17 @@ func ruleToResponse(r model.AccountHeaderRule) (RuleResponse, error) {
 	}, nil
 }
 
+// withRuleMutation keeps state-db admission active through the matching
+// immutable matcher publish. Shutdown must not observe an idle state database
+// while the same rule mutation can still change request-time behavior.
+func (s *ControlPlaneService) withRuleMutation(fn func() error) error {
+	err := s.Engine.WithStateWriteAdmission(fn)
+	if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
+		return internal("rule mutation", err)
+	}
+	return err
+}
+
 // ListAccountHeaderRules returns all rules.
 func (s *ControlPlaneService) ListAccountHeaderRules() ([]RuleResponse, error) {
 	rules, err := s.Engine.ListAccountHeaderRules()
@@ -97,19 +107,56 @@ func (s *ControlPlaneService) UpsertAccountHeaderRule(prefix string, headers []s
 		Headers:     append([]string(nil), headers...),
 		UpdatedAtNs: now,
 	}
-	created, err := s.Engine.UpsertAccountHeaderRuleWithCreated(rule)
-	if err != nil {
-		return nil, false, internal("persist rule", err)
-	}
 
-	// Hot-update matcher runtime.
-	s.reloadAccountMatcher()
+	s.runRuleMutationHook(ruleMutationBeforeLock)
+	var response *RuleResponse
+	var created bool
+	err := s.withRuleMutation(func() error {
+		s.ruleMu.Lock()
+		defer s.ruleMu.Unlock()
 
-	r, err := ruleToResponse(rule)
+		rules, err := s.Engine.ListAccountHeaderRules()
+		if err != nil {
+			return internal("load rules", err)
+		}
+		candidate := make([]model.AccountHeaderRule, 0, len(rules)+1)
+		createdFromSnapshot := true
+		for _, current := range rules {
+			if current.URLPrefix == rule.URLPrefix {
+				candidate = append(candidate, rule)
+				createdFromSnapshot = false
+				continue
+			}
+			candidate = append(candidate, current)
+		}
+		if createdFromSnapshot {
+			candidate = append(candidate, rule)
+		}
+		s.runRuleMutationHook(ruleMutationAfterSnapshot)
+
+		created, err = s.Engine.UpsertAccountHeaderRuleWithCreated(rule)
+		if err != nil {
+			return internal("persist rule", err)
+		}
+		s.runRuleMutationHook(ruleMutationAfterPersist)
+
+		// ReplaceRules only builds an immutable matcher and swaps one atomic
+		// pointer; it cannot fail. The candidate was fully loaded and constructed
+		// before the database write, so no post-persist DB read can split runtime
+		// from the committed row.
+		s.publishAccountMatcherRules(candidate)
+
+		r, err := ruleToResponse(rule)
+		if err != nil {
+			return internal(fmt.Sprintf("decode rule %q", rule.URLPrefix), err)
+		}
+		response = &r
+		return nil
+	})
 	if err != nil {
-		return nil, false, internal(fmt.Sprintf("decode rule %q", rule.URLPrefix), err)
+		return nil, false, err
 	}
-	return &r, created, nil
+	return response, created, nil
 }
 
 // DeleteAccountHeaderRule deletes a rule.
@@ -121,25 +168,48 @@ func (s *ControlPlaneService) DeleteAccountHeaderRule(prefix string) error {
 	if normalizedPrefix == fallbackRulePrefix {
 		return invalidArg(`fallback rule "*" cannot be deleted`)
 	}
-	if err := s.Engine.DeleteAccountHeaderRule(normalizedPrefix); err != nil {
-		if errors.Is(err, state.ErrNotFound) {
+
+	s.runRuleMutationHook(ruleMutationBeforeLock)
+	return s.withRuleMutation(func() error {
+		s.ruleMu.Lock()
+		defer s.ruleMu.Unlock()
+
+		rules, err := s.Engine.ListAccountHeaderRules()
+		if err != nil {
+			return internal("load rules", err)
+		}
+		candidate := make([]model.AccountHeaderRule, 0, len(rules))
+		found := false
+		for _, current := range rules {
+			if current.URLPrefix == normalizedPrefix {
+				found = true
+				continue
+			}
+			candidate = append(candidate, current)
+		}
+		if !found {
 			return notFound("rule not found")
 		}
-		return internal("delete rule", err)
-	}
-	s.reloadAccountMatcher()
-	return nil
+		s.runRuleMutationHook(ruleMutationAfterSnapshot)
+
+		if err := s.Engine.DeleteAccountHeaderRule(normalizedPrefix); err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				return notFound("rule not found")
+			}
+			return internal("delete rule", err)
+		}
+		s.runRuleMutationHook(ruleMutationAfterPersist)
+		s.publishAccountMatcherRules(candidate)
+		return nil
+	})
 }
 
-// reloadAccountMatcher reloads all rules and atomically swaps the runtime matcher.
-func (s *ControlPlaneService) reloadAccountMatcher() {
+// publishAccountMatcherRules atomically publishes a fully constructed rule
+// snapshot. Building the matcher cannot fail, so callers must construct the
+// candidate before committing the corresponding database mutation.
+func (s *ControlPlaneService) publishAccountMatcherRules(rules []model.AccountHeaderRule) {
 	if s.MatcherRuntime == nil {
 		return
-	}
-	rules, err := s.Engine.ListAccountHeaderRules()
-	if err != nil {
-		log.Printf("[service] reload account matcher failed: %v", err)
-		return // best-effort
 	}
 	s.MatcherRuntime.ReplaceRules(rules)
 }

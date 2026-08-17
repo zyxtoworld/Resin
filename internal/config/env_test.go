@@ -1,8 +1,10 @@
 package config
 
 import (
+	"math"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -446,6 +448,49 @@ func TestLoadEnvConfig_InvalidDuration(t *testing.T) {
 	assertContains(t, err.Error(), "RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL")
 }
 
+func TestLoadEnvConfig_RejectsMetricIntervalDurationOverflow(t *testing.T) {
+	envs := requiredEnvs()
+	// 9223372037 seconds is positive, but multiplying it by time.Second
+	// cannot be represented by time.Duration.
+	envs["RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS"] = "9223372037"
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected metric interval duration overflow to be rejected")
+	}
+	assertContains(t, err.Error(), "RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS")
+}
+
+func TestLoadEnvConfig_RejectsMetricsRealtimeCapacityOverflow(t *testing.T) {
+	envs := requiredEnvs()
+	// This stays inside every supported int range while exceeding the explicit
+	// realtime-ring sample budget. It must not reach make([]RealtimeSample, n).
+	envs["RESIN_METRIC_THROUGHPUT_RETENTION_SECONDS"] = "1048576"
+	envs["RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS"] = "1"
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected metrics realtime capacity overflow to be rejected")
+	}
+	assertContains(t, err.Error(), "RESIN_METRIC_THROUGHPUT_RETENTION_SECONDS")
+}
+
+func TestLoadEnvConfig_RejectsMetricsLatencyHistogramCapacityOverflow(t *testing.T) {
+	envs := requiredEnvs()
+	// These values fit in int but exceed the shared histogram bucket budget.
+	envs["RESIN_METRIC_LATENCY_BIN_WIDTH_MS"] = "1"
+	envs["RESIN_METRIC_LATENCY_BIN_OVERFLOW_MS"] = "65536"
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected metrics latency histogram capacity overflow to be rejected")
+	}
+	assertContains(t, err.Error(), "RESIN_METRIC_LATENCY_BIN_OVERFLOW_MS")
+}
+
 func TestLoadEnvConfig_NegativeValue(t *testing.T) {
 	envs := requiredEnvs()
 	envs["RESIN_PROBE_CONCURRENCY"] = "-5"
@@ -469,6 +514,38 @@ func TestLoadEnvConfig_MaxLatencyTableEntriesOutOfRange(t *testing.T) {
 	}
 	assertContains(t, err.Error(), "RESIN_MAX_LATENCY_TABLE_ENTRIES")
 	assertContains(t, err.Error(), "<= 32")
+}
+
+func TestLoadEnvConfig_RejectsRequestLogDBMaxBytesOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("int cannot represent a value that overflows int64 byte conversion")
+	}
+
+	envs := requiredEnvs()
+	overflowMB := int64(math.MaxInt64/(1024*1024) + 1)
+	envs["RESIN_REQUEST_LOG_DB_MAX_MB"] = strconv.FormatInt(overflowMB, 10)
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected request-log DB byte-size overflow to be rejected")
+	}
+	assertContains(t, err.Error(), "RESIN_REQUEST_LOG_DB_MAX_MB")
+	assertContains(t, err.Error(), "maximum representable byte size")
+}
+
+func TestLoadEnvConfig_RejectsRequestLogQueueOverBudget(t *testing.T) {
+	envs := requiredEnvs()
+	envs["RESIN_REQUEST_LOG_QUEUE_SIZE"] = "2147483647"
+	envs["RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE"] = "1"
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected request-log queue budget to be rejected")
+	}
+	assertContains(t, err.Error(), "RESIN_REQUEST_LOG_QUEUE_SIZE")
+	assertContains(t, err.Error(), "maximum")
 }
 
 func TestLoadEnvConfig_ProbeConcurrencyOutOfRange(t *testing.T) {

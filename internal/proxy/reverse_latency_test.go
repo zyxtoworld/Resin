@@ -13,19 +13,26 @@ type latencySampleRecorder struct {
 	samples chan time.Duration
 }
 
-func (r *latencySampleRecorder) RecordResult(hash node.Hash, success bool) {}
+func (r *latencySampleRecorder) RecordResultForEntry(hash node.Hash, entry *node.NodeEntry, success bool) bool {
+	return true
+}
 
-func (r *latencySampleRecorder) RecordLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
+func (r *latencySampleRecorder) RecordLatencyForEntry(hash node.Hash, entry *node.NodeEntry, rawTarget string, latency *time.Duration) bool {
 	if latency == nil {
-		return
+		return true
 	}
 	if *latency <= 0 {
-		return
+		return true
 	}
 	select {
 	case r.samples <- *latency:
 	default:
 	}
+	return true
+}
+
+func (r *latencySampleRecorder) RecordPassiveResultForEntry(platformID string, hash node.Hash, entry *node.NodeEntry, success bool) bool {
+	return true
 }
 
 func expectSample(t *testing.T, ch <-chan time.Duration) {
@@ -51,7 +58,7 @@ func expectNoExtraSample(t *testing.T, ch <-chan time.Duration) {
 
 func TestReverseLatencyReporter_FallbackOnFirstByte(t *testing.T) {
 	rec := &latencySampleRecorder{samples: make(chan time.Duration, 4)}
-	reporter := newReverseLatencyReporter(rec, node.Hash{1}, "example.com")
+	reporter := newReverseLatencyReporter(rec, node.Hash{1}, nil, "example.com")
 	trace := reporter.clientTrace()
 
 	trace.GotFirstResponseByte()
@@ -62,7 +69,7 @@ func TestReverseLatencyReporter_FallbackOnFirstByte(t *testing.T) {
 
 func TestReverseLatencyReporter_TLSPreferredAndSingleReport(t *testing.T) {
 	rec := &latencySampleRecorder{samples: make(chan time.Duration, 4)}
-	reporter := newReverseLatencyReporter(rec, node.Hash{2}, "example.com")
+	reporter := newReverseLatencyReporter(rec, node.Hash{2}, nil, "example.com")
 	trace := reporter.clientTrace()
 
 	trace.TLSHandshakeStart()
@@ -76,7 +83,7 @@ func TestReverseLatencyReporter_TLSPreferredAndSingleReport(t *testing.T) {
 
 func TestReverseLatencyReporter_TLSFailureFallsBack(t *testing.T) {
 	rec := &latencySampleRecorder{samples: make(chan time.Duration, 4)}
-	reporter := newReverseLatencyReporter(rec, node.Hash{3}, "example.com")
+	reporter := newReverseLatencyReporter(rec, node.Hash{3}, nil, "example.com")
 	trace := reporter.clientTrace()
 
 	trace.TLSHandshakeStart()

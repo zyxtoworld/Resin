@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/state"
+	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
 )
@@ -901,6 +904,594 @@ func TestBootstrapNodes_TrimRegularLatencyKeepsAuthorities(t *testing.T) {
 	}
 	if domains["old-c.com"] {
 		t.Fatal("trimmed regular domain should be deleted from persistence")
+	}
+}
+
+func TestRestoreBootstrapLatencies_TrimsAuthorityTieAcrossRestart(t *testing.T) {
+	cacheDir := t.TempDir()
+	stateDir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(cacheDir, stateDir)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-bootstrap-authority-trim"
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.122","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	hashHex := hash.Hex()
+	now := time.Unix(123, 0).UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "BootstrapAuthorityTrim",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hashHex,
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hashHex,
+	}}); err != nil {
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+
+	authorities := make([]string, node.MaxLatencyAuthorityEntries+1)
+	latencies := make([]model.NodeLatency, len(authorities))
+	for i := range authorities {
+		number := strconv.FormatInt(int64(i), 10)
+		if i < 10 {
+			number = "0" + number
+		}
+		authorities[i] = "authority-" + number + ".com"
+		latencies[i] = model.NodeLatency{
+			NodeHash:      hashHex,
+			Domain:        authorities[i],
+			EwmaNs:        int64(time.Duration(i+1) * time.Millisecond),
+			LastUpdatedNs: now,
+		}
+	}
+	if err := engine.BulkUpsertNodeLatency(latencies); err != nil {
+		t.Fatalf("BulkUpsertNodeLatency: %v", err)
+	}
+
+	subManager := topology.NewSubscriptionManager()
+	subManager.Register(subscription.NewSubscription(subID, "BootstrapAuthorityTrim", "https://example.com/sub", true, false))
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return authorities },
+	})
+	pool.AddNodeFromSub(hash, raw, subID)
+	if err := restoreBootstrapNodeLatencies(engine, pool, 1, authorities); err != nil {
+		t.Fatalf("restoreBootstrapNodeLatencies: %v", err)
+	}
+
+	entry, ok := pool.GetEntry(hash)
+	if !ok || entry.LatencyTable == nil {
+		t.Fatal("bootstrap node missing latency table")
+	}
+	restored := make(map[string]bool)
+	entry.LatencyTable.Range(func(domain string, _ node.DomainLatencyStats) bool {
+		restored[domain] = true
+		return true
+	})
+	if len(restored) != node.MaxLatencyAuthorityEntries {
+		t.Fatalf("bootstrap authority resident count: got %d, want %d", len(restored), node.MaxLatencyAuthorityEntries)
+	}
+	for i := 0; i < node.MaxLatencyAuthorityEntries; i++ {
+		if !restored[authorities[i]] {
+			t.Fatalf("newest/tie-ordered authority %q was not restored", authorities[i])
+		}
+	}
+	if restored[authorities[node.MaxLatencyAuthorityEntries]] {
+		t.Fatalf("authority beyond bootstrap capacity was restored: %q", authorities[node.MaxLatencyAuthorityEntries])
+	}
+
+	if err := engine.FlushDirtySets(newFlushReaders(pool, subManager, nil)); err != nil {
+		t.Fatalf("FlushDirtySets: %v", err)
+	}
+	rows, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("LoadAllNodeLatency: %v", err)
+	}
+	persisted := make(map[string]bool)
+	for _, row := range rows {
+		if row.NodeHash == hashHex {
+			persisted[row.Domain] = true
+		}
+	}
+	if len(persisted) != node.MaxLatencyAuthorityEntries || persisted[authorities[node.MaxLatencyAuthorityEntries]] {
+		t.Fatalf("bootstrap authority trim was not persisted: %v", persisted)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("close first persistence owner: %v", err)
+	}
+
+	engine2, closer2, err := state.PersistenceBootstrap(cacheDir, stateDir)
+	if err != nil {
+		t.Fatalf("reopen persistence: %v", err)
+	}
+	defer func() { _ = closer2.Close() }()
+	subManager2 := topology.NewSubscriptionManager()
+	subManager2.Register(subscription.NewSubscription(subID, "BootstrapAuthorityTrim", "https://example.com/sub", true, false))
+	pool2 := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager2.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return authorities },
+	})
+	pool2.AddNodeFromSub(hash, raw, subID)
+	if err := restoreBootstrapNodeLatencies(engine2, pool2, 1, authorities); err != nil {
+		t.Fatalf("restoreBootstrapNodeLatencies after restart: %v", err)
+	}
+	entry2, ok := pool2.GetEntry(hash)
+	if !ok || entry2.LatencyTable == nil {
+		t.Fatal("restarted bootstrap node missing latency table")
+	}
+	restoredAfterRestart := make(map[string]bool)
+	entry2.LatencyTable.Range(func(domain string, _ node.DomainLatencyStats) bool {
+		restoredAfterRestart[domain] = true
+		return true
+	})
+	if len(restoredAfterRestart) != node.MaxLatencyAuthorityEntries || restoredAfterRestart[authorities[node.MaxLatencyAuthorityEntries]] {
+		t.Fatalf("trimmed authority reappeared after restart: %v", restoredAfterRestart)
+	}
+}
+
+func TestAuthorityLatencyRotationFlushesEvictionAcrossRestart(t *testing.T) {
+	cacheDir := t.TempDir()
+	stateDir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(cacheDir, stateDir)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const subID = "sub-authority-rotation"
+	raw := json.RawMessage(`{"type":"stub","server":"198.51.100.121","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	hashHex := hash.Hex()
+	now := time.Now().UnixNano()
+	if err := engine.UpsertSubscription(model.Subscription{
+		ID:               subID,
+		Name:             "AuthorityRotation",
+		URL:              "https://example.com/sub",
+		UpdateIntervalNs: int64(30 * time.Minute),
+		Enabled:          true,
+		CreatedAtNs:      now,
+		UpdatedAtNs:      now,
+	}); err != nil {
+		_ = closer.Close()
+		t.Fatalf("UpsertSubscription: %v", err)
+	}
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: subID,
+		NodeHash:       hashHex,
+		Tags:           []string{"authority-rotation"},
+	}}); err != nil {
+		_ = closer.Close()
+		t.Fatalf("BulkUpsertSubscriptionNodes: %v", err)
+	}
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hashHex,
+		RawOptions:  raw,
+		CreatedAtNs: now,
+	}}); err != nil {
+		_ = closer.Close()
+		t.Fatalf("BulkUpsertNodesStatic: %v", err)
+	}
+
+	subManager := topology.NewSubscriptionManager()
+	sub := subscription.NewSubscription(subID, "AuthorityRotation", "https://example.com/sub", true, false)
+	subManager.Register(sub)
+	authorities := make([]string, node.MaxLatencyAuthorityEntries)
+	for i := range authorities {
+		authorities[i] = "old-" + strconv.Itoa(i) + ".com"
+	}
+	persistLatency := func(hash node.Hash, domain string) {
+		if !engine.MarkNodeLatency(hash.Hex(), domain) {
+			t.Fatalf("MarkNodeLatency(%s) was rejected", domain)
+		}
+	}
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return authorities },
+		OnNodeLatencyChanged:   persistLatency,
+	})
+	pool.AddNodeFromSub(hash, raw, subID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok || entry.LatencyTable == nil {
+		_ = closer.Close()
+		t.Fatal("expected pool node with latency table")
+	}
+
+	for i, domain := range authorities {
+		latency := time.Duration(i+1) * time.Millisecond
+		if !pool.RecordLatencyForEntry(hash, entry, domain, &latency) {
+			_ = closer.Close()
+			t.Fatalf("initial RecordLatencyForEntry(%s) rejected", domain)
+		}
+	}
+	if err := engine.FlushDirtySets(newFlushReaders(pool, subManager, nil)); err != nil {
+		_ = closer.Close()
+		t.Fatalf("initial FlushDirtySets: %v", err)
+	}
+
+	authorities = []string{"new.com"}
+	latency := 2 * time.Second
+	if !pool.RecordLatencyForEntry(hash, entry, "new.com", &latency) {
+		_ = closer.Close()
+		t.Fatal("rotated RecordLatencyForEntry rejected")
+	}
+	var evictedDomain string
+	for i := 0; i < node.MaxLatencyAuthorityEntries; i++ {
+		domain := "old-" + strconv.Itoa(i) + ".com"
+		if _, ok := entry.LatencyTable.GetDomainStats(domain); !ok {
+			if evictedDomain != "" {
+				t.Fatalf("multiple old authorities disappeared: %q and %q", evictedDomain, domain)
+			}
+			evictedDomain = domain
+		}
+	}
+	if evictedDomain == "" {
+		t.Fatal("authority rotation did not evict an old authority")
+	}
+	if err := engine.FlushDirtySets(newFlushReaders(pool, subManager, nil)); err != nil {
+		_ = closer.Close()
+		t.Fatalf("rotation FlushDirtySets: %v", err)
+	}
+
+	rows, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		_ = closer.Close()
+		t.Fatalf("LoadAllNodeLatency after rotation: %v", err)
+	}
+	for _, row := range rows {
+		if row.NodeHash == hashHex && row.Domain == evictedDomain {
+			t.Fatal("evicted authority remained in cache after rotation flush")
+		}
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("close first persistence owner: %v", err)
+	}
+
+	engine2, closer2, err := state.PersistenceBootstrap(cacheDir, stateDir)
+	if err != nil {
+		t.Fatalf("reopen persistence: %v", err)
+	}
+	defer func() { _ = closer2.Close() }()
+
+	subManager2 := topology.NewSubscriptionManager()
+	subManager2.Register(subscription.NewSubscription(subID, "AuthorityRotation", "https://example.com/sub", true, false))
+	pool2 := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager2.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "" },
+		MaxLatencyTableEntries: 1,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return []string{"new.com"} },
+	})
+	pool2.AddNodeFromSub(hash, raw, subID)
+	if err := restoreBootstrapNodeLatencies(engine2, pool2, 1, []string{"new.com"}); err != nil {
+		t.Fatalf("restoreBootstrapNodeLatencies: %v", err)
+	}
+	entry2, ok := pool2.GetEntry(hash)
+	if !ok || entry2.LatencyTable == nil {
+		t.Fatal("restarted pool node missing latency table")
+	}
+	if _, ok := entry2.LatencyTable.GetDomainStats("new.com"); !ok {
+		t.Fatal("rotated authority did not survive restart")
+	}
+	if _, ok := entry2.LatencyTable.GetDomainStats(evictedDomain); ok {
+		t.Fatal("evicted authority reappeared after restart")
+	}
+}
+
+func TestValidateLoadedRuntimeConfigRejectsTooManyAuthorities(t *testing.T) {
+	cfg := config.NewDefaultRuntimeConfig()
+	cfg.LatencyAuthorities = make([]string, node.MaxLatencyAuthorityEntries+1)
+	if err := validateLoadedRuntimeConfig(cfg); err == nil {
+		t.Fatal("expected oversized persisted latency authorities to be rejected")
+	}
+}
+
+func TestValidateLoadedRuntimeConfigRejectsOversizedPayloadCapture(t *testing.T) {
+	cfg := config.NewDefaultRuntimeConfig()
+	cfg.ReverseProxyLogReqBodyMaxBytes = config.MaxReverseProxyLogCaptureBytes + 1
+	if err := validateLoadedRuntimeConfig(cfg); err == nil {
+		t.Fatal("expected oversized persisted payload capture limit to be rejected")
+	}
+}
+
+func TestValidateLoadedRuntimeConfigRejectsInvalidRuntimeValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.RuntimeConfig)
+	}{
+		{
+			name: "negative consecutive failures",
+			mutate: func(cfg *config.RuntimeConfig) {
+				cfg.MaxConsecutiveFailures = -1
+			},
+		},
+		{
+			name: "short latency probe interval",
+			mutate: func(cfg *config.RuntimeConfig) {
+				cfg.MaxLatencyTestInterval = config.Duration(29 * time.Second)
+			},
+		},
+		{
+			name: "negative p2c window",
+			mutate: func(cfg *config.RuntimeConfig) {
+				cfg.P2CLatencyWindow = -1
+			},
+		},
+		{
+			name: "short cache flush interval",
+			mutate: func(cfg *config.RuntimeConfig) {
+				cfg.CacheFlushInterval = config.Duration(4 * time.Second)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.NewDefaultRuntimeConfig()
+			tt.mutate(cfg)
+			if err := validateLoadedRuntimeConfig(cfg); err == nil {
+				t.Fatal("expected invalid persisted runtime config to be rejected")
+			}
+		})
+	}
+}
+
+func TestMarkNodeRemovedDirtyKeepsCompoundDirtyAdmission(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	raw := json.RawMessage(`{"type":"compound-delete"}`)
+	hash := node.HashFromRawOptions(raw)
+	hashHex := hash.Hex()
+	entry := node.NewNodeEntry(hash, raw, time.Now(), 4)
+	entry.LatencyTable.Update("example.com", 50*time.Millisecond, time.Minute)
+	entry.LatencyTable.Update("cloudflare.com", 60*time.Millisecond, time.Minute)
+
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hashHex,
+		RawOptions:  raw,
+		CreatedAtNs: entry.CreatedAt.UnixNano(),
+	}}); err != nil {
+		t.Fatalf("seed static row: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:             hashHex,
+		FailureCount:     1,
+		CircuitOpenSince: entry.CircuitOpenSince.Load(),
+	}}); err != nil {
+		t.Fatalf("seed dynamic row: %v", err)
+	}
+	if err := engine.BulkUpsertNodeLatency([]model.NodeLatency{
+		{NodeHash: hashHex, Domain: "example.com", EwmaNs: int64(50 * time.Millisecond), LastUpdatedNs: time.Now().UnixNano()},
+		{NodeHash: hashHex, Domain: "cloudflare.com", EwmaNs: int64(60 * time.Millisecond), LastUpdatedNs: time.Now().UnixNano()},
+	}); err != nil {
+		t.Fatalf("seed latency rows: %v", err)
+	}
+
+	firstMarkEntered := make(chan struct{})
+	allowRemainingMarks := make(chan struct{})
+	var releaseOnce sync.Once
+	beforeNodeRemovedDirtyMarkHook = func(index int) {
+		if index != 1 {
+			return
+		}
+		close(firstMarkEntered)
+		<-allowRemainingMarks
+	}
+	t.Cleanup(func() {
+		beforeNodeRemovedDirtyMarkHook = nil
+		releaseOnce.Do(func() { close(allowRemainingMarks) })
+	})
+
+	removed := make(chan struct{})
+	go func() {
+		markNodeRemovedDirty(engine, hash, entry)
+		close(removed)
+	}()
+	select {
+	case <-firstMarkEntered:
+	case <-time.After(time.Second):
+		t.Fatal("node removal did not reach the controlled dirty-mark boundary")
+	}
+
+	// Close admission while the first delete has completed. The whole
+	// node-removal callback must already own one compound admission, so all
+	// remaining deletes still belong to the same mutation.
+	engine.CloseDirtyWriteAdmission()
+	releaseOnce.Do(func() { close(allowRemainingMarks) })
+	select {
+	case <-removed:
+	case <-time.After(time.Second):
+		t.Fatal("node removal dirty callback did not finish")
+	}
+
+	if err := engine.FlushDirtySets(state.CacheReaders{}); err != nil {
+		t.Fatalf("flush delete marks: %v", err)
+	}
+	staticRows, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("load static rows: %v", err)
+	}
+	dynamicRows, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("load dynamic rows: %v", err)
+	}
+	latencyRows, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("load latency rows: %v", err)
+	}
+	if len(staticRows) != 0 || len(dynamicRows) != 0 || len(latencyRows) != 0 {
+		t.Fatalf("node removal dirty callback was split by admission close: static=%+v dynamic=%+v latency=%+v", staticRows, dynamicRows, latencyRows)
+	}
+}
+
+func TestFinalNodeRemovalKeepsSubscriptionAndNodeDeletesInOneDirtyAdmission(t *testing.T) {
+	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	sub := subscription.NewSubscription(
+		"compound-node-delete",
+		"compound-node-delete",
+		"https://example.com",
+		true,
+		false,
+	)
+	subMgr.Register(sub)
+
+	raw := json.RawMessage(`{"type":"compound-node-delete"}`)
+	hash := node.HashFromRawOptions(raw)
+	hashHex := hash.Hex()
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"node"}})
+	entry := node.NewNodeEntry(hash, raw, time.Now(), 4)
+	entry.AddSubscriptionID(sub.ID)
+	entry.LatencyTable.Update("example.com", 50*time.Millisecond, time.Minute)
+
+	if err := engine.BulkUpsertSubscriptionNodes([]model.SubscriptionNode{{
+		SubscriptionID: sub.ID,
+		NodeHash:       hashHex,
+		Tags:           []string{"node"},
+	}}); err != nil {
+		t.Fatalf("seed subscription node: %v", err)
+	}
+	if err := engine.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hashHex,
+		RawOptions:  raw,
+		CreatedAtNs: entry.CreatedAt.UnixNano(),
+	}}); err != nil {
+		t.Fatalf("seed static node: %v", err)
+	}
+	if err := engine.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:             hashHex,
+		FailureCount:     1,
+		CircuitOpenSince: entry.CircuitOpenSince.Load(),
+	}}); err != nil {
+		t.Fatalf("seed dynamic node: %v", err)
+	}
+	if err := engine.BulkUpsertNodeLatency([]model.NodeLatency{{
+		NodeHash:      hashHex,
+		Domain:        "example.com",
+		EwmaNs:        int64(50 * time.Millisecond),
+		LastUpdatedNs: time.Now().UnixNano(),
+	}}); err != nil {
+		t.Fatalf("seed node latency: %v", err)
+	}
+
+	firstNodeDeleteEntered := make(chan struct{})
+	allowNodeDelete := make(chan struct{})
+	var firstNodeDeleteOnce sync.Once
+	var allowDeleteOnce sync.Once
+	t.Cleanup(func() {
+		beforeNodeRemovedDirtyMarkHook = nil
+		allowDeleteOnce.Do(func() { close(allowNodeDelete) })
+	})
+	beforeNodeRemovedDirtyMarkHook = func(index int) {
+		if index != 1 {
+			return
+		}
+		firstNodeDeleteOnce.Do(func() { close(firstNodeDeleteEntered) })
+		<-allowNodeDelete
+	}
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup: subMgr.Lookup,
+		OnSubNodeChanged: func(subID string, changedHash node.Hash, added bool) {
+			if !added && !engine.MarkSubscriptionNodeDelete(subID, changedHash.Hex()) {
+				t.Errorf("legacy subscription-node delete callback was rejected")
+			}
+		},
+		OnFinalNodeRemoved: func(subID string, changedHash node.Hash, removed *node.NodeEntry) {
+			markFinalNodeRemovedDirty(engine, subID, changedHash, removed)
+		},
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	pool.LoadNodeFromBootstrap(entry)
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(hash, sub.ID)
+		close(removeDone)
+	}()
+	select {
+	case <-firstNodeDeleteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("final node removal did not reach the compound dirty callback")
+	}
+
+	// The node-level delete has already entered the same admission as the
+	// subscription-node delete. Closing admission now must not interrupt the
+	// remaining marks in this already-admitted compound mutation.
+	engine.CloseDirtyWriteAdmission()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- engine.FlushDirtySets(state.CacheReaders{}) }()
+	select {
+	case err := <-flushDone:
+		t.Fatalf("flush crossed the admitted final-node removal: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	allowDeleteOnce.Do(func() { close(allowNodeDelete) })
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("final node removal did not finish after releasing callback")
+	}
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("flush final node deletion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flush did not finish after final node removal")
+	}
+	subscriptionNodes, err := engine.LoadAllSubscriptionNodes()
+	if err != nil {
+		t.Fatalf("load subscription nodes: %v", err)
+	}
+	staticNodes, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("load static nodes: %v", err)
+	}
+	dynamicNodes, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("load dynamic nodes: %v", err)
+	}
+	latencyNodes, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("load node latency: %v", err)
+	}
+	if len(subscriptionNodes) != 0 || len(staticNodes) != 0 || len(dynamicNodes) != 0 || len(latencyNodes) != 0 {
+		t.Fatalf("final node deletion was split by dirty admission close: subscription=%+v static=%+v dynamic=%+v latency=%+v", subscriptionNodes, staticNodes, dynamicNodes, latencyNodes)
 	}
 }
 

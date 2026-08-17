@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -41,12 +42,14 @@ type tunnelRelayResult struct {
 	ingressBytes  int64
 	egressBytes   int64
 	netOK         bool
+	canceled      bool
 	proxyErr      *ProxyError
 	upstreamStage string
 	upstreamErr   error
 }
 
 type tunnelPumpOptions struct {
+	ctx                         context.Context
 	requireBidirectionalTraffic bool
 	onFirstIngressByte          func()
 }
@@ -84,7 +87,7 @@ func prepareConnectTunnel(
 	domain := netutil.ExtractDomain(target)
 	nodeHashRaw := routed.Route.NodeHash
 	if deps.health != nil {
-		go deps.health.RecordLatency(nodeHashRaw, domain, nil)
+		recordLatencyAsync(deps.health, nodeHashRaw, routed.Entry, domain, nil)
 	}
 
 	rawConn, err := routed.Outbound.DialContext(ctx, "tcp", M.ParseSocksaddr(target))
@@ -97,7 +100,7 @@ func prepareConnectTunnel(
 			}
 		}
 		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, false)
+			recordPassiveResultAsync(deps.health, routed.Route, routed.Entry, false)
 		}
 		return tunnelPrepareResult{
 			route:         routed.Route,
@@ -109,7 +112,7 @@ func prepareConnectTunnel(
 
 	recordResult := func(ok bool) {
 		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, ok)
+			recordPassiveResultAsync(deps.health, routed.Route, routed.Entry, ok)
 		}
 	}
 
@@ -121,7 +124,10 @@ func prepareConnectTunnel(
 
 	upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 		if deps.health != nil {
-			deps.health.RecordLatency(nodeHashRaw, domain, &latency)
+			target := directHealthRecorder(deps.health)
+			submitHealthWrite(deps.health, func() {
+				target.RecordLatencyForEntry(nodeHashRaw, routed.Entry, domain, &latency)
+			})
 		}
 	})
 
@@ -206,6 +212,22 @@ func pumpPreparedTunnelReader(
 			_ = session.upstreamConn.Close()
 		})
 	}
+	var stopCancelMonitor chan struct{}
+	var cancelMonitorDone chan struct{}
+	var cancellationRequested atomic.Bool
+	if opts.ctx != nil && opts.ctx.Done() != nil {
+		stopCancelMonitor = make(chan struct{})
+		cancelMonitorDone = make(chan struct{})
+		go func() {
+			defer close(cancelMonitorDone)
+			select {
+			case <-opts.ctx.Done():
+				cancellationRequested.Store(true)
+				closeBoth()
+			case <-stopCancelMonitor:
+			}
+		}()
+	}
 	ingressBytesCh := make(chan copyResult, 1)
 	egressBytesCh := make(chan copyResult, 1)
 	go func() {
@@ -231,6 +253,19 @@ func pumpPreparedTunnelReader(
 	ingressResult := <-ingressBytesCh
 	egressResult := <-egressBytesCh
 	closeBoth()
+	if stopCancelMonitor != nil {
+		close(stopCancelMonitor)
+		<-cancelMonitorDone
+	}
+	// The cancellation monitor may lose the final select race against the
+	// stop signal after both copies have already completed. Consult the
+	// context itself before classifying a zero-traffic teardown; otherwise a
+	// client cancellation can be reported as an upstream failure. The final
+	// result check below still requires both copy errors to be benign, so a
+	// real copy error remains authoritative.
+	if opts.ctx != nil && opts.ctx.Err() != nil {
+		cancellationRequested.Store(true)
+	}
 
 	ingressErrBenign := isBenignTunnelCopyError(ingressResult.err)
 	egressErrBenign := isBenignTunnelCopyError(egressResult.err)
@@ -268,6 +303,16 @@ func pumpPreparedTunnelReader(
 		default:
 			result.upstreamStage = "connect_no_egress_traffic"
 		}
+	}
+	if cancellationRequested.Load() && ingressErrBenign && egressErrBenign {
+		// Context cancellation tears down an established tunnel, but is not an
+		// upstream failure. Keep any non-benign copy error above authoritative;
+		// only a pure cancellation/close teardown gets this outcome.
+		result.canceled = true
+		result.netOK = true
+		result.proxyErr = nil
+		result.upstreamStage = ""
+		result.upstreamErr = nil
 	}
 	return result
 }

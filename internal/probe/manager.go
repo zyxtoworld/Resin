@@ -1,6 +1,8 @@
 package probe
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -16,9 +18,11 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 )
 
-// Fetcher executes an HTTP request through the given node, returning
-// response body and TLS handshake latency. This is injectable for testing.
-type Fetcher func(hash node.Hash, url string) (body []byte, latency time.Duration, err error)
+// Fetcher executes an HTTP request through the exact node entry accepted by
+// the probe manager, returning response body and TLS handshake latency. The
+// context is owned by the probe manager and is canceled before Stop waits for
+// in-flight probes. Fetchers must not resolve a replacement by hash.
+type Fetcher func(ctx context.Context, entry *node.NodeEntry, url string) (body []byte, latency time.Duration, err error)
 
 // ProbeConfig configures the ProbeManager.
 // Field names align 1:1 with RuntimeConfig to prevent mis-wiring.
@@ -55,8 +59,12 @@ type ProbeConfig struct {
 type ProbeManager struct {
 	pool        *topology.GlobalNodePool
 	stopCh      chan struct{}
-	stopOnce    sync.Once
+	probeCtx    context.Context
+	probeCancel context.CancelFunc
 	wg          sync.WaitGroup
+	lifecycleMu sync.Mutex
+	started     bool
+	stopped     bool
 	fetcher     Fetcher
 	workerCount int
 	taskQueue   *probeTaskQueue
@@ -68,6 +76,12 @@ type ProbeManager struct {
 	latencyTestURL                  func() string
 	latencyAuthorities              func() []string
 	onProbeEvent                    func(kind string)
+	// Package-private test seam after the exact health result is committed and
+	// before probe post-processing writes latency or egress metadata.
+	afterProbeResultRecordHook func()
+	// Package-private test seam immediately before a periodic scan enqueues a
+	// due node. Production leaves it nil.
+	beforeScanEnqueueHook func(node.Hash, *node.NodeEntry)
 }
 
 const (
@@ -76,6 +90,8 @@ const (
 	defaultLatencyTestURL = "https://www.gstatic.com/generate_204"
 	defaultQueueCap       = 1024
 )
+
+var errProbeEntryNotLive = errors.New("probe entry is no longer live")
 
 type probePriority uint8
 
@@ -92,8 +108,9 @@ const (
 )
 
 type probeTaskKey struct {
-	hash node.Hash
-	kind probeTaskKind
+	hash     node.Hash
+	kind     probeTaskKind
+	expected *node.NodeEntry
 }
 
 type probeTask struct {
@@ -143,6 +160,16 @@ func (b *probeTaskBuffer) pop() probeTask {
 func (b *probeTaskBuffer) clear() {
 	b.items = nil
 	b.head = 0
+}
+
+func (b *probeTaskBuffer) drain() []probeTask {
+	if b.len() == 0 {
+		b.clear()
+		return nil
+	}
+	pending := append([]probeTask(nil), b.items[b.head:]...)
+	b.clear()
+	return pending
 }
 
 type probeTaskQueue struct {
@@ -226,13 +253,14 @@ func (q *probeTaskQueue) Dequeue() (probeTask, bool) {
 	}
 }
 
-func (q *probeTaskQueue) StopDropPending() {
+func (q *probeTaskQueue) StopDropPending() []probeTask {
 	q.mu.Lock()
 	q.stopped = true
-	q.high.clear()
-	q.normal.clear()
+	pending := q.high.drain()
+	pending = append(pending, q.normal.drain()...)
 	q.mu.Unlock()
 	q.notEmpty.Broadcast()
+	return pending
 }
 
 type egressProbeErrorStage int
@@ -257,9 +285,12 @@ func NewProbeManager(cfg ProbeConfig) *ProbeManager {
 		}
 	}
 
+	probeCtx, probeCancel := context.WithCancel(context.Background())
 	return &ProbeManager{
 		pool:                            cfg.Pool,
 		stopCh:                          make(chan struct{}),
+		probeCtx:                        probeCtx,
+		probeCancel:                     probeCancel,
 		fetcher:                         cfg.Fetcher,
 		workerCount:                     conc,
 		taskQueue:                       newProbeTaskQueue(queueCap, queueCap, cfg.ChooseNormalWhenBoth),
@@ -280,20 +311,28 @@ func (m *ProbeManager) SetOnProbeEvent(fn func(kind string)) {
 
 // Start launches the background probe workers.
 func (m *ProbeManager) Start() {
+	m.lifecycleMu.Lock()
+	if m.started || m.stopped {
+		m.lifecycleMu.Unlock()
+		return
+	}
+	m.started = true
 	m.wg.Add(1)
+	m.wg.Add(1)
+	m.wg.Add(m.workerCount)
+	m.lifecycleMu.Unlock()
+
 	go func() {
 		defer m.wg.Done()
 		scanloop.Run(m.stopCh, scanloop.DefaultMinInterval, scanloop.DefaultJitterRange, m.scanEgress)
 	}()
 
-	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		scanloop.Run(m.stopCh, scanloop.DefaultMinInterval, scanloop.DefaultJitterRange, m.scanLatency)
 	}()
 
 	for i := 0; i < m.workerCount; i++ {
-		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
 			m.runProbeWorker()
@@ -309,11 +348,47 @@ func (m *ProbeManager) Start() {
 //   - We intentionally do not reject post-stop triggers via extra manager-global
 //     state; expected ownership is that callers stop upstream event sources first.
 func (m *ProbeManager) Stop() {
-	m.stopOnce.Do(func() {
+	m.lifecycleMu.Lock()
+	if !m.stopped {
+		m.stopped = true
 		close(m.stopCh)
-		m.taskQueue.StopDropPending()
-	})
+		if m.probeCancel != nil {
+			m.probeCancel()
+		}
+		for _, task := range m.taskQueue.StopDropPending() {
+			m.dropPendingTaskState(task.key)
+		}
+	}
+	m.lifecycleMu.Unlock()
 	m.wg.Wait()
+}
+
+func (m *ProbeManager) beginSynchronousProbe() bool {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.stopped {
+		return false
+	}
+	m.wg.Add(1)
+	return true
+}
+
+// contextForSynchronousProbe combines a caller's cancellation with the
+// manager lifecycle cancellation. The caller owns only the returned wait;
+// ProbeManager.Stop remains able to cancel every admitted synchronous probe.
+func (m *ProbeManager) contextForSynchronousProbe(parent context.Context) (context.Context, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if m == nil || m.probeCtx == nil {
+		return ctx, cancel
+	}
+	stopManagerCancel := context.AfterFunc(m.probeCtx, cancel)
+	return ctx, func() {
+		stopManagerCancel()
+		cancel()
+	}
 }
 
 // TriggerImmediateEgressProbe enqueues an async egress probe for a node.
@@ -322,10 +397,29 @@ func (m *ProbeManager) TriggerImmediateEgressProbe(hash node.Hash) {
 	m.enqueueProbe(hash, probeTaskKindEgress, probePriorityNormal)
 }
 
+// TriggerImmediateEgressProbeForEntry enqueues a probe only for the exact
+// NodeEntry generation that created the request. A removed-and-recreated hash
+// must not inherit the old generation's asynchronous probe.
+func (m *ProbeManager) TriggerImmediateEgressProbeForEntry(hash node.Hash, expected *node.NodeEntry) {
+	if expected == nil {
+		return
+	}
+	m.enqueueProbe(hash, probeTaskKindEgress, probePriorityNormal, expected)
+}
+
 // TriggerImmediateLatencyProbe enqueues an async latency probe for a node.
 // Caller returns immediately.
 func (m *ProbeManager) TriggerImmediateLatencyProbe(hash node.Hash) {
 	m.enqueueProbe(hash, probeTaskKindLatency, probePriorityNormal)
+}
+
+// TriggerImmediateLatencyProbeForEntry enqueues a latency probe only for the
+// exact NodeEntry generation that requested it.
+func (m *ProbeManager) TriggerImmediateLatencyProbeForEntry(hash node.Hash, expected *node.NodeEntry) {
+	if expected == nil {
+		return
+	}
+	m.enqueueProbe(hash, probeTaskKindLatency, probePriorityNormal, expected)
 }
 
 // EgressProbeResult holds the results of a synchronous egress probe.
@@ -338,18 +432,50 @@ type EgressProbeResult struct {
 // ProbeEgressSync performs a blocking egress probe and returns the results.
 // Used by API action endpoints that must return probe data synchronously.
 func (m *ProbeManager) ProbeEgressSync(hash node.Hash) (*EgressProbeResult, error) {
+	return m.ProbeEgressSyncContext(context.Background(), hash)
+}
+
+// ProbeEgressSyncForEntry performs a blocking egress probe only for the exact
+// NodeEntry captured by the caller. A hash can be removed and recreated while
+// a control-plane request is waiting; silently probing the replacement would
+// return a result for a different node generation.
+func (m *ProbeManager) ProbeEgressSyncForEntry(hash node.Hash, expected *node.NodeEntry) (*EgressProbeResult, error) {
+	return m.ProbeEgressSyncForEntryContext(context.Background(), hash, expected)
+}
+
+// ProbeEgressSyncContext performs a blocking egress probe that is canceled by
+// either ctx or ProbeManager.Stop.
+func (m *ProbeManager) ProbeEgressSyncContext(ctx context.Context, hash node.Hash) (*EgressProbeResult, error) {
+	return m.probeEgressSync(ctx, hash, nil)
+}
+
+// ProbeEgressSyncForEntryContext is the request-aware exact-entry egress probe
+// used by control-plane handlers. It never falls back to a same-hash entry.
+func (m *ProbeManager) ProbeEgressSyncForEntryContext(
+	ctx context.Context,
+	hash node.Hash,
+	expected *node.NodeEntry,
+) (*EgressProbeResult, error) {
+	return m.probeEgressSync(ctx, hash, expected)
+}
+
+func (m *ProbeManager) probeEgressSync(ctx context.Context, hash node.Hash, expected *node.NodeEntry) (*EgressProbeResult, error) {
 	if m.fetcher == nil {
 		return nil, fmt.Errorf("no probe fetcher configured")
 	}
-	select {
-	case <-m.stopCh:
+	if !m.beginSynchronousProbe() {
 		return nil, fmt.Errorf("probe manager stopped")
-	default:
 	}
+	defer m.wg.Done()
+	probeCtx, releaseProbeCtx := m.contextForSynchronousProbe(ctx)
+	defer releaseProbeCtx()
 
 	entry, ok := m.pool.GetEntry(hash)
 	if !ok {
 		return nil, fmt.Errorf("node not found")
+	}
+	if expected != nil && entry != expected {
+		return nil, errProbeEntryNotLive
 	}
 	if entry.Outbound.Load() == nil {
 		return nil, fmt.Errorf("node outbound not ready")
@@ -360,7 +486,7 @@ func (m *ProbeManager) ProbeEgressSync(hash node.Hash) (*EgressProbeResult, erro
 		m.onProbeEvent("egress")
 	}
 
-	ip, stage, err := m.performEgressProbe(hash)
+	ip, stage, err := m.performEgressProbe(probeCtx, hash, entry)
 	if err != nil {
 		if stage == egressProbeParseError {
 			return nil, fmt.Errorf("parse egress IP: %w", err)
@@ -374,6 +500,9 @@ func (m *ProbeManager) ProbeEgressSync(hash node.Hash) (*EgressProbeResult, erro
 		if stats, ok := entry.LatencyTable.GetDomainStats(egressTraceDomain); ok {
 			ewmaMs = float64(stats.Ewma) / float64(time.Millisecond)
 		}
+	}
+	if current, ok := m.pool.GetEntry(hash); !ok || current != entry {
+		return nil, errProbeEntryNotLive
 	}
 
 	return &EgressProbeResult{
@@ -389,18 +518,49 @@ type LatencyProbeResult struct {
 
 // ProbeLatencySync performs a blocking latency probe and returns the results.
 func (m *ProbeManager) ProbeLatencySync(hash node.Hash) (*LatencyProbeResult, error) {
+	return m.ProbeLatencySyncContext(context.Background(), hash)
+}
+
+// ProbeLatencySyncForEntry performs a blocking latency probe only for the
+// exact NodeEntry captured by the caller.
+func (m *ProbeManager) ProbeLatencySyncForEntry(hash node.Hash, expected *node.NodeEntry) (*LatencyProbeResult, error) {
+	return m.ProbeLatencySyncForEntryContext(context.Background(), hash, expected)
+}
+
+// ProbeLatencySyncContext performs a blocking latency probe that is canceled
+// by either ctx or ProbeManager.Stop.
+func (m *ProbeManager) ProbeLatencySyncContext(ctx context.Context, hash node.Hash) (*LatencyProbeResult, error) {
+	return m.probeLatencySync(ctx, hash, nil)
+}
+
+// ProbeLatencySyncForEntryContext is the request-aware exact-entry latency
+// probe used by control-plane handlers. It never falls back to a same-hash
+// entry.
+func (m *ProbeManager) ProbeLatencySyncForEntryContext(
+	ctx context.Context,
+	hash node.Hash,
+	expected *node.NodeEntry,
+) (*LatencyProbeResult, error) {
+	return m.probeLatencySync(ctx, hash, expected)
+}
+
+func (m *ProbeManager) probeLatencySync(ctx context.Context, hash node.Hash, expected *node.NodeEntry) (*LatencyProbeResult, error) {
 	if m.fetcher == nil {
 		return nil, fmt.Errorf("no probe fetcher configured")
 	}
-	select {
-	case <-m.stopCh:
+	if !m.beginSynchronousProbe() {
 		return nil, fmt.Errorf("probe manager stopped")
-	default:
 	}
+	defer m.wg.Done()
+	probeCtx, releaseProbeCtx := m.contextForSynchronousProbe(ctx)
+	defer releaseProbeCtx()
 
 	entry, ok := m.pool.GetEntry(hash)
 	if !ok {
 		return nil, fmt.Errorf("node not found")
+	}
+	if expected != nil && entry != expected {
+		return nil, errProbeEntryNotLive
 	}
 	if entry.Outbound.Load() == nil {
 		return nil, fmt.Errorf("node outbound not ready")
@@ -414,7 +574,7 @@ func (m *ProbeManager) ProbeLatencySync(hash node.Hash) (*LatencyProbeResult, er
 		m.onProbeEvent("latency")
 	}
 
-	if err := m.performLatencyProbe(hash, testURL); err != nil {
+	if err := m.performLatencyProbe(probeCtx, hash, entry, testURL); err != nil {
 		return nil, fmt.Errorf("latency probe failed: %w", err)
 	}
 
@@ -424,6 +584,9 @@ func (m *ProbeManager) ProbeLatencySync(hash node.Hash) (*LatencyProbeResult, er
 		if stats, ok := entry.LatencyTable.GetDomainStats(domain); ok {
 			ewmaMs = float64(stats.Ewma) / float64(time.Millisecond)
 		}
+	}
+	if current, ok := m.pool.GetEntry(hash); !ok || current != entry {
+		return nil, errProbeEntryNotLive
 	}
 
 	return &LatencyProbeResult{
@@ -466,7 +629,10 @@ func (m *ProbeManager) scanEgress() {
 			}
 		}
 
-		m.enqueueProbe(h, probeTaskKindEgress, probePriorityNormal)
+		if hook := m.beforeScanEnqueueHook; hook != nil {
+			hook(h, entry)
+		}
+		m.enqueueProbe(h, probeTaskKindEgress, probePriorityNormal, entry)
 
 		return true
 	})
@@ -509,7 +675,10 @@ func (m *ProbeManager) scanLatency() {
 			return true
 		}
 
-		m.enqueueProbe(h, probeTaskKindLatency, probePriorityNormal)
+		if hook := m.beforeScanEnqueueHook; hook != nil {
+			hook(h, entry)
+		}
+		m.enqueueProbe(h, probeTaskKindLatency, probePriorityNormal, entry)
 
 		return true
 	})
@@ -534,7 +703,7 @@ func (m *ProbeManager) runProbeWorker() {
 
 func (m *ProbeManager) executeTask(task probeTask) {
 	entry, ok := m.pool.GetEntry(task.key.hash)
-	if !ok || entry.Outbound.Load() == nil {
+	if !ok || (task.key.expected != nil && entry != task.key.expected) || entry.Outbound.Load() == nil {
 		return
 	}
 	if entry.IsDisabledBySubscriptions(m.pool.MakeSubLookup()) {
@@ -549,8 +718,12 @@ func (m *ProbeManager) executeTask(task probeTask) {
 	}
 }
 
-func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority probePriority) bool {
-	key := probeTaskKey{hash: hash, kind: kind}
+func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority probePriority, expected ...*node.NodeEntry) bool {
+	var expectedEntry *node.NodeEntry
+	if len(expected) != 0 {
+		expectedEntry = expected[0]
+	}
+	key := probeTaskKey{hash: hash, kind: kind, expected: expectedEntry}
 	state, _ := m.taskStates.LoadOrCompute(key, func() (*probeTaskState, bool) {
 		return &probeTaskState{}, false
 	})
@@ -690,6 +863,15 @@ func (m *ProbeManager) clearDroppedState(state *probeTaskState) {
 	}
 }
 
+func (m *ProbeManager) dropPendingTaskState(key probeTaskKey) {
+	state, ok := m.taskStates.Load(key)
+	if !ok {
+		return
+	}
+	m.clearDroppedState(state)
+	m.tryDeleteTaskState(key, state)
+}
+
 func (m *ProbeManager) tryDeleteTaskState(key probeTaskKey, state *probeTaskState) {
 	m.taskStates.Compute(key, func(current *probeTaskState, loaded bool) (*probeTaskState, xsync.ComputeOp) {
 		if !loaded || current != state {
@@ -748,7 +930,7 @@ func (m *ProbeManager) probeEgress(hash node.Hash, entry *node.NodeEntry) {
 		m.onProbeEvent("egress")
 	}
 
-	_, stage, err := m.performEgressProbe(hash)
+	_, stage, err := m.performEgressProbe(m.probeCtx, hash, entry)
 	if err != nil {
 		if stage == egressProbeParseError {
 			log.Printf("[probe] parse egress IP for %s: %v", hash.Hex(), err)
@@ -775,45 +957,107 @@ func (m *ProbeManager) probeLatency(hash node.Hash, entry *node.NodeEntry, testU
 		m.onProbeEvent("latency")
 	}
 
-	if err := m.performLatencyProbe(hash, testURL); err != nil {
+	if err := m.performLatencyProbe(m.probeCtx, hash, entry, testURL); err != nil {
 		log.Printf("[probe] latency probe failed for %s: %v", hash.Hex(), err)
 		return
 	}
 }
 
-func (m *ProbeManager) performEgressProbe(hash node.Hash) (netip.Addr, egressProbeErrorStage, error) {
-	body, latency, err := m.fetcher(hash, egressTraceURL)
+func (m *ProbeManager) performEgressProbe(ctx context.Context, hash node.Hash, entry *node.NodeEntry) (netip.Addr, egressProbeErrorStage, error) {
+	body, latency, err := m.fetcher(ctx, entry, egressTraceURL)
 	if err != nil {
-		m.pool.RecordResult(hash, false)
-		m.pool.UpdateNodeEgressIP(hash, nil, nil)
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return netip.Addr{}, egressProbeFetchError, ctxErr
+			}
+		}
+		m.pool.RecordResultForEntry(hash, entry, false)
+		m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
 		return netip.Addr{}, egressProbeFetchError, err
 	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return netip.Addr{}, egressProbeFetchError, ctxErr
+		}
+	}
 
-	m.pool.RecordResult(hash, true)
-	if latency > 0 {
-		m.pool.RecordLatency(hash, egressTraceDomain, &latency)
+	if !m.pool.RecordResultForEntry(hash, entry, true) {
+		return netip.Addr{}, egressProbeFetchError, errProbeEntryNotLive
+	}
+	if hook := m.afterProbeResultRecordHook; hook != nil {
+		hook()
 	}
 
 	ip, loc, err := ParseCloudflareTrace(body)
+	postErr := m.withProbePostProcessing(ctx, func() {
+		if latency > 0 {
+			m.pool.RecordLatencyForEntry(hash, entry, egressTraceDomain, &latency)
+		}
+		if err != nil {
+			m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+			return
+		}
+		m.pool.UpdateNodeEgressIPForEntry(hash, entry, &ip, loc)
+	})
+	if postErr != nil {
+		return netip.Addr{}, egressProbeFetchError, postErr
+	}
 	if err != nil {
-		m.pool.UpdateNodeEgressIP(hash, nil, nil)
 		return netip.Addr{}, egressProbeParseError, err
 	}
-	m.pool.UpdateNodeEgressIP(hash, &ip, loc)
 	return ip, egressProbeNoError, nil
 }
 
-func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error {
+func (m *ProbeManager) performLatencyProbe(ctx context.Context, hash node.Hash, entry *node.NodeEntry, testURL string) error {
 	domain := netutil.ExtractDomain(testURL)
-	_, latency, err := m.fetcher(hash, testURL)
+	_, latency, err := m.fetcher(ctx, entry, testURL)
 	if err != nil {
-		m.pool.RecordResult(hash, false)
-		m.pool.RecordLatency(hash, domain, nil)
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+		}
+		m.pool.RecordResultForEntry(hash, entry, false)
+		m.pool.RecordLatencyForEntry(hash, entry, domain, nil)
 		return err
 	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
 
-	m.pool.RecordResult(hash, true)
-	m.pool.RecordLatency(hash, domain, &latency)
+	if !m.pool.RecordResultForEntry(hash, entry, true) {
+		return errProbeEntryNotLive
+	}
+	if hook := m.afterProbeResultRecordHook; hook != nil {
+		hook()
+	}
+	if err := m.withProbePostProcessing(ctx, func() {
+		m.pool.RecordLatencyForEntry(hash, entry, domain, &latency)
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// withProbePostProcessing owns the final health metadata write after the
+// result record. Stop uses the same lifecycle lock to close this admission, so
+// cancellation cannot land between the context check and the writeback.
+func (m *ProbeManager) withProbePostProcessing(ctx context.Context, fn func()) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.stopped {
+		return context.Canceled
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if fn != nil {
+		fn()
+	}
 	return nil
 }
 

@@ -4,11 +4,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Resinat/Resin/internal/metricsconfig"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/robfig/cron/v3"
 )
@@ -70,6 +72,16 @@ type EnvConfig struct {
 	MetricLatencyBinOverflowMS        int
 }
 
+// Request-log queue limits keep startup memory bounded. A RequestLogEntry
+// contains many strings and optional byte slices, so accepting an arbitrary
+// channel capacity turns configuration into an unbounded allocation request.
+const (
+	MaxRequestLogQueueSize      = 1 << 17
+	MaxRequestLogFlushBatchSize = 1 << 16
+	defaultRequestLogQueueSize  = 8192
+	defaultRequestLogBatchSize  = 4096
+)
+
 // DefaultNodeDNSUpstreams returns the default node DNS upstream URI list.
 func DefaultNodeDNSUpstreams() []string {
 	return []string{
@@ -128,8 +140,8 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyBypassRules = envDelimitedStringSlice("RESIN_PROXY_BYPASS", []string{})
 
 	// --- Request log ---
-	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)
-	cfg.RequestLogQueueFlushBatchSize = envInt("RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE", 4096, &errs)
+	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", defaultRequestLogQueueSize, &errs)
+	cfg.RequestLogQueueFlushBatchSize = envInt("RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE", defaultRequestLogBatchSize, &errs)
 	cfg.RequestLogQueueFlushInterval = envDuration("RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL", 5*time.Minute, &errs)
 	cfg.RequestLogDBMaxMB = envInt("RESIN_REQUEST_LOG_DB_MAX_MB", 512, &errs)
 	cfg.RequestLogDBRetainCount = envInt("RESIN_REQUEST_LOG_DB_RETAIN_COUNT", 2, &errs)
@@ -203,6 +215,8 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	}
 	if cfg.DefaultPlatformStickyTTL <= 0 {
 		errs = append(errs, "RESIN_DEFAULT_PLATFORM_STICKY_TTL must be positive")
+	} else if _, err := platform.StickyLeaseExpiryUnixNano(time.Now(), int64(cfg.DefaultPlatformStickyTTL)); err != nil {
+		errs = append(errs, "RESIN_DEFAULT_PLATFORM_STICKY_TTL: "+err.Error())
 	}
 	if _, err := platform.CompileRegexFilters(cfg.DefaultPlatformRegexFilters); err != nil {
 		errs = append(errs, fmt.Sprintf("RESIN_DEFAULT_PLATFORM_REGEX_FILTERS: %v", err))
@@ -284,27 +298,48 @@ func LoadEnvConfig() (*EnvConfig, error) {
 			"RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST must be less than or equal to RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS",
 		)
 	}
-	validatePositive("RESIN_REQUEST_LOG_QUEUE_SIZE", cfg.RequestLogQueueSize, &errs)
-	validatePositive("RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE", cfg.RequestLogQueueFlushBatchSize, &errs)
+	if err := ValidateRequestLogQueueConfig(cfg.RequestLogQueueSize, cfg.RequestLogQueueFlushBatchSize); err != nil {
+		errs = append(errs, "RESIN_REQUEST_LOG_QUEUE_SIZE/RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE: "+err.Error())
+	}
 	validatePositive("RESIN_REQUEST_LOG_DB_MAX_MB", cfg.RequestLogDBMaxMB, &errs)
+	if _, err := RequestLogDBMaxBytes(cfg.RequestLogDBMaxMB); err != nil {
+		errs = append(errs, "RESIN_REQUEST_LOG_DB_MAX_MB: "+err.Error())
+	}
 	validatePositive("RESIN_REQUEST_LOG_DB_RETAIN_COUNT", cfg.RequestLogDBRetainCount, &errs)
-	validatePositive("RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS", cfg.MetricThroughputIntervalSeconds, &errs)
-	validatePositive("RESIN_METRIC_THROUGHPUT_RETENTION_SECONDS", cfg.MetricThroughputRetentionSeconds, &errs)
-	validatePositive("RESIN_METRIC_BUCKET_SECONDS", cfg.MetricBucketSeconds, &errs)
-	validatePositive("RESIN_METRIC_CONNECTIONS_INTERVAL_SECONDS", cfg.MetricConnectionsIntervalSeconds, &errs)
-	validatePositive("RESIN_METRIC_CONNECTIONS_RETENTION_SECONDS", cfg.MetricConnectionsRetentionSeconds, &errs)
-	validatePositive("RESIN_METRIC_LEASES_INTERVAL_SECONDS", cfg.MetricLeasesIntervalSeconds, &errs)
-	validatePositive("RESIN_METRIC_LEASES_RETENTION_SECONDS", cfg.MetricLeasesRetentionSeconds, &errs)
-	validatePositive("RESIN_METRIC_LATENCY_BIN_WIDTH_MS", cfg.MetricLatencyBinWidthMS, &errs)
-	validatePositive("RESIN_METRIC_LATENCY_BIN_OVERFLOW_MS", cfg.MetricLatencyBinOverflowMS, &errs)
+	validateMetricDurationSeconds("RESIN_METRIC_BUCKET_SECONDS", cfg.MetricBucketSeconds, &errs)
+	validateMetricRealtimePair(
+		"RESIN_METRIC_THROUGHPUT_RETENTION_SECONDS",
+		cfg.MetricThroughputRetentionSeconds,
+		"RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS",
+		cfg.MetricThroughputIntervalSeconds,
+		&errs,
+	)
+	validateMetricRealtimePair(
+		"RESIN_METRIC_CONNECTIONS_RETENTION_SECONDS",
+		cfg.MetricConnectionsRetentionSeconds,
+		"RESIN_METRIC_CONNECTIONS_INTERVAL_SECONDS",
+		cfg.MetricConnectionsIntervalSeconds,
+		&errs,
+	)
+	validateMetricRealtimePair(
+		"RESIN_METRIC_LEASES_RETENTION_SECONDS",
+		cfg.MetricLeasesRetentionSeconds,
+		"RESIN_METRIC_LEASES_INTERVAL_SECONDS",
+		cfg.MetricLeasesIntervalSeconds,
+		&errs,
+	)
+	if _, err := metricsconfig.LatencyHistogramBucketCount(
+		cfg.MetricLatencyBinWidthMS,
+		cfg.MetricLatencyBinOverflowMS,
+	); err != nil {
+		errs = append(errs, fmt.Sprintf(
+			"RESIN_METRIC_LATENCY_BIN_WIDTH_MS/RESIN_METRIC_LATENCY_BIN_OVERFLOW_MS: %v",
+			err,
+		))
+	}
 
 	if cfg.RequestLogQueueFlushInterval <= 0 {
 		errs = append(errs, "RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL must be positive")
-	}
-
-	// Queue size must be >= 2x batch size
-	if cfg.RequestLogQueueSize < 2*cfg.RequestLogQueueFlushBatchSize {
-		errs = append(errs, "RESIN_REQUEST_LOG_QUEUE_SIZE must be at least 2x RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE")
 	}
 
 	if len(errs) > 0 {
@@ -312,6 +347,47 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+const requestLogDBBytesPerMB int64 = 1024 * 1024
+
+// RequestLogDBMaxBytes converts the configured request-log size without
+// allowing the MB-to-byte multiplication to wrap. A wrapped negative value
+// would otherwise be silently normalized to the 512 MiB constructor default.
+func RequestLogDBMaxBytes(maxMB int) (int64, error) {
+	if maxMB <= 0 {
+		// Keep the constructor's historical zero-value default for callers that
+		// build EnvConfig directly. LoadEnvConfig applies the stricter positive
+		// environment contract above.
+		return 0, nil
+	}
+	value := int64(maxMB)
+	if value > math.MaxInt64/requestLogDBBytesPerMB {
+		return 0, fmt.Errorf("%d MB exceeds the maximum representable byte size", maxMB)
+	}
+	return value * requestLogDBBytesPerMB, nil
+}
+
+// ValidateRequestLogQueueConfig validates request-log queue and batch sizes
+// before any constructor can allocate their backing storage.
+func ValidateRequestLogQueueConfig(queueSize, batchSize int) error {
+	if queueSize <= 0 {
+		return fmt.Errorf("queue size must be positive, got %d", queueSize)
+	}
+	if batchSize <= 0 {
+		return fmt.Errorf("flush batch size must be positive, got %d", batchSize)
+	}
+	if queueSize > MaxRequestLogQueueSize {
+		return fmt.Errorf("queue size %d exceeds maximum %d", queueSize, MaxRequestLogQueueSize)
+	}
+	if batchSize > MaxRequestLogFlushBatchSize {
+		return fmt.Errorf("flush batch size %d exceeds maximum %d", batchSize, MaxRequestLogFlushBatchSize)
+	}
+	// Use division instead of 2*batchSize so validation itself cannot wrap.
+	if batchSize > queueSize/2 {
+		return fmt.Errorf("queue size must be at least 2x flush batch size")
+	}
+	return nil
 }
 
 // --- helpers ---
@@ -399,6 +475,28 @@ func validatePort(name string, value int, errs *[]string) {
 func validatePositive(name string, value int, errs *[]string) {
 	if value <= 0 {
 		*errs = append(*errs, fmt.Sprintf("%s: must be positive, got %d", name, value))
+	}
+}
+
+func validateMetricDurationSeconds(name string, value int, errs *[]string) {
+	if err := metricsconfig.ValidateDurationSeconds(value); err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", name, err))
+	}
+}
+
+func validateMetricRealtimePair(
+	retentionName string,
+	retentionSec int,
+	intervalName string,
+	intervalSec int,
+	errs *[]string,
+) {
+	if err := metricsconfig.ValidateDurationSeconds(intervalSec); err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", intervalName, err))
+		return
+	}
+	if _, err := metricsconfig.RealtimeCapacity(retentionSec, intervalSec); err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", retentionName, err))
 	}
 }
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"net/netip"
 	"sync/atomic"
 	"testing"
@@ -506,7 +507,7 @@ func TestProbeEgress_ReturnsRegion(t *testing.T) {
 		GeoIP:  &geoip.Service{}, // empty service keeps focus on stored region from loc
 		ProbeMgr: probe.NewProbeManager(probe.ProbeConfig{
 			Pool: pool,
-			Fetcher: func(_ node.Hash, _ string) ([]byte, time.Duration, error) {
+			Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
 				return []byte("ip=198.51.100.88\nloc=JP"), 20 * time.Millisecond, nil
 			},
 		}),
@@ -521,5 +522,419 @@ func TestProbeEgress_ReturnsRegion(t *testing.T) {
 	}
 	if got.Region != "jp" {
 		t.Fatalf("region: got %q, want %q", got.Region, "jp")
+	}
+}
+
+func TestProbeEgressRejectsNodeGenerationChangedAfterLookup(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+
+	sub := subscription.NewSubscription("sub-generation", "sub-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.10","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.80")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+	oldEntry.SetEgressRegion("old-region")
+
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			return []byte("ip=198.51.100.81\nloc=US"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{
+		Pool:     pool,
+		SubMgr:   subMgr,
+		GeoIP:    &geoip.Service{},
+		ProbeMgr: probeMgr,
+	}
+	lookupDone := make(chan struct{})
+	allowProbe := make(chan struct{})
+	cp.beforeProbeManagerCallHook = func() {
+		close(lookupDone)
+		<-allowProbe
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeEgress(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-lookupDone:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not reach the post-lookup seam")
+	}
+
+	// Recreate the same hash while the service still holds the old entry.
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowProbe)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeEgress succeeded after its captured node entry was replaced")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeEgress did not finish after releasing the seam")
+	}
+	if got := fetchCalls.Load(); got != 0 {
+		t.Fatalf("probe fetched replacement entry after generation change: %d calls", got)
+	}
+}
+
+func TestProbeLatencyRejectsNodeGenerationChangedAfterLookup(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+
+	sub := subscription.NewSubscription("sub-latency-generation", "sub-latency-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.11","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.81")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			return []byte("OK"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{
+		Pool:     pool,
+		SubMgr:   subMgr,
+		ProbeMgr: probeMgr,
+	}
+	lookupDone := make(chan struct{})
+	allowProbe := make(chan struct{})
+	cp.beforeProbeManagerCallHook = func() {
+		close(lookupDone)
+		<-allowProbe
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeLatency(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-lookupDone:
+	case <-time.After(time.Second):
+		t.Fatal("latency probe did not reach the post-lookup seam")
+	}
+
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowProbe)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeLatency succeeded after its captured node entry was replaced")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeLatency did not finish after releasing the seam")
+	}
+	if got := fetchCalls.Load(); got != 0 {
+		t.Fatalf("latency probe fetched replacement entry after generation change: %d calls", got)
+	}
+}
+
+func TestProbeEgressRejectsNodeGenerationChangedDuringFetch(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-egress-fetch-generation", "sub-egress-fetch-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.14","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.84")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+
+	fetchStarted := make(chan struct{})
+	allowFetch := make(chan struct{})
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			close(fetchStarted)
+			<-allowFetch
+			return []byte("ip=198.51.100.84\nloc=CA"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr, ProbeMgr: probeMgr, GeoIP: &geoip.Service{}}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeEgress(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("egress probe did not enter fetch")
+	}
+
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowFetch)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeEgress returned an old-generation result after replacement during fetch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeEgress did not finish after releasing fetch")
+	}
+	probeMgr.Stop()
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("egress fetch calls = %d, want exactly one old-generation fetch", got)
+	}
+	if got := newEntry.GetEgressIP(); got.IsValid() {
+		t.Fatalf("stale egress probe polluted replacement entry: %v", got)
+	}
+	if newEntry.HasLatency() {
+		t.Fatal("stale egress probe wrote latency to replacement entry")
+	}
+}
+
+func TestProbeLatencyRejectsNodeGenerationChangedDuringFetch(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-latency-fetch-generation", "sub-latency-fetch-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.15","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.85")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+
+	fetchStarted := make(chan struct{})
+	allowFetch := make(chan struct{})
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			close(fetchStarted)
+			<-allowFetch
+			return []byte("OK"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr, ProbeMgr: probeMgr}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeLatency(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("latency probe did not enter fetch")
+	}
+
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowFetch)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeLatency returned an old-generation result after replacement during fetch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeLatency did not finish after releasing fetch")
+	}
+	probeMgr.Stop()
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("latency fetch calls = %d, want exactly one old-generation fetch", got)
+	}
+	if newEntry.HasLatency() {
+		t.Fatal("stale latency probe polluted replacement entry")
+	}
+}
+
+func TestProbeEgressRejectsNodeGenerationChangedBeforeResponse(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-egress-final-generation", "sub-egress-final-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.12","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.82")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			return []byte("ip=198.51.100.82\nloc=CA"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr, ProbeMgr: probeMgr, GeoIP: &geoip.Service{}}
+	managerDone := make(chan struct{})
+	allowResponse := make(chan struct{})
+	cp.afterProbeManagerResultHook = func() {
+		close(managerDone)
+		<-allowResponse
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeEgress(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-managerDone:
+	case <-time.After(time.Second):
+		t.Fatal("egress probe did not reach the post-manager seam")
+	}
+
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowResponse)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeEgress returned a result after its captured entry was replaced")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeEgress did not finish after releasing the response seam")
+	}
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("egress fetch calls = %d, want exactly one old-generation fetch", got)
+	}
+	if got := newEntry.GetEgressIP(); got.IsValid() {
+		t.Fatalf("post-manager generation change polluted replacement egress IP: %v", got)
+	}
+}
+
+func TestProbeLatencyRejectsNodeGenerationChangedBeforeResponse(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	sub := subscription.NewSubscription("sub-latency-final-generation", "sub-latency-final-generation", "https://example.com", true, false)
+	subMgr.Register(sub)
+	raw := []byte(`{"type":"ss","server":"198.51.100.13","port":443}`)
+	hash := addRoutableNodeForSubscription(t, pool, sub, raw, "203.0.113.83")
+	oldEntry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("old node entry not found")
+	}
+
+	var fetchCalls atomic.Int32
+	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+		Pool: pool,
+		Fetcher: func(_ context.Context, _ *node.NodeEntry, _ string) ([]byte, time.Duration, error) {
+			fetchCalls.Add(1)
+			return []byte("OK"), 20 * time.Millisecond, nil
+		},
+	})
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr, ProbeMgr: probeMgr}
+	managerDone := make(chan struct{})
+	allowResponse := make(chan struct{})
+	cp.afterProbeManagerResultHook = func() {
+		close(managerDone)
+		<-allowResponse
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cp.ProbeLatency(hash.Hex())
+		resultCh <- err
+	}()
+	select {
+	case <-managerDone:
+	case <-time.After(time.Second):
+		t.Fatal("latency probe did not reach the post-manager seam")
+	}
+
+	pool.RemoveNodeFromSub(hash, sub.ID)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	newEntry, ok := pool.GetEntry(hash)
+	if !ok || newEntry == oldEntry {
+		t.Fatal("same-hash node was not recreated with a new entry")
+	}
+	newOutbound := testutil.NewNoopOutbound()
+	newEntry.Outbound.Store(&newOutbound)
+	if !pool.RecordResultForEntry(hash, newEntry, true) {
+		t.Fatal("new entry health setup was rejected")
+	}
+
+	close(allowResponse)
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("ProbeLatency returned a result after its captured entry was replaced")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ProbeLatency did not finish after releasing the response seam")
+	}
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("latency fetch calls = %d, want exactly one old-generation fetch", got)
+	}
+	if newEntry.HasLatency() {
+		t.Fatal("post-manager generation change polluted replacement latency")
 	}
 }

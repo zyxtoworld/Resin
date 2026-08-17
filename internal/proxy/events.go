@@ -96,18 +96,23 @@ type NoOpEventEmitter struct{}
 func (NoOpEventEmitter) EmitRequestFinished(RequestFinishedEvent) {}
 func (NoOpEventEmitter) EmitRequestLog(RequestLogEntry)           {}
 
-// ConfigAwareEventEmitter wraps another EventEmitter and gates request-log
-// emission by a runtime flag provider (hot-reload friendly).
-type ConfigAwareEventEmitter struct {
-	Base              EventEmitter
-	RequestLogEnabled func() bool
+// RequestLogRuntimeConfig is the complete runtime configuration needed for one
+// request-log event. The provider must return one immutable generation so an
+// event cannot combine fields from two hot-reloaded configurations.
+type RequestLogRuntimeConfig struct {
+	Enabled             bool
+	DetailEnabled       bool
+	ReqHeadersMaxBytes  int
+	ReqBodyMaxBytes     int
+	RespHeadersMaxBytes int
+	RespBodyMaxBytes    int
+}
 
-	// Reverse proxy request-log detail controls (hot-reload friendly).
-	ReverseProxyLogDetailEnabled       func() bool
-	ReverseProxyLogReqHeadersMaxBytes  func() int
-	ReverseProxyLogReqBodyMaxBytes     func() int
-	ReverseProxyLogRespHeadersMaxBytes func() int
-	ReverseProxyLogRespBodyMaxBytes    func() int
+// ConfigAwareEventEmitter wraps another EventEmitter and gates request-log
+// emission by one complete runtime configuration snapshot.
+type ConfigAwareEventEmitter struct {
+	Base                     EventEmitter
+	RequestLogConfigProvider func() RequestLogRuntimeConfig
 }
 
 type reverseDetailCaptureConfig struct {
@@ -125,33 +130,29 @@ func (e ConfigAwareEventEmitter) emitBase() EventEmitter {
 	return e.Base
 }
 
-func (e ConfigAwareEventEmitter) reverseDetailCaptureConfig() reverseDetailCaptureConfig {
-	cfg := reverseDetailCaptureConfig{
+func (e ConfigAwareEventEmitter) requestLogRuntimeConfig() RequestLogRuntimeConfig {
+	if e.RequestLogConfigProvider != nil {
+		return e.RequestLogConfigProvider()
+	}
+	return RequestLogRuntimeConfig{
 		Enabled:             true,
+		DetailEnabled:       true,
 		ReqHeadersMaxBytes:  -1,
 		ReqBodyMaxBytes:     -1,
 		RespHeadersMaxBytes: -1,
 		RespBodyMaxBytes:    -1,
 	}
-	if e.RequestLogEnabled != nil && !e.RequestLogEnabled() {
-		cfg.Enabled = false
+}
+
+func (e ConfigAwareEventEmitter) reverseDetailCaptureConfig() reverseDetailCaptureConfig {
+	cfg := e.requestLogRuntimeConfig()
+	return reverseDetailCaptureConfig{
+		Enabled:             cfg.Enabled && cfg.DetailEnabled,
+		ReqHeadersMaxBytes:  cfg.ReqHeadersMaxBytes,
+		ReqBodyMaxBytes:     cfg.ReqBodyMaxBytes,
+		RespHeadersMaxBytes: cfg.RespHeadersMaxBytes,
+		RespBodyMaxBytes:    cfg.RespBodyMaxBytes,
 	}
-	if e.ReverseProxyLogDetailEnabled != nil && !e.ReverseProxyLogDetailEnabled() {
-		cfg.Enabled = false
-	}
-	if e.ReverseProxyLogReqHeadersMaxBytes != nil {
-		cfg.ReqHeadersMaxBytes = e.ReverseProxyLogReqHeadersMaxBytes()
-	}
-	if e.ReverseProxyLogReqBodyMaxBytes != nil {
-		cfg.ReqBodyMaxBytes = e.ReverseProxyLogReqBodyMaxBytes()
-	}
-	if e.ReverseProxyLogRespHeadersMaxBytes != nil {
-		cfg.RespHeadersMaxBytes = e.ReverseProxyLogRespHeadersMaxBytes()
-	}
-	if e.ReverseProxyLogRespBodyMaxBytes != nil {
-		cfg.RespBodyMaxBytes = e.ReverseProxyLogRespBodyMaxBytes()
-	}
-	return cfg
 }
 
 func normalizePayloadField(payload []byte, length int, truncated bool, max int) ([]byte, int, bool) {
@@ -190,14 +191,14 @@ func (e ConfigAwareEventEmitter) EmitRequestFinished(ev RequestFinishedEvent) {
 }
 
 func (e ConfigAwareEventEmitter) EmitRequestLog(ev RequestLogEntry) {
-	if e.RequestLogEnabled != nil && !e.RequestLogEnabled() {
+	cfg := e.requestLogRuntimeConfig()
+	if !cfg.Enabled {
 		return
 	}
 
 	// Reverse proxy detail payload is controlled by runtime config.
 	if ev.ProxyType == ProxyTypeReverse {
-		cfg := e.reverseDetailCaptureConfig()
-		if !cfg.Enabled {
+		if !cfg.DetailEnabled {
 			clearReverseDetailPayload(&ev)
 		} else {
 			ev.ReqHeaders, ev.ReqHeadersLen, ev.ReqHeadersTruncated = normalizePayloadField(

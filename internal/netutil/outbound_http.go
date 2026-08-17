@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -70,7 +69,7 @@ func HTTPGetViaOutbound(
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, &NonRetryableError{Err: err, url: redactURLCredentials(url)}
 	}
 
 	userAgent := opts.UserAgent
@@ -93,15 +92,26 @@ func HTTPGetViaOutbound(
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, latency, fmt.Errorf(
+			"outbound fetch: request %s failed: %w",
+			redactURLCredentials(url),
+			unwrapURLRequestError(err),
+		)
 	}
 	defer resp.Body.Close()
 
 	if opts.RequireStatusOK && resp.StatusCode != http.StatusOK {
-		return nil, latency, fmt.Errorf("outbound fetch: unexpected status %d from %s", resp.StatusCode, url)
+		return nil, latency, fmt.Errorf(
+			"outbound fetch: unexpected status %d from %s",
+			resp.StatusCode,
+			redactURLCredentials(url),
+		)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	if err := validateResourceContentLength(resp.ContentLength); err != nil {
+		return nil, latency, fmt.Errorf("outbound fetch: %w", err)
+	}
+	body, err := readResourceBody(resp.Body)
 	if err != nil {
 		return nil, latency, err
 	}
@@ -119,10 +129,10 @@ type connCloseHook struct {
 
 func (c *connCloseHook) Close() error {
 	c.closeOnce.Do(func() {
+		c.closeErr = c.Conn.Close()
 		if c.onClose != nil {
 			c.onClose()
 		}
-		c.closeErr = c.Conn.Close()
 	})
 	return c.closeErr
 }

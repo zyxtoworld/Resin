@@ -190,7 +190,7 @@ func HandleGetNode(cp *service.ControlPlaneService) http.HandlerFunc {
 func HandleProbeEgress(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hash := PathParam(r, "hash")
-		result, err := cp.ProbeEgress(hash)
+		result, err := cp.ProbeEgressContext(r.Context(), hash)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -203,7 +203,7 @@ func HandleProbeEgress(cp *service.ControlPlaneService) http.HandlerFunc {
 func HandleProbeLatency(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hash := PathParam(r, "hash")
-		result, err := cp.ProbeLatency(hash)
+		result, err := cp.ProbeLatencyContext(r.Context(), hash)
 		if err != nil {
 			writeServiceError(w, err)
 			return

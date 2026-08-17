@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -17,38 +18,112 @@ import (
 
 var (
 	ErrPlatformNotFound = errors.New("platform not found")
+	ErrLeaseNotFound    = errors.New("lease not found")
+	ErrRouterStopped    = errors.New("router stopped")
+	// ErrRuntimeGenerationBusy means a complete subscription/node/platform
+	// generation is being published. Data-plane callers must fail closed
+	// rather than observe a mixture of the old and new generation.
+	ErrRuntimeGenerationBusy = errors.New("runtime generation busy")
 )
 
 type PoolAccessor interface {
 	GetEntry(hash node.Hash) (*node.NodeEntry, bool)
+	// IsNodeDisabled is checked again at the traffic-selection boundary; a
+	// published platform view can lag a subscription enable/disable rebuild.
+	IsNodeDisabled(hash node.Hash) bool
 	GetPlatform(id string) (*platform.Platform, bool)
 	GetPlatformByName(name string) (*platform.Platform, bool)
 	RangePlatforms(fn func(*platform.Platform) bool)
 }
 
+// RuntimeGenerationReader is implemented by the production node pool. Route
+// selection reads platform views, pool entries, and subscription-derived
+// state as one generation; the optional interface keeps lightweight test pool
+// fakes source-compatible while production takes the read side.
+type RuntimeGenerationReader interface {
+	WithRuntimeRead(func())
+}
+
+// RuntimeGenerationTryReader is the non-blocking data-plane variant. It is
+// optional so lightweight pool fakes keep the historical blocking contract.
+type RuntimeGenerationTryReader interface {
+	TryWithRuntimeRead(func()) bool
+}
+
+// ExactEntryExecutor provides the node-lifecycle linearization point for a
+// side effect tied to one captured entry generation. Implementations must
+// recheck the current pointer while holding their node replacement owner and
+// invoke fn only when it is still exact.
+type ExactEntryExecutor interface {
+	WithCurrentEntry(hash node.Hash, expected *node.NodeEntry, fn func()) bool
+}
+
 // Router handles route selection and lease management.
 type Router struct {
-	pool            PoolAccessor
-	states          *xsync.Map[string, *PlatformRoutingState]
-	authorities     func() []string
-	p2cWindow       func() time.Duration
-	onLeaseEvent    LeaseEventFunc
-	nodeTagResolver func(node.Hash) string
+	pool   PoolAccessor
+	states *xsync.Map[string, *PlatformRoutingState]
+	// lifecycleMu is the platform-routing lifetime owner. Routes, lease writes,
+	// reads, and cleaner sweeps hold the read side. Platform removal first
+	// unregisters the platform from the pool, then takes the write side to drain
+	// old operations before deleting the complete routing state.
+	lifecycleMu            sync.RWMutex
+	stopped                bool
+	leaseEventsMu          sync.Mutex
+	leaseEventsCond        *sync.Cond
+	nextLeaseEventSeq      uint64
+	deliveredLeaseEventSeq uint64
+	authorities            func() []string
+	p2cWindow              func() time.Duration
+	onLeaseEvent           LeaseEventFunc
+	nodeTagResolver        func(node.Hash, *node.NodeEntry) string
+
+	// Package-private seam for deterministic lifecycle tests. It runs after
+	// RouteRequest has entered lifecycleMu's read section and resolved a
+	// platform, but before it mutates or reads routing state.
+	afterPlatformResolveHook func(*platform.Platform)
+	// Package-private seam for proving that removal waits at the exclusive
+	// lifecycle boundary after the caller has started deletion.
+	beforePlatformStateRemovalLockHook func()
+	// Package-private seam called after the exclusive lifecycle lock is
+	// acquired, while it is still held.
+	afterPlatformStateRemovalLockHook func()
+	// Package-private seam used to stop immediately after a lease-delete ticket
+	// is assigned, while the per-account Compute is still in progress.
+	afterLeaseDeleteLinearizedHook func()
+	// Package-private seam used to stop immediately after a lease-create or
+	// replace ticket is assigned, while the per-account Compute is in progress.
+	afterLeaseUpsertLinearizedHook func()
+	// Package-private seam called after one Compute's contiguous event ticket
+	// range has been assigned, before that Compute callback returns.
+	afterLeaseEventBatchTicketHook func()
+	// Package-private seam called inside an atomic platform read after the pool
+	// existence check, while lifecycleMu.RLock is held.
+	beforeAtomicPlatformReadHook func()
+	// Package-private seam called after QuarantineRoute validates the exact
+	// selected entry and immediately before it records the cooldown.
+	beforeResponseCooldownMarkHook func()
+	// Package-private seam called after Stop closes route admission and before
+	// it waits for lease-event delivery.
+	afterStopAdmissionHook func()
 }
 
 type RouterConfig struct {
 	Pool        PoolAccessor
 	Authorities func() []string
 	P2CWindow   func() time.Duration
-	// OnLeaseEvent is called synchronously; handlers must stay lightweight.
+	// OnLeaseEvent is called synchronously after the lifecycle lock is released.
+	// It may re-enter Router read APIs, but must not call a Router mutation that
+	// can emit another lease event.
 	OnLeaseEvent LeaseEventFunc
-	// NodeTagResolver resolves a node hash to its display tag ("<Sub>/<Tag>").
+	// NodeTagResolver resolves the selected node entry to its display tag
+	// ("<Sub>/<Tag>"). The entry is an identity token: implementations must
+	// fail closed when it is no longer the current generation for the hash.
 	// If nil, NodeTag will be empty.
-	NodeTagResolver func(node.Hash) string
+	NodeTagResolver func(node.Hash, *node.NodeEntry) string
 }
 
 func NewRouter(cfg RouterConfig) *Router {
-	return &Router{
+	r := &Router{
 		pool:            cfg.Pool,
 		states:          xsync.NewMap[string, *PlatformRoutingState](),
 		authorities:     cfg.Authorities,
@@ -56,16 +131,118 @@ func NewRouter(cfg RouterConfig) *Router {
 		onLeaseEvent:    cfg.OnLeaseEvent,
 		nodeTagResolver: cfg.NodeTagResolver,
 	}
+	r.leaseEventsCond = sync.NewCond(&r.leaseEventsMu)
+	return r
+}
+
+// Stop closes route and lease mutation admission. It waits for any operation
+// already inside lifecycleMu, while later callers fail closed under the same
+// lock. It is idempotent.
+func (r *Router) Stop() {
+	if r == nil {
+		return
+	}
+	r.lifecycleMu.Lock()
+	r.stopped = true
+	r.lifecycleMu.Unlock()
+	if hook := r.afterStopAdmissionHook; hook != nil {
+		hook()
+	}
+	// Route/lease mutations assign their event tickets before releasing
+	// lifecycleMu, but deliver callbacks afterward. Drain those already
+	// admitted callbacks before reporting the router stopped; otherwise the
+	// application could close dirty-write admission while a lease event is
+	// still waiting to persist.
+	r.WaitForLeaseEvents()
+}
+
+// RemovePlatformState linearly removes all routing state for a platform.
+// Callers must unregister the platform from the pool first so new routes stop
+// resolving it before this exclusive boundary drains old operations.
+func (r *Router) RemovePlatformState(platformID string) {
+	if r == nil || platformID == "" {
+		return
+	}
+	if hook := r.beforePlatformStateRemovalLockHook; hook != nil {
+		hook()
+	}
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.Lock()
+	if hook := r.afterPlatformStateRemovalLockHook; hook != nil {
+		hook()
+	}
+	r.removePlatformStateUnlocked(platformID, events)
+	r.lifecycleMu.Unlock()
+	events.finish()
+}
+
+// removePlatformStateUnlocked removes a platform's complete routing state.
+// The caller must hold lifecycleMu exclusively.
+func (r *Router) removePlatformStateUnlocked(platformID string, events *leaseEventBatch) {
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		return
+	}
+
+	var accounts []string
+	state.Leases.Range(func(account string, _ Lease) bool {
+		accounts = append(accounts, account)
+		return true
+	})
+	for _, account := range accounts {
+		// Delete through the table so the per-IP counter stays in sync.
+		r.deleteLeaseWithEvent(state, platformID, account, events)
+	}
+	r.states.Delete(platformID)
+}
+
+// deleteLeaseWithEvent is the common local mutation path for all removals.
+// The event ticket is assigned from inside LeaseTable's Compute callback, so
+// a same-account replacement cannot overtake the removal after the table has
+// already committed its delete.
+func (r *Router) deleteLeaseWithEvent(
+	state *PlatformRoutingState,
+	platformID string,
+	account string,
+	events *leaseEventBatch,
+) bool {
+	return state.Leases.deleteLeaseWith(account, func(lease Lease) {
+		mutation := events.newMutation()
+		mutation.add(LeaseEvent{
+			Type:        LeaseRemove,
+			PlatformID:  platformID,
+			Account:     account,
+			NodeHash:    lease.NodeHash,
+			EgressIP:    lease.EgressIP,
+			CreatedAtNs: lease.CreatedAtNs,
+		})
+		mutation.commit()
+		if hook := r.afterLeaseDeleteLinearizedHook; hook != nil {
+			hook()
+		}
+	})
 }
 
 type RouteResult struct {
-	PlatformID    string
-	PlatformName  string
-	NodeHash      node.Hash
-	EgressIP      netip.Addr
-	NodeTag       string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
-	LeaseCreated  bool
-	ResponseRules platform.ResponseRules
+	PlatformID                    string
+	PlatformName                  string
+	NodeHash                      node.Hash
+	EgressIP                      netip.Addr
+	NodeTag                       string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
+	LeaseCreated                  bool
+	PassiveCircuitBreakerDisabled bool
+	ResponseRules                 platform.ResponseRules
+	// selectedEntry is the exact pool entry that passed the platform view at
+	// route selection time. Consumers must re-read the pool and compare pointer
+	// identity before using the current entry; this is not a resource lease.
+	selectedEntry *node.NodeEntry
+}
+
+// SelectedEntry returns the entry identity captured during route selection.
+// Callers must validate it against a fresh pool lookup before using any
+// mutable or closable resource owned by the entry.
+func (r RouteResult) SelectedEntry() *node.NodeEntry {
+	return r.selectedEntry
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -79,25 +256,122 @@ const (
 )
 
 func (r *Router) RouteRequest(platName, account, target string) (RouteResult, error) {
+	if tryReader, ok := r.pool.(RuntimeGenerationTryReader); ok {
+		var result RouteResult
+		var err error
+		if !tryReader.TryWithRuntimeRead(func() {
+			result, err = r.routeRequest(platName, account, target)
+		}) {
+			return RouteResult{}, ErrRuntimeGenerationBusy
+		}
+		return result, err
+	}
+	if reader, ok := r.pool.(RuntimeGenerationReader); ok {
+		var result RouteResult
+		var err error
+		reader.WithRuntimeRead(func() {
+			result, err = r.routeRequest(platName, account, target)
+		})
+		return result, err
+	}
+	return r.routeRequest(platName, account, target)
+}
+
+// RouteRequestForPlatform routes with an already captured platform generation.
+// The caller must hold the platform publication read owner while this method
+// runs; that owner keeps account-policy extraction and route selection on one
+// complete platform object without re-entering the platform lookup lock.
+func (r *Router) RouteRequestForPlatform(
+	plat *platform.Platform,
+	account string,
+	target string,
+) (RouteResult, error) {
+	if r == nil || plat == nil {
+		return RouteResult{}, ErrPlatformNotFound
+	}
+	if tryReader, ok := r.pool.(RuntimeGenerationTryReader); ok {
+		var result RouteResult
+		var err error
+		if !tryReader.TryWithRuntimeRead(func() {
+			result, err = r.routeRequestForPlatform(plat, account, target)
+		}) {
+			return RouteResult{}, ErrRuntimeGenerationBusy
+		}
+		return result, err
+	}
+	if reader, ok := r.pool.(RuntimeGenerationReader); ok {
+		var result RouteResult
+		var err error
+		reader.WithRuntimeRead(func() {
+			result, err = r.routeRequestForPlatform(plat, account, target)
+		})
+		return result, err
+	}
+	return r.routeRequestForPlatform(plat, account, target)
+}
+
+func (r *Router) routeRequest(platName, account, target string) (RouteResult, error) {
+	var events *leaseEventBatch
+	if account != "" {
+		events = r.newLeaseEventBatch()
+	}
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return RouteResult{}, ErrRouterStopped
+	}
+
 	plat, err := r.resolvePlatform(platName)
 	if err != nil {
+		r.lifecycleMu.RUnlock()
+		events.finish()
 		return RouteResult{}, err
+	}
+	return r.routeRequestLocked(plat, account, target, events)
+}
+
+func (r *Router) routeRequestForPlatform(plat *platform.Platform, account, target string) (RouteResult, error) {
+	var events *leaseEventBatch
+	if account != "" {
+		events = r.newLeaseEventBatch()
+	}
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return RouteResult{}, ErrRouterStopped
+	}
+	return r.routeRequestLocked(plat, account, target, events)
+}
+
+func (r *Router) routeRequestLocked(
+	plat *platform.Platform,
+	account string,
+	target string,
+	events *leaseEventBatch,
+) (RouteResult, error) {
+	if hook := r.afterPlatformResolveHook; hook != nil {
+		hook(plat)
 	}
 
 	targetDomain := netutil.ExtractDomain(target)
 	state := r.ensurePlatformState(plat.ID)
 	var result RouteResult
+	var err error
 	if account == "" {
 		result, err = r.routeRandom(plat, state, targetDomain)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now())
+		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now(), events)
 	}
+	r.lifecycleMu.RUnlock()
+	events.finish()
 	if err != nil {
 		return RouteResult{}, err
 	}
 	result = withPlatformContext(plat, result)
 	if r.nodeTagResolver != nil {
-		result.NodeTag = r.nodeTagResolver(result.NodeHash)
+		result.NodeTag = r.nodeTagResolver(result.NodeHash, result.selectedEntry)
 	}
 	return result, nil
 }
@@ -105,6 +379,7 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 func withPlatformContext(plat *platform.Platform, res RouteResult) RouteResult {
 	res.PlatformID = plat.ID
 	res.PlatformName = plat.Name
+	res.PassiveCircuitBreakerDisabled = plat.PassiveCircuitBreakerDisabled
 	res.ResponseRules = plat.ResponseRules
 	return res
 }
@@ -130,6 +405,16 @@ func (r *Router) ensurePlatformState(platformID string) *PlatformRoutingState {
 	return state
 }
 
+// platformExistsLocked reports whether the platform is still registered in the
+// pool. The caller must hold lifecycleMu for reading or writing.
+func (r *Router) platformExistsLocked(platformID string) bool {
+	if r == nil || r.pool == nil || platformID == "" {
+		return false
+	}
+	_, ok := r.pool.GetPlatform(platformID)
+	return ok
+}
+
 func (r *Router) routeRandom(
 	plat *platform.Platform,
 	state *PlatformRoutingState,
@@ -140,9 +425,10 @@ func (r *Router) routeRandom(
 		return RouteResult{}, err
 	}
 	return RouteResult{
-		NodeHash:     h,
-		EgressIP:     entry.GetEgressIP(),
-		LeaseCreated: false,
+		NodeHash:      h,
+		EgressIP:      entry.GetEgressIP(),
+		LeaseCreated:  false,
+		selectedEntry: entry,
 	}, nil
 }
 
@@ -152,12 +438,14 @@ func (r *Router) routeSticky(
 	account string,
 	targetDomain string,
 	now time.Time,
+	events *leaseEventBatch,
 ) (RouteResult, error) {
 	nowNs := now.UnixNano()
 	var result RouteResult
 	var routeErr error
 
 	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		mutation := events.newMutation()
 		newLease, op, routeResult, err := r.decideStickyLease(
 			plat,
 			state,
@@ -167,12 +455,15 @@ func (r *Router) routeSticky(
 			nowNs,
 			current,
 			loaded,
+			mutation,
 		)
 		if err != nil {
 			routeErr = err
+			mutation.commit()
 			return newLease, op
 		}
 		result = routeResult
+		mutation.commit()
 		return newLease, op
 	})
 
@@ -188,6 +479,7 @@ func (r *Router) decideStickyLease(
 	nowNs int64,
 	current Lease,
 	loaded bool,
+	events leaseEventSink,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -198,10 +490,10 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if newLease, hitResult, ok := r.tryLeaseHit(plat, state, account, current, nowNs); ok {
+		if newLease, hitResult, ok := r.tryLeaseHit(plat, state, account, current, nowNs, events); ok {
 			return newLease, xsync.UpdateOp, hitResult, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, state, account, current, targetDomain, nowNs); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, state, account, current, targetDomain, nowNs, events); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -217,6 +509,7 @@ func (r *Router) decideStickyLease(
 		current,
 		hadPreviousLease,
 		invalidation,
+		events,
 	)
 }
 
@@ -230,10 +523,11 @@ func (r *Router) createOrAbortStickyLease(
 	previous Lease,
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
+	events leaseEventSink,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs)
 	if err != nil {
-		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
+		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account, events)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
 		return lease, op, RouteResult{}, err
 	}
@@ -241,19 +535,29 @@ func (r *Router) createOrAbortStickyLease(
 	// lease must still carry a new expiry even when the old and new calculations
 	// land in the same clock tick.
 	if hadPreviousLease && newLease.ExpiryNs == previous.ExpiryNs {
-		newLease.ExpiryNs++
+		if newLease.ExpiryNs < math.MaxInt64 {
+			newLease.ExpiryNs++
+		} else if newLease.ExpiryNs-1 > nowNs {
+			// MaxInt64 cannot be incremented. Keep the replacement distinct
+			// while preserving the expiry-after-now contract.
+			newLease.ExpiryNs--
+		} else {
+			return Lease{}, xsync.CancelOp, RouteResult{}, fmt.Errorf("cannot produce a distinct non-expired lease expiry")
+		}
 		createdResult.LeaseCreated = true
 	}
 
-	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
+	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account, events)
 	state.IPLoadStats.Inc(newLease.EgressIP)
-	r.emitLeaseEvent(LeaseEvent{
-		Type:       LeaseCreate,
-		PlatformID: plat.ID,
-		Account:    account,
-		NodeHash:   newLease.NodeHash,
-		EgressIP:   newLease.EgressIP,
-	})
+	if events != nil {
+		events.add(LeaseEvent{
+			Type:       LeaseCreate,
+			PlatformID: plat.ID,
+			Account:    account,
+			NodeHash:   newLease.NodeHash,
+			EgressIP:   newLease.EgressIP,
+		})
+	}
 	return newLease, xsync.UpdateOp, createdResult, nil
 }
 
@@ -263,26 +567,30 @@ func (r *Router) tryLeaseHit(
 	account string,
 	current Lease,
 	nowNs int64,
+	events leaseEventSink,
 ) (Lease, RouteResult, bool) {
 	entry, ok := r.pool.GetEntry(current.NodeHash)
-	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP ||
-		state.ResponseCooldowns.IsCooling(current.NodeHash, current.EgressIP, time.Now()) {
+	if !ok || entry == nil || !entry.IsHealthy() || r.pool.IsNodeDisabled(current.NodeHash) || !plat.ContainsViewEntry(current.NodeHash, entry) || entry.GetEgressIP() != current.EgressIP ||
+		state.ResponseCooldowns.IsCoolingForEntry(current.NodeHash, entry, current.EgressIP, time.Now()) {
 		return Lease{}, RouteResult{}, false
 	}
 
 	newLease := current
 	newLease.LastAccessedNs = nowNs
-	r.emitLeaseEvent(LeaseEvent{
-		Type:       LeaseTouch,
-		PlatformID: plat.ID,
-		Account:    account,
-		NodeHash:   current.NodeHash,
-		EgressIP:   current.EgressIP,
-	})
+	if events != nil {
+		events.add(LeaseEvent{
+			Type:       LeaseTouch,
+			PlatformID: plat.ID,
+			Account:    account,
+			NodeHash:   current.NodeHash,
+			EgressIP:   current.EgressIP,
+		})
+	}
 	return newLease, RouteResult{
-		NodeHash:     current.NodeHash,
-		EgressIP:     current.EgressIP,
-		LeaseCreated: false,
+		NodeHash:      current.NodeHash,
+		EgressIP:      current.EgressIP,
+		LeaseCreated:  false,
+		selectedEntry: entry,
 	}, true
 }
 
@@ -293,8 +601,9 @@ func (r *Router) tryLeaseSameIPRotation(
 	current Lease,
 	targetDomain string,
 	nowNs int64,
+	events leaseEventSink,
 ) (Lease, RouteResult, bool) {
-	bestHash, ok := chooseSameIPRotationCandidateWithCooldown(
+	bestHash, bestEntry, ok := chooseSameIPRotationCandidateWithCooldownEntry(
 		plat,
 		r.pool,
 		current.EgressIP,
@@ -310,17 +619,20 @@ func (r *Router) tryLeaseSameIPRotation(
 	newLease := current
 	newLease.NodeHash = bestHash
 	newLease.LastAccessedNs = nowNs
-	r.emitLeaseEvent(LeaseEvent{
-		Type:       LeaseReplace,
-		PlatformID: plat.ID,
-		Account:    account,
-		NodeHash:   bestHash,
-		EgressIP:   current.EgressIP,
-	})
+	if events != nil {
+		events.add(LeaseEvent{
+			Type:       LeaseReplace,
+			PlatformID: plat.ID,
+			Account:    account,
+			NodeHash:   bestHash,
+			EgressIP:   current.EgressIP,
+		})
+	}
 	return newLease, RouteResult{
-		NodeHash:     bestHash,
-		EgressIP:     current.EgressIP,
-		LeaseCreated: false,
+		NodeHash:      bestHash,
+		EgressIP:      current.EgressIP,
+		LeaseCreated:  false,
+		selectedEntry: bestEntry,
 	}, true
 }
 
@@ -339,18 +651,23 @@ func (r *Router) createLease(
 	if ttl <= 0 {
 		ttl = int64(24 * time.Hour) // Default safeguard
 	}
+	expiryNs, err := platform.StickyLeaseExpiryUnixNano(now, ttl)
+	if err != nil {
+		return Lease{}, RouteResult{}, fmt.Errorf("invalid sticky ttl: %w", err)
+	}
 
 	lease := Lease{
 		NodeHash:       h,
 		EgressIP:       entry.GetEgressIP(),
 		CreatedAtNs:    nowNs,
-		ExpiryNs:       now.Add(time.Duration(ttl)).UnixNano(),
+		ExpiryNs:       expiryNs,
 		LastAccessedNs: nowNs,
 	}
 	return lease, RouteResult{
-		NodeHash:     lease.NodeHash,
-		EgressIP:     lease.EgressIP,
-		LeaseCreated: true,
+		NodeHash:      lease.NodeHash,
+		EgressIP:      lease.EgressIP,
+		LeaseCreated:  true,
+		selectedEntry: entry,
 	}, nil
 }
 
@@ -361,14 +678,18 @@ func (r *Router) cleanupPreviousLease(
 	invalidation leaseInvalidationReason,
 	platformID string,
 	account string,
+	events leaseEventSink,
 ) {
 	if !hadPreviousLease {
 		return
 	}
 	state.Leases.stats.Dec(lease.EgressIP)
+	if events == nil {
+		return
+	}
 	switch invalidation {
 	case leaseInvalidationExpire:
-		r.emitLeaseEvent(LeaseEvent{
+		events.add(LeaseEvent{
 			Type:        LeaseExpire,
 			PlatformID:  platformID,
 			Account:     account,
@@ -377,7 +698,7 @@ func (r *Router) cleanupPreviousLease(
 			CreatedAtNs: lease.CreatedAtNs,
 		})
 	case leaseInvalidationRemove:
-		r.emitLeaseEvent(LeaseEvent{
+		events.add(LeaseEvent{
 			Type:        LeaseRemove,
 			PlatformID:  platformID,
 			Account:     account,
@@ -395,12 +716,6 @@ func abortLeaseCreate(current Lease, hadPreviousLease bool) (Lease, xsync.Comput
 	return current, xsync.CancelOp
 }
 
-func (r *Router) emitLeaseEvent(event LeaseEvent) {
-	if r.onLeaseEvent != nil {
-		r.onLeaseEvent(event)
-	}
-}
-
 func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
@@ -410,16 +725,16 @@ func (r *Router) selectLiveRandomRoute(
 	for i := 0; i < livePickAttempts; i++ {
 		h, err := randomRouteFiltered(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), func(hash node.Hash) bool {
 			entry, ok := r.pool.GetEntry(hash)
-			if !ok {
-				return true
+			if !ok || entry == nil || !entry.IsHealthy() || r.pool.IsNodeDisabled(hash) || !plat.ContainsViewEntry(hash, entry) {
+				return false
 			}
-			return !r.responseCooldowns(plat.ID).IsCooling(hash, entry.GetEgressIP(), time.Now())
+			return !r.responseCooldowns(plat.ID).IsCoolingForEntry(hash, entry, entry.GetEgressIP(), time.Now())
 		})
 		if err != nil {
 			return node.Zero, nil, err
 		}
 		entry, ok := r.pool.GetEntry(h)
-		if ok {
+		if ok && entry != nil && entry.IsHealthy() && !r.pool.IsNodeDisabled(h) && plat.ContainsViewEntry(h, entry) {
 			return h, entry, nil
 		}
 		lastMissing = h
@@ -438,7 +753,8 @@ func chooseSameIPRotationCandidate(
 	authorities []string,
 	window time.Duration,
 ) (node.Hash, bool) {
-	return chooseSameIPRotationCandidateWithCooldown(plat, pool, targetIP, targetDomain, authorities, window, nil)
+	h, _, ok := chooseSameIPRotationCandidateWithCooldownEntry(plat, pool, targetIP, targetDomain, authorities, window, nil)
+	return h, ok
 }
 
 func chooseSameIPRotationCandidateWithCooldown(
@@ -450,34 +766,51 @@ func chooseSameIPRotationCandidateWithCooldown(
 	window time.Duration,
 	cooldowns *ResponseCooldowns,
 ) (node.Hash, bool) {
+	h, _, ok := chooseSameIPRotationCandidateWithCooldownEntry(plat, pool, targetIP, targetDomain, authorities, window, cooldowns)
+	return h, ok
+}
+
+func chooseSameIPRotationCandidateWithCooldownEntry(
+	plat *platform.Platform,
+	pool PoolAccessor,
+	targetIP netip.Addr,
+	targetDomain string,
+	authorities []string,
+	window time.Duration,
+	cooldowns *ResponseCooldowns,
+) (node.Hash, *node.NodeEntry, bool) {
 	bestKnownHash := node.Zero
+	var bestKnownEntry *node.NodeEntry
 	bestKnownLatency := time.Duration(math.MaxInt64)
 	fallbackHash := node.Zero
+	var fallbackEntry *node.NodeEntry
 
-	plat.View().Range(func(h node.Hash) bool {
+	plat.RangeViewEntries(func(h node.Hash, publishedEntry *node.NodeEntry) bool {
 		entry, ok := pool.GetEntry(h)
-		if !ok || entry.GetEgressIP() != targetIP || (cooldowns != nil && cooldowns.IsCooling(h, targetIP, time.Now())) {
+		if !ok || entry == nil || entry != publishedEntry || !entry.IsHealthy() || pool.IsNodeDisabled(h) || entry.GetEgressIP() != targetIP || (cooldowns != nil && cooldowns.IsCoolingForEntry(h, entry, targetIP, time.Now())) {
 			return true
 		}
 		if fallbackHash == node.Zero {
 			fallbackHash = h
+			fallbackEntry = entry
 		}
 
 		latency, hasLatency := sameIPCandidateLatency(entry, targetDomain, authorities, window)
 		if hasLatency && latency < bestKnownLatency {
 			bestKnownLatency = latency
 			bestKnownHash = h
+			bestKnownEntry = entry
 		}
 		return true
 	})
 
 	if bestKnownHash != node.Zero {
-		return bestKnownHash, true
+		return bestKnownHash, bestKnownEntry, true
 	}
 	if fallbackHash != node.Zero {
-		return fallbackHash, true
+		return fallbackHash, fallbackEntry, true
 	}
-	return node.Zero, false
+	return node.Zero, nil, false
 }
 
 func (r *Router) responseCooldowns(platformID string) *ResponseCooldowns {
@@ -490,7 +823,41 @@ func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleS
 	if r == nil || route.PlatformID == "" {
 		return
 	}
-	r.responseCooldowns(route.PlatformID).Mark(scope, route.NodeHash, route.EgressIP, until)
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped || r.pool == nil {
+		return
+	}
+	if _, ok := r.pool.GetPlatform(route.PlatformID); !ok {
+		return
+	}
+	// A response can arrive after the node hash has been removed and rebuilt.
+	// The route carries the exact entry selected by the router; do not let a
+	// late response from that retired generation cool its replacement.
+	if route.selectedEntry == nil {
+		return
+	}
+	current, ok := r.pool.GetEntry(route.NodeHash)
+	if !ok || current != route.selectedEntry {
+		return
+	}
+	if hook := r.beforeResponseCooldownMarkHook; hook != nil {
+		hook()
+	}
+	mark := func() {
+		r.responseCooldowns(route.PlatformID).markForEntry(scope, route.NodeHash, route.selectedEntry, route.EgressIP, until, time.Now())
+	}
+	if executor, ok := r.pool.(ExactEntryExecutor); ok {
+		executor.WithCurrentEntry(route.NodeHash, route.selectedEntry, mark)
+		return
+	}
+	// Test and narrow custom PoolAccessor implementations may not expose the
+	// lifecycle owner. Preserve the exact-pointer fail-closed behavior for
+	// those accessors; production GlobalNodePool implements the atomic path.
+	if current, ok := r.pool.GetEntry(route.NodeHash); !ok || current != route.selectedEntry {
+		return
+	}
+	mark()
 }
 
 func sameIPCandidateLatency(
@@ -510,8 +877,9 @@ func sameIPCandidateLatency(
 	return 0, false
 }
 
-// ReadLease implements weak persistence read.
-func (r *Router) ReadLease(key model.LeaseKey) *model.Lease {
+// readLeaseUnlocked reads a lease from routing state. The caller must hold
+// lifecycleMu for reading or writing.
+func (r *Router) readLeaseUnlocked(key model.LeaseKey) *model.Lease {
 	state, ok := r.states.Load(key.PlatformID)
 	if !ok {
 		return nil
@@ -529,6 +897,108 @@ func (r *Router) ReadLease(key model.LeaseKey) *model.Lease {
 		ExpiryNs:       lease.ExpiryNs,
 		LastAccessedNs: lease.LastAccessedNs,
 	}
+}
+
+// listLeasesUnlocked snapshots all leases for a platform. The caller must
+// hold lifecycleMu for reading or writing.
+func (r *Router) listLeasesUnlocked(platformID string) []model.Lease {
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		return []model.Lease{}
+	}
+	result := make([]model.Lease, 0, state.Leases.Size())
+	state.Leases.Range(func(account string, lease Lease) bool {
+		result = append(result, model.Lease{
+			PlatformID:     platformID,
+			Account:        account,
+			NodeHash:       lease.NodeHash.Hex(),
+			EgressIP:       lease.EgressIP.String(),
+			CreatedAtNs:    lease.CreatedAtNs,
+			ExpiryNs:       lease.ExpiryNs,
+			LastAccessedNs: lease.LastAccessedNs,
+		})
+		return true
+	})
+	return result
+}
+
+// snapshotIPLoadUnlocked snapshots a platform's IP load. The caller must
+// hold lifecycleMu for reading or writing.
+func (r *Router) snapshotIPLoadUnlocked(platformID string) map[netip.Addr]int64 {
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		return map[netip.Addr]int64{}
+	}
+	return state.IPLoadStats.Snapshot()
+}
+
+// ReadLease implements weak persistence read.
+func (r *Router) ReadLease(key model.LeaseKey) *model.Lease {
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped {
+		return nil
+	}
+	return r.readLeaseUnlocked(key)
+}
+
+// ReadLeaseForPersistence reads the last live routing state for cache flushes.
+// Unlike the runtime API, it remains available after Router.Stop so the final
+// cache flush can persist active leases. Platform removal still wins because
+// RemovePlatformState deletes the state under the same lifecycle lock.
+func (r *Router) ReadLeaseForPersistence(key model.LeaseKey) *model.Lease {
+	if r == nil {
+		return nil
+	}
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.pool != nil {
+		if _, ok := r.pool.GetPlatform(key.PlatformID); !ok {
+			return nil
+		}
+	}
+	return r.readLeaseUnlocked(key)
+}
+
+// ListLeasesForPlatform atomically checks platform lifetime and snapshots its
+// leases. The boolean is false when the platform is not registered or Router
+// mutation admission has been stopped; a true value with an empty slice means
+// the platform has no routing state or leases.
+func (r *Router) ListLeasesForPlatform(platformID string) ([]model.Lease, bool) {
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	if hook := r.beforeAtomicPlatformReadHook; hook != nil {
+		hook()
+	}
+	result := r.listLeasesUnlocked(platformID)
+	r.lifecycleMu.RUnlock()
+	return result, true
+}
+
+// ReadLeaseForPlatform atomically checks platform lifetime and reads one
+// lease. The boolean is false when the platform is not registered or Router
+// mutation admission has been stopped; a true value with a nil lease means the
+// platform has no such lease.
+func (r *Router) ReadLeaseForPlatform(key model.LeaseKey) (*model.Lease, bool) {
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	if !r.platformExistsLocked(key.PlatformID) {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	lease := r.readLeaseUnlocked(key)
+	r.lifecycleMu.RUnlock()
+	return lease, true
 }
 
 // UpsertLease writes or replaces a lease for (platform_id, account).
@@ -552,7 +1022,16 @@ func (r *Router) UpsertLease(ml model.Lease) error {
 		return fmt.Errorf("parse egress_ip: %w", err)
 	}
 
-	state := r.ensurePlatformState(platformID)
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		return ErrRouterStopped
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		return ErrPlatformNotFound
+	}
+
 	lease := Lease{
 		NodeHash:       h,
 		EgressIP:       ip,
@@ -561,38 +1040,162 @@ func (r *Router) UpsertLease(ml model.Lease) error {
 		LastAccessedNs: ml.LastAccessedNs,
 	}
 
+	events := r.newLeaseEventBatch()
+	r.upsertLeaseUnlocked(platformID, account, lease, events)
+	r.lifecycleMu.RUnlock()
+	events.finish()
+	return nil
+}
+
+// upsertLeaseUnlocked replaces one lease and appends its event ticket. The
+// caller must hold lifecycleMu for reading or writing.
+func (r *Router) upsertLeaseUnlocked(
+	platformID string,
+	account string,
+	lease Lease,
+	events *leaseEventBatch,
+) {
+	state := r.ensurePlatformState(platformID)
 	eventType := LeaseCreate
 	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		mutation := events.newMutation()
 		if loaded {
 			state.Leases.stats.Dec(current.EgressIP)
 			eventType = LeaseReplace
 		}
 		state.Leases.stats.Inc(lease.EgressIP)
+		mutation.add(LeaseEvent{
+			Type:       eventType,
+			PlatformID: platformID,
+			Account:    account,
+			NodeHash:   lease.NodeHash,
+			EgressIP:   lease.EgressIP,
+		})
+		mutation.commit()
+		if hook := r.afterLeaseUpsertLinearizedHook; hook != nil {
+			hook()
+		}
 		return lease, xsync.UpdateOp
 	})
-
-	r.emitLeaseEvent(LeaseEvent{
-		Type:       eventType,
-		PlatformID: platformID,
-		Account:    account,
-		NodeHash:   lease.NodeHash,
-		EgressIP:   lease.EgressIP,
-	})
-	return nil
 }
 
 // SnapshotIPLoad returns a best-effort point-in-time IP load snapshot for a platform.
 // If the platform has no routing state yet, it returns an empty snapshot.
 func (r *Router) SnapshotIPLoad(platformID string) map[netip.Addr]int64 {
-	state, ok := r.states.Load(platformID)
-	if !ok {
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped {
 		return map[netip.Addr]int64{}
 	}
-	return state.IPLoadStats.Snapshot()
+	return r.snapshotIPLoadUnlocked(platformID)
+}
+
+// SnapshotIPLoadForPlatform atomically checks platform lifetime and snapshots
+// its IP load. The boolean is false when the platform is not registered or
+// Router mutation admission has been stopped; a true value with an empty map
+// means no routing state or active leases.
+func (r *Router) SnapshotIPLoadForPlatform(platformID string) (map[netip.Addr]int64, bool) {
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	snapshot := r.snapshotIPLoadUnlocked(platformID)
+	r.lifecycleMu.RUnlock()
+	return snapshot, true
+}
+
+// InheritLeaseForPlatform validates the parent and creates/replaces the child
+// inside one lifecycle read section. The platform check and the lease mutation
+// therefore cannot be split by platform removal.
+func (r *Router) InheritLeaseForPlatform(
+	platformID string,
+	parentAccount string,
+	newAccount string,
+	now time.Time,
+) error {
+	return r.inheritLeaseForPlatform(nil, platformID, parentAccount, newAccount, now)
+}
+
+// InheritLeaseForPlatformExact performs the same mutation while requiring the
+// platform object captured by the caller to still be the object published in
+// the pool. The identity check is made under the routing lifecycle read lock,
+// before the lease state is read or changed.
+func (r *Router) InheritLeaseForPlatformExact(
+	expected *platform.Platform,
+	parentAccount string,
+	newAccount string,
+	now time.Time,
+) error {
+	if expected == nil {
+		return ErrPlatformNotFound
+	}
+	return r.inheritLeaseForPlatform(expected, expected.ID, parentAccount, newAccount, now)
+}
+
+func (r *Router) inheritLeaseForPlatform(
+	expected *platform.Platform,
+	platformID string,
+	parentAccount string,
+	newAccount string,
+	now time.Time,
+) error {
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return ErrRouterStopped
+	}
+	if expected == nil {
+		if !r.platformExistsLocked(platformID) {
+			r.lifecycleMu.RUnlock()
+			events.finish()
+			return ErrPlatformNotFound
+		}
+	} else {
+		if r.pool == nil {
+			r.lifecycleMu.RUnlock()
+			events.finish()
+			return ErrPlatformNotFound
+		}
+		current, ok := r.pool.GetPlatform(platformID)
+		if !ok || current != expected {
+			r.lifecycleMu.RUnlock()
+			events.finish()
+			return ErrPlatformNotFound
+		}
+	}
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return ErrLeaseNotFound
+	}
+	parent, ok := state.Leases.GetLease(parentAccount)
+	if !ok || parent.ExpiryNs <= now.UnixNano() {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return ErrLeaseNotFound
+	}
+	r.upsertLeaseUnlocked(platformID, newAccount, parent, events)
+	r.lifecycleMu.RUnlock()
+	events.finish()
+	return nil
 }
 
 // RestoreLeases restores leases from persistence during bootstrap.
 func (r *Router) RestoreLeases(leases []model.Lease) {
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped || r.pool == nil {
+		return
+	}
+
 	for _, ml := range leases {
 		h, err := node.ParseHex(ml.NodeHash)
 		if err != nil {
@@ -603,6 +1206,9 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 			continue
 		}
 
+		if _, ok := r.pool.GetPlatform(ml.PlatformID); !ok {
+			continue
+		}
 		state, _ := r.states.LoadOrCompute(ml.PlatformID, func() (*PlatformRoutingState, bool) {
 			return NewPlatformRoutingState(), false
 		})
@@ -614,7 +1220,7 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 			ExpiryNs:       ml.ExpiryNs,
 			LastAccessedNs: ml.LastAccessedNs,
 		}
-		// Directly insert into table and stats
+		// Directly insert into table and stats.
 		state.Leases.CreateLease(ml.Account, l)
 	}
 }
@@ -622,6 +1228,12 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 // RangeLeases iterates over all leases for a platform.
 // Returns false if the platform has no routing state.
 func (r *Router) RangeLeases(platformID string, fn func(account string, lease Lease) bool) bool {
+	r.lifecycleMu.RLock()
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped {
+		return false
+	}
+
 	state, ok := r.states.Load(platformID)
 	if !ok {
 		return false
@@ -633,47 +1245,115 @@ func (r *Router) RangeLeases(platformID string, fn func(account string, lease Le
 // DeleteLease removes a single lease by platform and account.
 // Returns true if a lease was deleted. Emits a LeaseRemove event.
 func (r *Router) DeleteLease(platformID, account string) bool {
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false
+	}
+
 	state, ok := r.states.Load(platformID)
 	if !ok {
+		r.lifecycleMu.RUnlock()
+		events.finish()
 		return false
 	}
-	lease, deleted := state.Leases.DeleteLease(account)
+	deleted := r.deleteLeaseWithEvent(state, platformID, account, events)
 	if !deleted {
+		r.lifecycleMu.RUnlock()
+		events.finish()
 		return false
 	}
-	r.emitLeaseEvent(LeaseEvent{
-		Type:        LeaseRemove,
-		PlatformID:  platformID,
-		Account:     account,
-		NodeHash:    lease.NodeHash,
-		EgressIP:    lease.EgressIP,
-		CreatedAtNs: lease.CreatedAtNs,
-	})
+	r.lifecycleMu.RUnlock()
+	events.finish()
 	return true
+}
+
+// DeleteLeaseForPlatform atomically checks platform lifetime and removes one
+// lease. The second result is false only when the platform is not registered;
+// a true value with deleted=false means the platform exists but the lease does
+// not.
+func (r *Router) DeleteLeaseForPlatform(platformID, account string) (deleted bool, platformExists bool) {
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false, false
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false, false
+	}
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return false, true
+	}
+	deleted = r.deleteLeaseWithEvent(state, platformID, account, events)
+	r.lifecycleMu.RUnlock()
+	events.finish()
+	return deleted, true
 }
 
 // DeleteAllLeases removes all leases for a platform.
 // Returns the number of leases deleted. Emits a LeaseRemove event for each.
 func (r *Router) DeleteAllLeases(platformID string) int {
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return 0
+	}
+
 	state, ok := r.states.Load(platformID)
 	if !ok {
+		r.lifecycleMu.RUnlock()
+		events.finish()
 		return 0
 	}
 	count := 0
 	state.Leases.Range(func(account string, _ Lease) bool {
-		removed, deleted := state.Leases.DeleteLease(account)
-		if deleted {
-			r.emitLeaseEvent(LeaseEvent{
-				Type:        LeaseRemove,
-				PlatformID:  platformID,
-				Account:     account,
-				NodeHash:    removed.NodeHash,
-				EgressIP:    removed.EgressIP,
-				CreatedAtNs: removed.CreatedAtNs,
-			})
+		if r.deleteLeaseWithEvent(state, platformID, account, events) {
 			count++
 		}
 		return true
 	})
+	r.lifecycleMu.RUnlock()
+	events.finish()
 	return count
+}
+
+// DeleteAllLeasesForPlatform atomically checks platform lifetime and removes
+// every lease in its routing state. A zero count with platformExists=true is a
+// valid empty-platform result.
+func (r *Router) DeleteAllLeasesForPlatform(platformID string) (count int, platformExists bool) {
+	events := r.newLeaseEventBatch()
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return 0, false
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		events.finish()
+		return 0, false
+	}
+	state, ok := r.states.Load(platformID)
+	if ok && state != nil {
+		state.Leases.Range(func(account string, _ Lease) bool {
+			if r.deleteLeaseWithEvent(state, platformID, account, events) {
+				count++
+			}
+			return true
+		})
+	}
+	r.lifecycleMu.RUnlock()
+	events.finish()
+	return count, true
 }

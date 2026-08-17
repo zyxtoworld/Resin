@@ -2,6 +2,7 @@
 package subscription
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,44 @@ type ManagedNode struct {
 //   - If mutation is needed, make an explicit copy first.
 type ManagedNodes struct {
 	m *xsync.Map[node.Hash, ManagedNode]
+}
+
+// cancellableOpLock serializes high-level subscription mutations while still
+// allowing an HTTP caller to stop waiting when its context is canceled.
+// The zero value is ready for use.
+type cancellableOpLock struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *cancellableOpLock) init() {
+	m.token = make(chan struct{}, 1)
+	m.token <- struct{}{}
+}
+
+func (m *cancellableOpLock) lockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.once.Do(m.init)
+	select {
+	case <-m.token:
+		if err := ctx.Err(); err != nil {
+			m.unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *cancellableOpLock) unlock() {
+	m.once.Do(m.init)
+	m.token <- struct{}{}
 }
 
 // NewManagedNodes creates an empty managed-node view.
@@ -113,7 +152,7 @@ type Subscription struct {
 	ID string
 
 	// Operation-level lock for serializing multi-step workflows.
-	opMu sync.Mutex
+	opMu cancellableOpLock
 
 	// Mutable fields guarded by mu.
 	mu         sync.RWMutex
@@ -153,6 +192,24 @@ type Subscription struct {
 	configVersion atomic.Int64
 }
 
+// ConfigSnapshot is an immutable copy of the persisted subscription
+// configuration and timestamps. Callers may use it after the subscription
+// operation lock has been released while building a response.
+type ConfigSnapshot struct {
+	URL                       string
+	SourceType                string
+	Content                   string
+	ConfigVersion             int64
+	UpdateIntervalNs          int64
+	Name                      string
+	Enabled                   bool
+	Ephemeral                 bool
+	IncrementalAliveNodes     bool
+	EphemeralNodeEvictDelayNs int64
+	CreatedAtNs               int64
+	UpdatedAtNs               int64
+}
+
 // NewSubscription creates a Subscription with an empty ManagedNodes map.
 func NewSubscription(id, name, url string, enabled, ephemeral bool) *Subscription {
 	s := &Subscription{
@@ -182,17 +239,76 @@ func (s *Subscription) GetLastError() string { return *s.LastError.Load() }
 // NextAttemptSeq returns a strictly increasing sequence for refresh attempts.
 func (s *Subscription) NextAttemptSeq() int64 { return s.attemptSeq.Add(1) }
 
-// LastAppliedSeq returns the latest applied refresh attempt sequence.
+// LastAppliedSeq returns the latest committed refresh result sequence.
 func (s *Subscription) LastAppliedSeq() int64 { return s.lastAppliedSeq.Load() }
 
-// MarkAppliedAttempt records the latest applied refresh attempt sequence.
+// MarkAppliedAttempt records the latest committed refresh result sequence.
 func (s *Subscription) MarkAppliedAttempt(seq int64) { s.lastAppliedSeq.Store(seq) }
 
 // WithOpLock runs fn under the subscription operation lock.
 func (s *Subscription) WithOpLock(fn func()) {
-	s.opMu.Lock()
-	defer s.opMu.Unlock()
+	if s == nil || fn == nil {
+		return
+	}
+	_ = s.opMu.lockContext(context.Background())
+	defer s.opMu.unlock()
 	fn()
+}
+
+// WithOpLockContext runs fn under the subscription operation lock, returning
+// the caller context error if the lock cannot be acquired in time.
+func (s *Subscription) WithOpLockContext(ctx context.Context, fn func()) error {
+	if s == nil || fn == nil {
+		return nil
+	}
+	if err := s.opMu.lockContext(ctx); err != nil {
+		return err
+	}
+	defer s.opMu.unlock()
+	fn()
+	return nil
+}
+
+// SnapshotConfig copies all response configuration under the established
+// opMu -> mu lock order. The copy is intentionally short-lived; callers must
+// perform potentially slow managed-node and pool reads after it returns.
+func (s *Subscription) SnapshotConfig() ConfigSnapshot {
+	snapshot, _ := s.SnapshotConfigContext(context.Background())
+	return snapshot
+}
+
+// SnapshotConfigContext copies all response configuration under the
+// established opMu -> mu lock order while allowing a request-scoped caller to
+// stop waiting for the operation owner.
+func (s *Subscription) SnapshotConfigContext(ctx context.Context) (ConfigSnapshot, error) {
+	if s == nil {
+		return ConfigSnapshot{}, nil
+	}
+	var snapshot ConfigSnapshot
+	if err := s.WithOpLockContext(ctx, func() {
+		s.mu.RLock()
+		snapshot = ConfigSnapshot{
+			URL:                       s.url,
+			SourceType:                normalizeSourceType(s.sourceType),
+			Content:                   s.content,
+			ConfigVersion:             s.configVersion.Load(),
+			UpdateIntervalNs:          s.updateIntervalNs,
+			Name:                      s.name,
+			Enabled:                   s.enabled,
+			Ephemeral:                 s.ephemeral,
+			IncrementalAliveNodes:     s.incrementalAliveNodes,
+			EphemeralNodeEvictDelayNs: s.ephemeralNodeEvictDelayNs,
+		}
+		s.mu.RUnlock()
+
+		// These timestamps are immutable/operation-owned respectively. Holding
+		// opMu makes their copy part of the same configuration generation.
+		snapshot.CreatedAtNs = s.CreatedAtNs
+		snapshot.UpdatedAtNs = s.UpdatedAtNs
+	}); err != nil {
+		return ConfigSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 // URL returns the subscription source URL (thread-safe).

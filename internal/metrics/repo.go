@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/Resinat/Resin/internal/state"
 )
+
+const defaultSQLiteBusyTimeoutMs = state.DefaultSQLiteBusyTimeoutMs
 
 // MetricsDBDDL defines the schema for metrics.db.
 const MetricsDBDDL = `
@@ -68,6 +72,10 @@ CREATE TABLE IF NOT EXISTS metric_lease_lifetime_bucket (
 // MetricsRepo handles persistence of metric buckets to metrics.db.
 type MetricsRepo struct {
 	db *sql.DB
+
+	// Package-private seam for deterministic query lifecycle tests. It runs
+	// after a query has acquired its rows and before the caller consumes them.
+	afterQueryHook func(context.Context)
 }
 
 // NewMetricsRepo opens (or creates) metrics.db at the given path and initializes the schema.
@@ -96,18 +104,139 @@ func (r *MetricsRepo) Close() error {
 
 // WriteBucket persists a bucket flush data set in a single transaction.
 func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
+	return r.WriteBucketContext(context.Background(), data)
+}
+
+// WriteBucketContext persists a bucket flush data set with a cancellable
+// SQLite transaction. Shutdown uses this path so a database lock cannot
+// outlive the caller's lifecycle deadline.
+func (r *MetricsRepo) WriteBucketContext(ctx context.Context, data *BucketFlushData) error {
 	if data == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	tx, err := r.db.Begin()
+	conn, release, err := r.acquireContextConn(ctx)
+	if err != nil {
+		return fmt.Errorf("metrics repo acquire connection: %w", err)
+	}
+	defer release()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("metrics repo begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := writeBucketExec(ctx, tx, data); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// WriteNodePoolSnapshot writes a node pool snapshot for a bucket.
+func (r *MetricsRepo) WriteNodePoolSnapshot(bucketStartUnix int64, totalNodes, healthyNodes, egressIPCount int) error {
+	return r.WriteNodePoolSnapshotContext(context.Background(), bucketStartUnix, totalNodes, healthyNodes, egressIPCount)
+}
+
+// WriteNodePoolSnapshotContext writes a node pool snapshot with a cancellable
+// database operation.
+func (r *MetricsRepo) WriteNodePoolSnapshotContext(ctx context.Context, bucketStartUnix int64, totalNodes, healthyNodes, egressIPCount int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, release, err := r.acquireContextConn(ctx)
+	if err != nil {
+		return fmt.Errorf("metrics repo acquire connection: %w", err)
+	}
+	defer release()
+	return writeNodePoolExec(ctx, conn, bucketStartUnix, totalNodes, healthyNodes, egressIPCount)
+}
+
+// WriteLatencyBucket writes access latency histogram for a bucket.
+func (r *MetricsRepo) WriteLatencyBucket(bucketStartUnix int64, platformID string, buckets []int64) error {
+	return r.WriteLatencyBucketContext(context.Background(), bucketStartUnix, platformID, buckets)
+}
+
+// WriteLatencyBucketContext writes an access latency histogram with a
+// cancellable database operation.
+func (r *MetricsRepo) WriteLatencyBucketContext(ctx context.Context, bucketStartUnix int64, platformID string, buckets []int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, release, err := r.acquireContextConn(ctx)
+	if err != nil {
+		return fmt.Errorf("metrics repo acquire connection: %w", err)
+	}
+	defer release()
+	return writeLatencyExec(ctx, conn, bucketStartUnix, platformID, buckets)
+}
+
+// WritePersistTaskContext commits one complete bucket persistence task as one
+// transaction. A task is the retry ticket owned by MetricsManager; publishing
+// only part of it would make a failed retry observable as a mixed generation.
+func (r *MetricsRepo) WritePersistTaskContext(
+	ctx context.Context,
+	data *BucketFlushData,
+	nodePool *nodePoolSnapshot,
+	globalLatency []int64,
+	platformLatency map[string][]int64,
+) error {
+	if data == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	conn, release, err := r.acquireContextConn(ctx)
+	if err != nil {
+		return fmt.Errorf("metrics repo acquire connection: %w", err)
+	}
+	defer release()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("metrics repo begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	if err := writeBucketExec(ctx, tx, data); err != nil {
+		return err
+	}
+	if nodePool != nil {
+		if err := writeNodePoolExec(
+			ctx,
+			tx,
+			data.BucketStartUnix,
+			nodePool.TotalNodes,
+			nodePool.HealthyNodes,
+			nodePool.EgressIPCount,
+		); err != nil {
+			return fmt.Errorf("metrics repo upsert node pool snapshot: %w", err)
+		}
+	}
+	if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, "", globalLatency); err != nil {
+		return fmt.Errorf("metrics repo upsert global latency bucket: %w", err)
+	}
+	for platformID, buckets := range platformLatency {
+		if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, platformID, buckets); err != nil {
+			return fmt.Errorf("metrics repo upsert platform latency bucket %s: %w", platformID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+type metricsExecContext interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func writeBucketExec(ctx context.Context, exec metricsExecContext, data *BucketFlushData) error {
 	// Traffic.
-	_, err = tx.Exec(`INSERT INTO metric_traffic_bucket (bucket_start_unix, ingress_bytes, egress_bytes)
+	_, err := exec.ExecContext(ctx, `INSERT INTO metric_traffic_bucket (bucket_start_unix, ingress_bytes, egress_bytes)
 		VALUES (?,?,?) ON CONFLICT(bucket_start_unix)
 		DO UPDATE SET ingress_bytes = excluded.ingress_bytes, egress_bytes = excluded.egress_bytes`,
 		data.BucketStartUnix, data.Traffic.IngressBytes, data.Traffic.EgressBytes)
@@ -120,7 +249,7 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 	if rq, ok := data.Requests[""]; ok {
 		globalRequests = rq
 	}
-	_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
+	_, err = exec.ExecContext(ctx, `INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
 		VALUES (?,NULL,?,?) ON CONFLICT(bucket_start_unix) WHERE platform_id IS NULL
 		DO UPDATE SET total_requests = excluded.total_requests, success_requests = excluded.success_requests`,
 		data.BucketStartUnix, globalRequests.Total, globalRequests.Success)
@@ -132,7 +261,7 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 		if pid == "" {
 			continue
 		}
-		_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
+		_, err = exec.ExecContext(ctx, `INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
 			VALUES (?,?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
 			DO UPDATE SET total_requests = excluded.total_requests, success_requests = excluded.success_requests`,
 			data.BucketStartUnix, pid, rq.Total, rq.Success)
@@ -142,7 +271,7 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 	}
 
 	// Probes.
-	_, err = tx.Exec(`INSERT INTO metric_probe_bucket (bucket_start_unix, total_count)
+	_, err = exec.ExecContext(ctx, `INSERT INTO metric_probe_bucket (bucket_start_unix, total_count)
 		VALUES (?,?) ON CONFLICT(bucket_start_unix)
 		DO UPDATE SET total_count = excluded.total_count`,
 		data.BucketStartUnix, data.Probes.Total)
@@ -156,7 +285,7 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 			continue
 		}
 		p1, p5, p50 := computePercentiles(acc.Samples)
-		_, err := tx.Exec(`INSERT INTO metric_lease_lifetime_bucket (bucket_start_unix, platform_id, sample_count, p1_ms, p5_ms, p50_ms)
+		_, err := exec.ExecContext(ctx, `INSERT INTO metric_lease_lifetime_bucket (bucket_start_unix, platform_id, sample_count, p1_ms, p5_ms, p50_ms)
 			VALUES (?,?,?,?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
 			DO UPDATE SET sample_count = excluded.sample_count, p1_ms = excluded.p1_ms, p5_ms = excluded.p5_ms, p50_ms = excluded.p50_ms`,
 			data.BucketStartUnix, pid, len(acc.Samples), p1, p5, p50)
@@ -164,37 +293,89 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 			return fmt.Errorf("metrics repo upsert lease lifetime: %w", err)
 		}
 	}
-
-	return tx.Commit()
+	return nil
 }
 
-// WriteNodePoolSnapshot writes a node pool snapshot for a bucket.
-func (r *MetricsRepo) WriteNodePoolSnapshot(bucketStartUnix int64, totalNodes, healthyNodes, egressIPCount int) error {
-	_, err := r.db.Exec(`INSERT INTO metric_node_pool_bucket (bucket_start_unix, total_nodes, healthy_nodes, egress_ip_count)
+func writeNodePoolExec(
+	ctx context.Context,
+	exec metricsExecContext,
+	bucketStartUnix int64,
+	totalNodes, healthyNodes, egressIPCount int,
+) error {
+	_, err := exec.ExecContext(ctx, `INSERT INTO metric_node_pool_bucket (bucket_start_unix, total_nodes, healthy_nodes, egress_ip_count)
 		VALUES (?,?,?,?) ON CONFLICT(bucket_start_unix)
 		DO UPDATE SET total_nodes = excluded.total_nodes, healthy_nodes = excluded.healthy_nodes, egress_ip_count = excluded.egress_ip_count`,
 		bucketStartUnix, totalNodes, healthyNodes, egressIPCount)
 	return err
 }
 
-// WriteLatencyBucket writes access latency histogram for a bucket.
-func (r *MetricsRepo) WriteLatencyBucket(bucketStartUnix int64, platformID string, buckets []int64) error {
-	bucketsJSON, _ := json.Marshal(buckets)
-	var (
-		err error
-	)
+func writeLatencyExec(
+	ctx context.Context,
+	exec metricsExecContext,
+	bucketStartUnix int64,
+	platformID string,
+	buckets []int64,
+) error {
+	bucketsJSON, err := json.Marshal(buckets)
+	if err != nil {
+		return err
+	}
 	if platformID == "" {
-		_, err = r.db.Exec(`INSERT INTO metric_access_latency_bucket (bucket_start_unix, platform_id, buckets_json)
+		_, err = exec.ExecContext(ctx, `INSERT INTO metric_access_latency_bucket (bucket_start_unix, platform_id, buckets_json)
 			VALUES (?,NULL,?) ON CONFLICT(bucket_start_unix) WHERE platform_id IS NULL
 			DO UPDATE SET buckets_json = excluded.buckets_json`,
 			bucketStartUnix, string(bucketsJSON))
-	} else {
-		_, err = r.db.Exec(`INSERT INTO metric_access_latency_bucket (bucket_start_unix, platform_id, buckets_json)
-			VALUES (?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
-			DO UPDATE SET buckets_json = excluded.buckets_json`,
-			bucketStartUnix, platformID, string(bucketsJSON))
+		return err
 	}
+	_, err = exec.ExecContext(ctx, `INSERT INTO metric_access_latency_bucket (bucket_start_unix, platform_id, buckets_json)
+		VALUES (?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
+		DO UPDATE SET buckets_json = excluded.buckets_json`,
+		bucketStartUnix, platformID, string(bucketsJSON))
 	return err
+}
+
+func (r *MetricsRepo) acquireContextConn(ctx context.Context) (*sql.Conn, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	busyTimeoutMs, timeoutErr := state.SQLiteBusyTimeoutMs(ctx)
+	if timeoutErr != nil {
+		_ = conn.Close()
+		return nil, nil, timeoutErr
+	}
+	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	release := func() {
+		if ctx.Err() != nil {
+			// A canceled operation may still be blocked by the same SQLite
+			// writer lock. Do not run a background reset while releasing it;
+			// discard the connection instead.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		} else if !resetSQLiteBusyTimeout(conn) {
+			// Returning driver.ErrBadConn from Raw makes database/sql discard the
+			// underlying connection instead of putting it back in the idle pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}
+	return conn, release, nil
+}
+
+func resetSQLiteBusyTimeout(conn *sql.Conn) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	_, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", state.DefaultSQLiteBusyTimeoutMs))
+	return err == nil
 }
 
 // TrafficBucketRow holds a single traffic bucket result.
@@ -206,11 +387,15 @@ type TrafficBucketRow struct {
 
 // QueryTraffic returns traffic buckets in a time range.
 func (r *MetricsRepo) QueryTraffic(from, to int64) ([]TrafficBucketRow, error) {
+	return r.queryTraffic(context.Background(), from, to)
+}
+
+func (r *MetricsRepo) queryTraffic(ctx context.Context, from, to int64) ([]TrafficBucketRow, error) {
 	q := `SELECT bucket_start_unix, ingress_bytes, egress_bytes
 		FROM metric_traffic_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?`
 	args := []interface{}{from, to}
 	q += " ORDER BY bucket_start_unix"
-	rows, err := r.db.Query(q, args...)
+	rows, err := r.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +422,10 @@ type RequestBucketRow struct {
 
 // QueryRequests returns request buckets in a time range.
 func (r *MetricsRepo) QueryRequests(from, to int64, platformID string) ([]RequestBucketRow, error) {
+	return r.queryRequests(context.Background(), from, to, platformID)
+}
+
+func (r *MetricsRepo) queryRequests(ctx context.Context, from, to int64, platformID string) ([]RequestBucketRow, error) {
 	q := `SELECT bucket_start_unix, platform_id, total_requests, success_requests
 		FROM metric_request_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?`
 	args := []interface{}{from, to}
@@ -248,7 +437,7 @@ func (r *MetricsRepo) QueryRequests(from, to int64, platformID string) ([]Reques
 		q += " AND platform_id IS NULL"
 	}
 	q += " ORDER BY bucket_start_unix"
-	rows, err := r.db.Query(q, args...)
+	rows, err := r.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +466,11 @@ type ProbeBucketRow struct {
 
 // QueryProbes returns probe buckets in a time range.
 func (r *MetricsRepo) QueryProbes(from, to int64) ([]ProbeBucketRow, error) {
-	rows, err := r.db.Query(`SELECT bucket_start_unix, total_count
+	return r.queryProbes(context.Background(), from, to)
+}
+
+func (r *MetricsRepo) queryProbes(ctx context.Context, from, to int64) ([]ProbeBucketRow, error) {
+	rows, err := r.query(ctx, `SELECT bucket_start_unix, total_count
 		FROM metric_probe_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?
 		ORDER BY bucket_start_unix`, from, to)
 	if err != nil {
@@ -306,7 +499,11 @@ type NodePoolBucketRow struct {
 
 // QueryNodePool returns node pool buckets in a time range.
 func (r *MetricsRepo) QueryNodePool(from, to int64) ([]NodePoolBucketRow, error) {
-	rows, err := r.db.Query(`SELECT bucket_start_unix, total_nodes, healthy_nodes, egress_ip_count
+	return r.queryNodePool(context.Background(), from, to)
+}
+
+func (r *MetricsRepo) queryNodePool(ctx context.Context, from, to int64) ([]NodePoolBucketRow, error) {
+	rows, err := r.query(ctx, `SELECT bucket_start_unix, total_nodes, healthy_nodes, egress_ip_count
 		FROM metric_node_pool_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?
 		ORDER BY bucket_start_unix`, from, to)
 	if err != nil {
@@ -359,6 +556,10 @@ type AccessLatencyBucketRow struct {
 
 // QueryAccessLatency returns access latency histogram buckets in a time range.
 func (r *MetricsRepo) QueryAccessLatency(from, to int64, platformID string) ([]AccessLatencyBucketRow, error) {
+	return r.queryAccessLatency(context.Background(), from, to, platformID)
+}
+
+func (r *MetricsRepo) queryAccessLatency(ctx context.Context, from, to int64, platformID string) ([]AccessLatencyBucketRow, error) {
 	q := `SELECT bucket_start_unix, platform_id, buckets_json
 		FROM metric_access_latency_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?`
 	args := []interface{}{from, to}
@@ -370,7 +571,7 @@ func (r *MetricsRepo) QueryAccessLatency(from, to int64, platformID string) ([]A
 		q += " AND platform_id IS NULL"
 	}
 	q += " ORDER BY bucket_start_unix"
-	rows, err := r.db.Query(q, args...)
+	rows, err := r.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -403,6 +604,10 @@ type LeaseLifetimeBucketRow struct {
 
 // QueryLeaseLifetime returns lease lifetime buckets in a time range.
 func (r *MetricsRepo) QueryLeaseLifetime(from, to int64, platformID string) ([]LeaseLifetimeBucketRow, error) {
+	return r.queryLeaseLifetime(context.Background(), from, to, platformID)
+}
+
+func (r *MetricsRepo) queryLeaseLifetime(ctx context.Context, from, to int64, platformID string) ([]LeaseLifetimeBucketRow, error) {
 	q := `SELECT bucket_start_unix, platform_id, sample_count, p1_ms, p5_ms, p50_ms
 		FROM metric_lease_lifetime_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?`
 	args := []interface{}{from, to}
@@ -411,7 +616,7 @@ func (r *MetricsRepo) QueryLeaseLifetime(from, to int64, platformID string) ([]L
 		args = append(args, platformID)
 	}
 	q += " ORDER BY bucket_start_unix"
-	rows, err := r.db.Query(q, args...)
+	rows, err := r.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -426,4 +631,15 @@ func (r *MetricsRepo) QueryLeaseLifetime(from, to int64, platformID string) ([]L
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+func (r *MetricsRepo) query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if hook := r.afterQueryHook; hook != nil {
+		hook(ctx)
+	}
+	return rows, nil
 }

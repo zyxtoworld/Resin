@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/testutil"
@@ -407,6 +408,36 @@ func TestSecureDNSFailoverTransport_AllUpstreamsFail(t *testing.T) {
 	}
 }
 
+func TestSecureDNSFailoverTransport_StopsAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := &cancelingErrorDNSTransport{
+		tag:    "first",
+		cancel: cancel,
+	}
+	second := newStaticDNSTransport("second", successDNSResponse("second.example."))
+	manager := &stubDNSTransportManager{
+		transports: map[string]adapter.DNSTransport{
+			"first":  first,
+			"second": second,
+		},
+	}
+	transport := &secureDNSFailoverTransport{
+		manager:      manager,
+		tag:          secureDNSFailoverTransportTag,
+		upstreamTags: []string{"first", "second"},
+	}
+
+	_, err := transport.Exchange(ctx, dnsQuestion("example.com."))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Exchange() error = %v, want context.Canceled", err)
+	}
+	if got := second.calls.Load(); got != 0 {
+		t.Fatalf("fallback upstream calls = %d, want 0 after cancellation", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Build: parse and create real outbound
 // ---------------------------------------------------------------------------
@@ -676,6 +707,23 @@ type staticDNSTransport struct {
 	calls    atomic.Int32
 }
 
+type cancelingErrorDNSTransport struct {
+	tag    string
+	cancel context.CancelFunc
+}
+
+func (t *cancelingErrorDNSTransport) Type() string { return "stub" }
+func (t *cancelingErrorDNSTransport) Tag() string  { return t.tag }
+func (t *cancelingErrorDNSTransport) Dependencies() []string {
+	return nil
+}
+func (t *cancelingErrorDNSTransport) Start(adapter.StartStage) error { return nil }
+func (t *cancelingErrorDNSTransport) Close() error                   { return nil }
+func (t *cancelingErrorDNSTransport) Exchange(context.Context, *mDNS.Msg) (*mDNS.Msg, error) {
+	t.cancel()
+	return nil, context.Canceled
+}
+
 func newStaticDNSTransport(tag string, response *mDNS.Msg) *staticDNSTransport {
 	return &staticDNSTransport{tag: tag, response: response}
 }
@@ -818,11 +866,16 @@ type closableBuilder struct {
 }
 
 type trackCloser struct {
-	closed atomic.Bool
+	closed    atomic.Bool
+	closedCh  chan struct{}
+	closeOnce sync.Once
 }
 
 func (c *trackCloser) Close() error {
 	c.closed.Store(true)
+	if c.closedCh != nil {
+		c.closeOnce.Do(func() { close(c.closedCh) })
+	}
 	return nil
 }
 
@@ -905,7 +958,7 @@ func TestEnsureNodeOutbound_CASLoserClose(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemoveNodeOutbound_Closes(t *testing.T) {
-	tc := &trackCloser{}
+	tc := &trackCloser{closedCh: make(chan struct{})}
 	entry := newTestEntry(`{"type":"test"}`)
 	var wrapped adapter.Outbound = tc
 	entry.Outbound.Store(&wrapped)
@@ -915,10 +968,50 @@ func TestRemoveNodeOutbound_Closes(t *testing.T) {
 
 	mgr.RemoveNodeOutbound(entry)
 
-	if !tc.closed.Load() {
+	select {
+	case <-tc.closedCh:
+	case <-time.After(time.Second):
 		t.Fatal("expected outbound to be closed after RemoveNodeOutbound")
 	}
 	if entry.Outbound.Load() != nil {
 		t.Fatal("expected outbound to be nil after RemoveNodeOutbound")
 	}
+}
+
+func TestRemoveNodeOutbound_DoesNotWaitForAdapterClose(t *testing.T) {
+	entry := newTestEntry(`{"type":"nonblocking-remove-close"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	ob := &closableOnly{
+		closeEntered: make(chan struct{}),
+		allowClose:   make(chan struct{}),
+	}
+	var raw adapter.Outbound = ob
+	entry.Outbound.Store(&raw)
+	mgr := NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+
+	removeDone := make(chan struct{})
+	go func() {
+		mgr.RemoveNodeOutbound(entry)
+		close(removeDone)
+	}()
+	select {
+	case <-ob.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("RemoveNodeOutbound did not start adapter close")
+	}
+	if entry.Outbound.Load() != nil {
+		t.Fatal("removed entry still published an outbound")
+	}
+	if _, release, ok := entry.AcquireOutbound(); ok {
+		release()
+		t.Fatal("removed entry accepted a new outbound lease")
+	}
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("RemoveNodeOutbound waited for adapter Close")
+	}
+
+	close(ob.allowClose)
 }

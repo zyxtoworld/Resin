@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +36,19 @@ func (p *routerTestPool) addPlatform(plat *platform.Platform) {
 	p.platsByName[plat.Name] = plat
 }
 
+func (p *routerTestPool) removePlatform(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	plat, ok := p.platsByID[id]
+	if !ok {
+		return
+	}
+	delete(p.platsByID, id)
+	if current, ok := p.platsByName[plat.Name]; ok && current == plat {
+		delete(p.platsByName, plat.Name)
+	}
+}
+
 func (p *routerTestPool) addEntry(h node.Hash, entry *node.NodeEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -53,6 +67,19 @@ func (p *routerTestPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
 	e, ok := p.entries[hash]
 	return e, ok
 }
+
+func (p *routerTestPool) WithCurrentEntry(hash node.Hash, expected *node.NodeEntry, fn func()) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current, ok := p.entries[hash]
+	if !ok || current != expected || fn == nil {
+		return false
+	}
+	fn()
+	return true
+}
+
+func (p *routerTestPool) IsNodeDisabled(node.Hash) bool { return false }
 
 func (p *routerTestPool) GetPlatform(id string) (*platform.Platform, bool) {
 	p.mu.RLock()
@@ -108,6 +135,11 @@ func newRoutableEntry(t *testing.T, raw, ip string) (node.Hash, *node.NodeEntry)
 	t.Helper()
 	rawOpts := json.RawMessage(raw)
 	h := node.HashFromRawOptions(rawOpts)
+	return h, newHealthyEntryForHash(t, h, rawOpts, ip)
+}
+
+func newHealthyEntryForHash(t *testing.T, h node.Hash, rawOpts json.RawMessage, ip string) *node.NodeEntry {
+	t.Helper()
 	e := node.NewNodeEntry(h, rawOpts, time.Now(), 16)
 	// Empty platform regex still requires at least one enabled subscription.
 	e.AddSubscriptionID("sub-test")
@@ -126,7 +158,7 @@ func newRoutableEntry(t *testing.T, raw, ip string) (node.Hash, *node.NodeEntry)
 	ob := testutil.NewNoopOutbound()
 	e.Outbound.Store(&ob)
 
-	return h, e
+	return e
 }
 
 func waitForDomainLatency(t *testing.T, e *node.NodeEntry, domain string) {
@@ -157,6 +189,69 @@ func newTestRouter(pool PoolAccessor, onEvent LeaseEventFunc) *Router {
 		P2CWindow:    func() time.Duration { return 10 * time.Minute },
 		OnLeaseEvent: onEvent,
 	})
+}
+
+func TestRouteRequestKeepsPublishedViewDuringFullRebuild(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("p-rebuild-gap", "RebuildGap", nil, nil)
+	pool.addPlatform(plat)
+	h, entry := newRoutableEntry(t, `{"type":"rebuild-gap"}`, "203.0.113.20")
+	pool.addEntry(h, entry)
+	pool.rebuildPlatformView(plat)
+	if got := plat.View().Size(); got != 1 {
+		t.Fatalf("setup view size = %d, want 1", got)
+	}
+
+	router := newTestRouter(pool, nil)
+	routeResolved := make(chan struct{})
+	router.afterPlatformResolveHook = func(*platform.Platform) {
+		close(routeResolved)
+	}
+
+	scanEntered := make(chan struct{})
+	releaseScan := make(chan struct{})
+	rebuildDone := make(chan struct{})
+	go func() {
+		plat.FullRebuild(func(fn func(node.Hash, *node.NodeEntry) bool) {
+			close(scanEntered)
+			<-releaseScan
+			fn(h, entry)
+		}, func(_ string, _ node.Hash) (string, bool, []string, bool) {
+			return "", true, nil, true
+		}, func(_ netip.Addr) string { return "" })
+		close(rebuildDone)
+	}()
+
+	select {
+	case <-scanEntered:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not enter pool scan")
+	}
+
+	routeDone := make(chan error, 1)
+	go func() {
+		_, err := router.RouteRequest(plat.Name, "", "https://example.com")
+		routeDone <- err
+	}()
+	select {
+	case <-routeResolved:
+	case <-time.After(time.Second):
+		t.Fatal("route did not resolve platform")
+	}
+	close(releaseScan)
+	select {
+	case <-rebuildDone:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not finish after scan release")
+	}
+	select {
+	case err := <-routeDone:
+		if err != nil {
+			t.Fatalf("route failed while full rebuild was scanning: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route did not finish after the rebuilt view was published")
+	}
 }
 
 func TestRouteRequest_SameIPRotationPrefersTargetLatencySample(t *testing.T) {
@@ -231,6 +326,9 @@ func TestRouteRequest_SameIPRotationPrefersTargetLatencySample(t *testing.T) {
 	}
 	if res.NodeHash != preferredHash {
 		t.Fatalf("rotation picked %s, want %s (candidate with target-domain latency)", res.NodeHash.Hex(), preferredHash.Hex())
+	}
+	if res.SelectedEntry() != entries[preferredHash] {
+		t.Fatal("same-ip rotation did not carry the exact selected entry identity")
 	}
 	if res.LeaseCreated {
 		t.Fatal("same-ip rotation should update existing lease, not create a new one")
@@ -314,5 +412,185 @@ func TestRouteRequest_SelectedNodeRemovedAfterPick_EmitsLeaseRemove(t *testing.T
 	}
 	if !foundRemove {
 		t.Fatal("expected LeaseRemove event when old lease is dropped")
+	}
+}
+
+func TestRouteRequest_RejectsReplacementWithStalePlatformViewIdentity(t *testing.T) {
+	pool := newRouterTestPool()
+	var currentTag = "allowed"
+	plat := platform.NewPlatformWithTagFilter(
+		"plat-stale-identity",
+		"Plat-Stale-Identity",
+		node.TagFilter{Must: []*regexp.Regexp{regexp.MustCompile(`^sub-test/allowed$`)}},
+		nil,
+	)
+	payload := json.RawMessage(`{"id":"same-hash-route"}`)
+	h := node.HashFromRawOptions(payload)
+	oldEntry := newHealthyEntryForHash(t, h, payload, "203.0.113.201")
+
+	subLookup := func(_ string, _ node.Hash) (string, bool, []string, bool) {
+		return "sub-test", true, []string{currentTag}, true
+	}
+	plat.FullRebuild(
+		func(fn func(node.Hash, *node.NodeEntry) bool) {
+			fn(h, oldEntry)
+		},
+		subLookup,
+		func(_ netip.Addr) string { return "" },
+	)
+	if !plat.View().Contains(h) {
+		t.Fatal("setup expected old entry in platform view")
+	}
+
+	currentTag = "excluded"
+	newEntry := newHealthyEntryForHash(t, h, payload, "203.0.113.202")
+	pool.addEntry(h, newEntry)
+	pool.addPlatform(plat)
+
+	router := newTestRouter(pool, nil)
+	_, err := router.RouteRequest(plat.Name, "", "https://cloudflare.com/")
+	if !errors.Is(err, ErrNoAvailableNodes) {
+		t.Fatalf("stale platform view selected replacement entry: err=%v", err)
+	}
+}
+
+func newFilteredReplacementFixture(
+	t *testing.T,
+	platformID string,
+	platformName string,
+	oldIP string,
+	newIP string,
+) (*routerTestPool, *platform.Platform, node.Hash, *node.NodeEntry, *node.NodeEntry, func()) {
+	t.Helper()
+	pool := newRouterTestPool()
+	currentTag := "allowed"
+	plat := platform.NewPlatformWithTagFilter(
+		platformID,
+		platformName,
+		node.TagFilter{Must: []*regexp.Regexp{regexp.MustCompile(`^sub-test/allowed$`)}},
+		nil,
+	)
+	payload := json.RawMessage(`{"id":"same-hash-sticky"}`)
+	h := node.HashFromRawOptions(payload)
+	oldEntry := newHealthyEntryForHash(t, h, payload, oldIP)
+	subLookup := func(_ string, _ node.Hash) (string, bool, []string, bool) {
+		return "sub-test", true, []string{currentTag}, true
+	}
+	plat.FullRebuild(
+		func(fn func(node.Hash, *node.NodeEntry) bool) { fn(h, oldEntry) },
+		subLookup,
+		func(_ netip.Addr) string { return "" },
+	)
+	if !plat.View().Contains(h) {
+		t.Fatal("setup expected old entry in filtered platform view")
+	}
+
+	currentTag = "excluded"
+	newEntry := newHealthyEntryForHash(t, h, payload, newIP)
+	pool.addEntry(h, newEntry)
+	pool.addPlatform(plat)
+	return pool, plat, h, oldEntry, newEntry, func() {
+		plat.NotifyDirty(
+			h,
+			pool.GetEntry,
+			subLookup,
+			func(_ netip.Addr) string { return "" },
+		)
+	}
+}
+
+func TestRouteRequest_StickyHitRejectsReplacementWithStalePlatformViewIdentity(t *testing.T) {
+	pool, plat, h, oldEntry, _, converge := newFilteredReplacementFixture(
+		t,
+		"plat-stale-sticky-hit",
+		"Plat-Stale-Sticky-Hit",
+		"203.0.113.211",
+		"203.0.113.211",
+	)
+	defer converge()
+
+	router := newTestRouter(pool, nil)
+	state, _ := router.states.LoadOrCompute(plat.ID, func() (*PlatformRoutingState, bool) {
+		return NewPlatformRoutingState(), false
+	})
+	state.Leases.CreateLease("stale-hit-account", Lease{
+		NodeHash:       h,
+		EgressIP:       oldEntry.GetEgressIP(),
+		ExpiryNs:       time.Now().Add(time.Hour).UnixNano(),
+		LastAccessedNs: time.Now().UnixNano(),
+	})
+
+	_, err := router.RouteRequest(plat.Name, "stale-hit-account", "https://cloudflare.com/")
+	if !errors.Is(err, ErrNoAvailableNodes) {
+		t.Fatalf("stale platform view renewed replacement lease: err=%v", err)
+	}
+	if _, ok := state.Leases.GetLease("stale-hit-account"); ok {
+		t.Fatal("stale lease should be removed after its replacement is rejected")
+	}
+}
+
+func TestRouteRequest_SameIPRotationRejectsReplacementWithStalePlatformViewIdentity(t *testing.T) {
+	pool := newRouterTestPool()
+	currentTag := "allowed"
+	plat := platform.NewPlatformWithTagFilter(
+		"plat-stale-rotation",
+		"Plat-Stale-Rotation",
+		node.TagFilter{Must: []*regexp.Regexp{regexp.MustCompile(`^sub-test/allowed$`)}},
+		nil,
+	)
+	currentHash, currentEntry := newRoutableEntry(t, `{"id":"rotation-current"}`, "203.0.113.221")
+	candidatePayload := json.RawMessage(`{"id":"rotation-candidate"}`)
+	candidateHash := node.HashFromRawOptions(candidatePayload)
+	candidateEntry := newHealthyEntryForHash(t, candidateHash, candidatePayload, "203.0.113.221")
+	pool.addEntry(currentHash, currentEntry)
+	pool.addEntry(candidateHash, candidateEntry)
+	subLookup := func(_ string, _ node.Hash) (string, bool, []string, bool) {
+		return "sub-test", true, []string{currentTag}, true
+	}
+	plat.FullRebuild(
+		func(fn func(node.Hash, *node.NodeEntry) bool) {
+			fn(currentHash, currentEntry)
+			fn(candidateHash, candidateEntry)
+		},
+		subLookup,
+		func(_ netip.Addr) string { return "" },
+	)
+	// The current lease is invalidated by removing only its hash from the
+	// published view; the candidate remains in the old view snapshot.
+	plat.NotifyDirty(
+		currentHash,
+		func(h node.Hash) (*node.NodeEntry, bool) {
+			if h == currentHash {
+				return nil, false
+			}
+			return pool.GetEntry(h)
+		},
+		subLookup,
+		func(_ netip.Addr) string { return "" },
+	)
+	if plat.View().Contains(currentHash) || !plat.View().Contains(candidateHash) {
+		t.Fatal("setup did not leave only the candidate in the stale view")
+	}
+
+	currentTag = "excluded"
+	pool.addEntry(candidateHash, newHealthyEntryForHash(t, candidateHash, candidatePayload, "203.0.113.221"))
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+	state, _ := router.states.LoadOrCompute(plat.ID, func() (*PlatformRoutingState, bool) {
+		return NewPlatformRoutingState(), false
+	})
+	state.Leases.CreateLease("stale-rotation-account", Lease{
+		NodeHash:       currentHash,
+		EgressIP:       currentEntry.GetEgressIP(),
+		ExpiryNs:       time.Now().Add(time.Hour).UnixNano(),
+		LastAccessedNs: time.Now().UnixNano(),
+	})
+
+	_, err := router.RouteRequest(plat.Name, "stale-rotation-account", "https://cloudflare.com/")
+	if !errors.Is(err, ErrNoAvailableNodes) {
+		t.Fatalf("stale platform view rotated onto replacement: err=%v", err)
+	}
+	if _, ok := state.Leases.GetLease("stale-rotation-account"); ok {
+		t.Fatal("stale lease should be removed after its rotation candidate is rejected")
 	}
 }

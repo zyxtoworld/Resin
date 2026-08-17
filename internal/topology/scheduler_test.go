@@ -1,14 +1,18 @@
 package topology
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	neturl "net/url"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,14 +20,15 @@ import (
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 )
 
 // makeMockFetcher returns a Fetcher that serves the given response.
-func makeMockFetcher(body []byte, err error) func(string) ([]byte, error) {
-	return func(url string) ([]byte, error) {
+func makeMockFetcher(body []byte, err error) func(context.Context, string) ([]byte, error) {
+	return func(context.Context, string) ([]byte, error) {
 		return body, err
 	}
 }
@@ -40,12 +45,59 @@ func makeSubscriptionJSON(outbounds ...string) []byte {
 	return []byte(`{"outbounds":` + arr + `}`)
 }
 
-func newTestScheduler(subMgr *SubscriptionManager, pool *GlobalNodePool, fetcher func(string) ([]byte, error)) *SubscriptionScheduler {
+func newTestScheduler(subMgr *SubscriptionManager, pool *GlobalNodePool, fetcher func(context.Context, string) ([]byte, error)) *SubscriptionScheduler {
 	return NewSubscriptionScheduler(SchedulerConfig{
 		SubManager: subMgr,
 		Pool:       pool,
 		Fetcher:    fetcher,
 	})
+}
+
+func TestScheduler_TickDoesNotOverflowHugeUpdateInterval(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("huge-interval", "Huge interval", "http://example.com", true, false)
+	sub.SetFetchConfig(sub.URL(), math.MaxInt64)
+	sub.LastCheckedNs.Store(time.Now().UnixNano())
+	subMgr.Register(sub)
+
+	var fetchCalls atomic.Int32
+	sched := newTestScheduler(subMgr, newTestPool(subMgr), func(context.Context, string) ([]byte, error) {
+		fetchCalls.Add(1)
+		return nil, errors.New("unexpected refresh")
+	})
+
+	sched.tick()
+	if got := fetchCalls.Load(); got != 0 {
+		t.Fatalf("huge update interval was treated as immediately due after overflow: fetch calls=%d", got)
+	}
+}
+
+type controlledDeadlineContext struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *controlledDeadlineContext) Deadline() (time.Time, bool) {
+	return time.Now().Add(time.Hour), true
+}
+
+func (c *controlledDeadlineContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *controlledDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *controlledDeadlineContext) Value(any) any { return nil }
+
+func (c *controlledDeadlineContext) expire() {
+	c.once.Do(func() { close(c.done) })
 }
 
 // --- Test: UpdateSubscription success path ---
@@ -212,6 +264,109 @@ func TestScheduler_UpdateSubscription_LocalSubscription_SuccessWithoutFetcher(t 
 	}
 }
 
+func TestScheduler_RefreshDoesNotPublishMixedInputConfigGeneration(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("mixed-input", "LocalSub", "", true, false)
+	sub.SetFetchConfig("", int64(time.Hour))
+	sub.SetSourceType(subscription.SourceTypeLocal)
+	oldRaw := `{"type":"shadowsocks","tag":"old-input","server":"1.1.1.1","server_port":443}`
+	newRaw := `{"type":"shadowsocks","tag":"new-input","server":"2.2.2.2","server_port":443}`
+	sub.SetContent(string(makeSubscriptionJSON(oldRaw)))
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	sched := newTestScheduler(subMgr, pool, makeMockFetcher(nil, errors.New("local fetch must not run")))
+	fieldsRead := make(chan struct{})
+	allowVersionRead := make(chan struct{})
+	sched.beforeRefreshConfigVersionHook = func() {
+		close(fieldsRead)
+		<-allowVersionRead
+	}
+
+	refreshDone := make(chan struct{})
+	go func() {
+		sched.UpdateSubscription(sub)
+		close(refreshDone)
+	}()
+	select {
+	case <-fieldsRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not reach the mixed-input barrier")
+	}
+
+	// This is the same operation-lock/field-setter contract used by the
+	// control-plane PATCH path. It changes the refresh input after the old
+	// fields were read but before the old implementation reads ConfigVersion.
+	sub.WithOpLock(func() {
+		sub.SetContent(string(makeSubscriptionJSON(newRaw)))
+	})
+	close(allowVersionRead)
+
+	select {
+	case <-refreshDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not finish after releasing the barrier")
+	}
+
+	oldHash := node.HashFromRawOptions([]byte(oldRaw))
+	newHash := node.HashFromRawOptions([]byte(newRaw))
+	if _, ok := sub.ManagedNodes().LoadNode(oldHash); ok {
+		t.Fatal("refresh published old content after the input config generation changed")
+	}
+	if _, ok := pool.GetEntry(oldHash); ok {
+		t.Fatal("pool published old content after the input config generation changed")
+	}
+	if _, ok := sub.ManagedNodes().LoadNode(newHash); ok {
+		t.Fatal("refresh published the post-mutation content without a new refresh")
+	}
+	if _, ok := pool.GetEntry(newHash); ok {
+		t.Fatal("pool published the post-mutation content without a new refresh")
+	}
+}
+
+func TestScheduler_RefreshContextCancellationInterruptsConfigSnapshotLock(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("snapshot-cancel", "LocalSub", "", true, false)
+	sub.SetFetchConfig("", int64(time.Hour))
+	sub.SetSourceType(subscription.SourceTypeLocal)
+	sub.SetContent(string(makeSubscriptionJSON(
+		`{"type":"shadowsocks","tag":"snapshot-cancel","server":"1.1.1.1","server_port":443}`,
+	)))
+	subMgr.Register(sub)
+
+	sched := newTestScheduler(subMgr, newTestPool(subMgr), nil)
+	snapshotStarted := make(chan struct{})
+	sched.beforeRefreshConfigSnapshotHook = func() { close(snapshotStarted) }
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	go sub.WithOpLock(func() {
+		close(lockHeld)
+		<-releaseLock
+	})
+	<-lockHeld
+	defer close(releaseLock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	refreshDone := make(chan struct{})
+	go func() {
+		sched.UpdateSubscriptionContext(ctx, sub)
+		close(refreshDone)
+	}()
+	select {
+	case <-snapshotStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not reach the config snapshot boundary")
+	}
+	cancel()
+
+	select {
+	case <-refreshDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh ignored caller cancellation while waiting for config snapshot lock")
+	}
+}
+
 func TestScheduler_UpdateSubscription_LocalSubscription_ParseFailure(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "LocalSub", "", true, false)
@@ -231,6 +386,161 @@ func TestScheduler_UpdateSubscription_LocalSubscription_ParseFailure(t *testing.
 	}
 	if pool.Size() != 0 {
 		t.Fatalf("expected empty pool, got %d", pool.Size())
+	}
+}
+
+func TestScheduler_UpdateSubscription_AllUnsupportedPayloadRetainsExistingNodes(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	oldRaw := `{"type":"shadowsocks","tag":"old-node","server":"1.1.1.1","server_port":443}`
+	sched := newTestScheduler(subMgr, pool, makeMockFetcher(makeSubscriptionJSON(oldRaw), nil))
+	sched.UpdateSubscription(sub)
+
+	oldHash := node.HashFromRawOptions([]byte(oldRaw))
+	if _, ok := pool.GetEntry(oldHash); !ok {
+		t.Fatal("old node should exist before the invalid refresh")
+	}
+
+	for _, invalidPayload := range [][]byte{
+		[]byte(`{"outbounds":[{"type":"direct"},{"type":"block"}]}`),
+		[]byte(`{"outbounds":[]}`),
+	} {
+		// A syntactically valid recognized subscription with no supported nodes
+		// is not a trustworthy replacement for the last known-good node set.
+		sched.Fetcher = makeMockFetcher(invalidPayload, nil)
+		sched.UpdateSubscription(sub)
+
+		if _, ok := pool.GetEntry(oldHash); !ok {
+			t.Fatal("zero-node refresh must not remove the last known-good node")
+		}
+		if _, ok := sub.ManagedNodes().LoadNode(oldHash); !ok {
+			t.Fatal("zero-node refresh must not replace ManagedNodes with an empty set")
+		}
+	}
+}
+
+func TestScheduler_UpdateSubscription_StatusErrorRedactsWholeURL(t *testing.T) {
+	canaries := []struct {
+		url    string
+		secret string
+	}{
+		{
+			url:    "https://subscriber:userinfo-secret@example.com/subscription",
+			secret: "userinfo-secret",
+		},
+		{
+			url:    "https://example.com/subscription?token=query-secret&format=json",
+			secret: "query-secret",
+		},
+		{
+			url:    "https://example.com/subscription/path-secret",
+			secret: "path-secret",
+		},
+	}
+
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", canaries[0].url, true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	sched := newTestScheduler(subMgr, p, nil)
+
+	for _, canary := range canaries {
+		sub.SetFetchConfig(canary.url, int64(time.Hour))
+		sched.Fetcher = makeMockFetcher(nil, &netutil.HTTPStatusError{StatusCode: 503, URL: canary.url})
+		if !sched.UpdateSubscription(sub) {
+			t.Fatal("refresh was not admitted")
+		}
+		got := sub.GetLastError()
+		if strings.Contains(got, canary.secret) || strings.Contains(got, "subscriber:") || strings.Contains(got, "?token=") || strings.Contains(got, "/path-secret") {
+			t.Fatal("subscription LastError exposed URL data beyond its origin")
+		}
+		if !strings.Contains(got, "503") || !strings.Contains(got, "https://example.com") {
+			t.Fatalf("LastError lost safe status/origin diagnostics: %q", got)
+		}
+	}
+}
+
+type subscriptionRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f subscriptionRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestScheduler_UpdateSubscription_RequestErrorRedactsWholeURL(t *testing.T) {
+	canaries := []struct {
+		url    string
+		secret string
+	}{
+		{
+			url:    "https://subscriber:userinfo-secret@example.com/subscription",
+			secret: "userinfo-secret",
+		},
+		{
+			url:    "https://example.com/subscription?token=query-secret&format=json",
+			secret: "query-secret",
+		},
+		{
+			url:    "https://example.com/subscription/path-secret",
+			secret: "path-secret",
+		},
+	}
+	requestErr := errors.New("connection refused")
+	downloader := &netutil.DirectDownloader{
+		Client: &http.Client{Transport: subscriptionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &neturl.Error{Op: req.Method, URL: req.URL.String(), Err: requestErr}
+		})},
+		TimeoutFn:   func() time.Duration { return 0 },
+		UserAgentFn: func() string { return "" },
+	}
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", canaries[0].url, true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	sched := NewSubscriptionScheduler(SchedulerConfig{SubManager: subMgr, Pool: p, Downloader: downloader})
+
+	for _, canary := range canaries {
+		sub.SetFetchConfig(canary.url, int64(time.Hour))
+		if !sched.UpdateSubscription(sub) {
+			t.Fatal("refresh was not admitted")
+		}
+		got := sub.GetLastError()
+		if strings.Contains(got, canary.secret) || strings.Contains(got, "subscriber:") || strings.Contains(got, "?token=") || strings.Contains(got, "/path-secret") {
+			t.Fatal("subscription LastError exposed URL data beyond its origin")
+		}
+		if !strings.Contains(got, "connection refused") || !strings.Contains(got, "https://example.com") {
+			t.Fatalf("LastError lost safe request diagnostics: %q", got)
+		}
+	}
+}
+
+func TestScheduler_UpdateSubscription_MalformedURLRedactsWholeURL(t *testing.T) {
+	const rawURL = "https://subscriber:malformed-userinfo@example.com/sub/%zz?token=malformed-query"
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", rawURL, true, false)
+	subMgr.Register(sub)
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       newTestPool(subMgr),
+		Downloader: &netutil.DirectDownloader{
+			TimeoutFn:   func() time.Duration { return 0 },
+			UserAgentFn: func() string { return "" },
+		},
+	})
+
+	if !sched.UpdateSubscription(sub) {
+		t.Fatal("refresh was not admitted")
+	}
+	got := sub.GetLastError()
+	for _, secret := range []string{"malformed-userinfo", "malformed-query", "/sub/%zz", "subscriber:"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("subscription LastError exposed %q: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "invalid request URL [redacted-url]") {
+		t.Fatalf("LastError lost safe malformed-URL diagnostics: %q", got)
 	}
 }
 
@@ -500,7 +810,7 @@ func TestScheduler_FailurePath_Serialized(t *testing.T) {
 	pool := newTestPool(subMgr)
 
 	var fetchCount atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		fetchCount.Add(1)
 		return nil, errors.New("fail")
 	}
@@ -538,7 +848,7 @@ func TestScheduler_StaleFailureDoesNotOverrideNewerSuccess(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var calls atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		if calls.Add(1) == 1 {
 			close(firstStarted)
 			<-releaseFirst
@@ -585,6 +895,118 @@ func TestScheduler_StaleFailureDoesNotOverrideNewerSuccess(t *testing.T) {
 	}
 }
 
+func TestScheduler_StaleFailureDoesNotOverrideNewerFailure(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	var calls atomic.Int32
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return nil, errors.New("stale failure")
+		}
+		close(secondDone)
+		return nil, errors.New("newer failure")
+	}
+	sched := newTestScheduler(subMgr, pool, fetcher)
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		sched.UpdateSubscription(sub)
+	}()
+
+	<-firstStarted
+	secondDoneCall := make(chan struct{})
+	go func() {
+		sched.UpdateSubscription(sub)
+		close(secondDoneCall)
+	}()
+
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("newer failure did not reach fetcher")
+	}
+	select {
+	case <-secondDoneCall:
+	case <-time.After(time.Second):
+		t.Fatal("newer failure did not finish")
+	}
+
+	close(releaseFirst)
+	<-firstDone
+
+	if got := sub.GetLastError(); got != "newer failure" {
+		t.Fatalf("stale failure overwrote newer failure: got %q", got)
+	}
+}
+
+func TestScheduler_StaleSuccessDoesNotOverrideNewerFailure(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	oldBody := makeSubscriptionJSON(
+		`{"type":"shadowsocks","tag":"old-node","server":"1.1.1.1","server_port":443}`,
+	)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	var calls atomic.Int32
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return oldBody, nil
+		}
+		close(secondDone)
+		return nil, errors.New("newer failure")
+	}
+	sched := newTestScheduler(subMgr, pool, fetcher)
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		sched.UpdateSubscription(sub)
+	}()
+
+	<-firstStarted
+	secondDoneCall := make(chan struct{})
+	go func() {
+		sched.UpdateSubscription(sub)
+		close(secondDoneCall)
+	}()
+
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("newer failure did not reach fetcher")
+	}
+	select {
+	case <-secondDoneCall:
+	case <-time.After(time.Second):
+		t.Fatal("newer failure did not finish")
+	}
+
+	close(releaseFirst)
+	<-firstDone
+
+	if got := sub.GetLastError(); got != "newer failure" {
+		t.Fatalf("stale success cleared newer failure: got %q", got)
+	}
+	if pool.Size() != 0 {
+		t.Fatalf("stale success repopulated nodes after newer failure: size=%d", pool.Size())
+	}
+}
+
 func TestScheduler_StaleSuccessDoesNotOverrideNewerSuccess(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "http://example.com", true, false)
@@ -601,7 +1023,7 @@ func TestScheduler_StaleSuccessDoesNotOverrideNewerSuccess(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	var calls atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		if calls.Add(1) == 1 {
 			close(firstStarted)
 			<-releaseFirst
@@ -720,7 +1142,7 @@ func TestScheduler_DueCheck(t *testing.T) {
 
 	pool := newTestPool(subMgr)
 	var fetchedURLs sync.Map
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		fetchedURLs.Store(url, true)
 		return makeSubscriptionJSON(), nil
 	}
@@ -733,7 +1155,7 @@ func TestScheduler_DueCheck(t *testing.T) {
 		if !sub.Enabled() {
 			return true
 		}
-		if sub.LastCheckedNs.Load()+sub.UpdateIntervalNs()-15*int64(time.Second) <= now {
+		if subscriptionDueAt(sub.LastCheckedNs.Load(), sub.UpdateIntervalNs(), now) {
 			dueIDs = append(dueIDs, id)
 		}
 		return true
@@ -769,7 +1191,7 @@ func TestScheduler_Tick_UpdatesDueSubscriptionsInParallel(t *testing.T) {
 	releaseFetch := make(chan struct{})
 	allStarted := make(chan struct{})
 	var started atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		if started.Add(1) == 2 {
 			close(allStarted)
 		}
@@ -817,7 +1239,7 @@ func TestScheduler_ForceRefreshAllAsync_ReturnsImmediately(t *testing.T) {
 	pool := newTestPool(subMgr)
 	fetchStarted := make(chan struct{})
 	releaseFetch := make(chan struct{})
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		close(fetchStarted)
 		<-releaseFetch
 		return makeSubscriptionJSON(), nil
@@ -846,6 +1268,262 @@ func TestScheduler_ForceRefreshAllAsync_ReturnsImmediately(t *testing.T) {
 	sched.Stop()
 }
 
+func TestScheduler_StopAfterWorkerCheckRejectsFetcherAdmission(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-stop-race", "Stop race", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	var fetchCalls atomic.Int32
+	fetchStarted := make(chan struct{})
+	fetcher := func(ctx context.Context, _ string) ([]byte, error) {
+		fetchCalls.Add(1)
+		close(fetchStarted)
+		return makeSubscriptionJSON(), ctx.Err()
+	}
+	sched := newTestScheduler(subMgr, p, fetcher)
+	fetchAdmissionReached := make(chan struct{})
+	releaseBeforeFetcher := make(chan struct{})
+	sched.beforeRefreshUpdateHook = func() {
+		close(fetchAdmissionReached)
+		<-releaseBeforeFetcher
+	}
+
+	done := make(chan struct{})
+	go func() {
+		sched.ForceRefreshAll()
+		close(done)
+	}()
+	select {
+	case <-fetchAdmissionReached:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach fetch admission")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		sched.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-sched.stopCh:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not close stop channel")
+	}
+	close(releaseBeforeFetcher)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ForceRefreshAll did not finish")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not finish")
+	}
+	if got := fetchCalls.Load(); got != 0 {
+		t.Fatalf("Fetcher was called after stop admission closed: got %d calls", got)
+	}
+	select {
+	case <-fetchStarted:
+		t.Fatal("Fetcher unexpectedly started")
+	default:
+	}
+}
+
+func TestScheduler_RequestDeadlineDoesNotRecordFailure(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-request-deadline", "Request deadline", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+
+	const initialChecked = int64(123)
+	sub.LastCheckedNs.Store(initialChecked)
+	sub.SetLastError("")
+	fetchStarted := make(chan struct{})
+	sched := newTestScheduler(subMgr, p, func(ctx context.Context, _ string) ([]byte, error) {
+		close(fetchStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	var updateCallbacks atomic.Int32
+	sched.onSubUpdated = func(*subscription.Subscription) {
+		updateCallbacks.Add(1)
+	}
+
+	requestCtx := &controlledDeadlineContext{done: make(chan struct{})}
+	result := make(chan bool, 1)
+	go func() {
+		result <- sched.UpdateSubscriptionContext(requestCtx, sub)
+	}()
+
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach fetcher")
+	}
+	requestCtx.expire()
+
+	select {
+	case accepted := <-result:
+		if !accepted {
+			t.Fatal("admitted refresh unexpectedly rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not return after request deadline")
+	}
+
+	if got := sub.GetLastError(); got != "" {
+		t.Fatalf("request deadline was recorded as subscription failure: %q", got)
+	}
+	if got := sub.LastCheckedNs.Load(); got != initialChecked {
+		t.Fatalf("request deadline changed LastCheckedNs: got %d, want %d", got, initialChecked)
+	}
+	if got := updateCallbacks.Load(); got != 0 {
+		t.Fatalf("request deadline triggered %d update callbacks, want 0", got)
+	}
+}
+
+func TestScheduler_FetcherDeadlineWhileCallerAliveRecordsFailure(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-fetcher-deadline", "Fetcher deadline", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	sched := newTestScheduler(subMgr, p, func(context.Context, string) ([]byte, error) {
+		return nil, context.DeadlineExceeded
+	})
+
+	if !sched.UpdateSubscriptionContext(context.Background(), sub) {
+		t.Fatal("refresh was not admitted")
+	}
+	if got := sub.GetLastError(); got != context.DeadlineExceeded.Error() {
+		t.Fatalf("fetcher deadline was not recorded while caller was alive: got %q", got)
+	}
+}
+
+func TestScheduler_RequestDeadlineBeforeParseDoesNotRecordFailure(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-parse-deadline", "Parse deadline", "", true, false)
+	sub.SetSourceType(subscription.SourceTypeLocal)
+	sub.SetContent("not a subscription")
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+
+	const initialChecked = int64(456)
+	sub.LastCheckedNs.Store(initialChecked)
+	sub.SetLastError("")
+	requestCtx := &controlledDeadlineContext{done: make(chan struct{})}
+	sched := newTestScheduler(subMgr, p, makeMockFetcher(nil, errors.New("local refresh must not fetch")))
+	sched.beforeRefreshParseHook = requestCtx.expire
+
+	if !sched.UpdateSubscriptionContext(requestCtx, sub) {
+		t.Fatal("refresh was not admitted")
+	}
+	if got := sub.GetLastError(); got != "" {
+		t.Fatalf("request deadline before parse was recorded as failure: %q", got)
+	}
+	if got := sub.LastCheckedNs.Load(); got != initialChecked {
+		t.Fatalf("request deadline before parse changed LastCheckedNs: got %d, want %d", got, initialChecked)
+	}
+}
+
+func TestScheduler_StopWaitsForDirectLocalRefresh(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-local-stop", "Local stop", "", true, false)
+	sub.SetSourceType(subscription.SourceTypeLocal)
+	sub.SetContent(string(makeSubscriptionJSON(
+		`{"type":"shadowsocks","tag":"local-stop","server":"1.1.1.1","server_port":443}`,
+	)))
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	sched := newTestScheduler(subMgr, p, makeMockFetcher(nil, errors.New("local refresh must not fetch")))
+	reachedRefresh := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	sched.beforeRefreshUpdateHook = func() {
+		close(reachedRefresh)
+		<-releaseRefresh
+	}
+
+	refreshDone := make(chan struct{})
+	go func() {
+		sched.UpdateSubscription(sub)
+		close(refreshDone)
+	}()
+	select {
+	case <-reachedRefresh:
+	case <-time.After(time.Second):
+		t.Fatal("local refresh did not reach the controlled admission boundary")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		sched.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-sched.stopCh:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not signal the scheduler")
+	}
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned while a direct local refresh was still admitted")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseRefresh)
+	select {
+	case <-refreshDone:
+	case <-time.After(time.Second):
+		t.Fatal("local refresh did not finish after release")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not join the direct local refresh")
+	}
+	if got := p.Size(); got != 1 {
+		t.Fatalf("expected admitted local refresh to publish one node, got %d", got)
+	}
+}
+
+func TestScheduler_StopAfterFetcherAdmissionCancelsCustomFetcher(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-fetch-cancel", "Fetch cancel", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	p := newTestPool(subMgr)
+	var fetchCalls atomic.Int32
+	fetchStarted := make(chan struct{})
+	fetcher := func(ctx context.Context, _ string) ([]byte, error) {
+		fetchCalls.Add(1)
+		close(fetchStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	sched := newTestScheduler(subMgr, p, fetcher)
+
+	sched.UpdateSubscriptionAsync(sub)
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("custom Fetcher was not admitted")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		sched.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel and join the admitted custom Fetcher")
+	}
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly one admitted Fetcher call, got %d", got)
+	}
+}
+
 func TestScheduler_ForceRefreshAll_UpdatesSubscriptionsInParallel(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub1 := subscription.NewSubscription("s1", "One", "http://example.com/one", true, false)
@@ -857,7 +1535,7 @@ func TestScheduler_ForceRefreshAll_UpdatesSubscriptionsInParallel(t *testing.T) 
 	releaseFetch := make(chan struct{})
 	allStarted := make(chan struct{})
 	var started atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		if started.Add(1) == 2 {
 			close(allStarted)
 		}
@@ -917,7 +1595,7 @@ func TestScheduler_ForceRefreshAll_LimitsConcurrentUpdates(t *testing.T) {
 	var started atomic.Int32
 	var inFlight atomic.Int32
 	var maxInFlight atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		current := inFlight.Add(1)
 		for {
 			prev := maxInFlight.Load()
@@ -977,7 +1655,7 @@ func TestScheduler_ForceRefreshAll_AfterStopDoesNotFetch(t *testing.T) {
 
 	pool := newTestPool(subMgr)
 	var calls atomic.Int32
-	fetcher := func(url string) ([]byte, error) {
+	fetcher := func(_ context.Context, url string) ([]byte, error) {
 		calls.Add(1)
 		return makeSubscriptionJSON(), nil
 	}
@@ -1264,7 +1942,7 @@ func TestScheduler_SetSubscriptionEnabled_ReenabledCallbackForActiveNodesOnly(t 
 	sched := NewSubscriptionScheduler(SchedulerConfig{
 		SubManager: subMgr,
 		Pool:       pool,
-		OnSubReenabledNode: func(h node.Hash) {
+		OnSubReenabledNode: func(h node.Hash, _ *node.NodeEntry) {
 			got = append(got, h)
 		},
 	})
@@ -1276,6 +1954,103 @@ func TestScheduler_SetSubscriptionEnabled_ReenabledCallbackForActiveNodesOnly(t 
 	}
 	if got[0] != hLive {
 		t.Fatalf("reenabled callback hash = %s, want %s", got[0].Hex(), hLive.Hex())
+	}
+}
+
+func TestScheduler_SetSubscriptionEnabled_ReenabledOutboundPublishesNode(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-reenable-view", "Provider", "http://example.com", false, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	plat := platform.NewPlatform("p-reenable-view", "Reenable", nil, nil)
+	if err := pool.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+
+	raw := json.RawMessage(`{"type":"shadowsocks","server":"1.1.1.1","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(hash, subscription.ManagedNode{Tags: []string{"ready"}})
+	sub.SwapManagedNodes(mn)
+
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	entry, ok := pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if !pool.RecordResultForEntry(hash, entry, true) {
+		t.Fatal("failed to mark node healthy")
+	}
+	entry.SetEgressIP(netip.MustParseAddr("203.0.113.10"))
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+	pool.RebuildAllPlatforms()
+	if got := plat.View().Size(); got != 0 {
+		t.Fatalf("disabled node view size = %d, want 0", got)
+	}
+
+	outboundMgr := outbound.NewOutboundManager(pool, &testutil.StubOutboundBuilder{})
+	sched := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		OnSubReenabledNode: func(h node.Hash, expected *node.NodeEntry) {
+			outboundMgr.EnsureNodeOutboundForEntry(h, expected)
+		},
+	})
+
+	sched.SetSubscriptionEnabled(sub, true)
+
+	if !entry.HasOutbound() {
+		t.Fatal("reenabled node did not receive outbound")
+	}
+	if got := plat.View().Size(); got != 1 {
+		t.Fatalf("reenabled node view size = %d, want 1", got)
+	}
+	if !plat.View().Contains(hash) {
+		t.Fatalf("reenabled node %s missing from platform view", hash.Hex())
+	}
+}
+
+func TestScheduler_ReenabledRuntimePreparationDoesNotCrossEntryGeneration(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-reenable-generation", "Provider", "http://example.com", false, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"reenable-generation","server":"198.51.100.77","server_port":443}`)
+	hash := node.HashFromRawOptions(raw)
+	managed := subscription.NewManagedNodes()
+	managed.StoreNode(hash, subscription.ManagedNode{Tags: []string{"reenable-generation"}})
+	sub.SwapManagedNodes(managed)
+	pool.AddNodeFromSub(hash, raw, sub.ID)
+	entryA, ok := pool.GetEntry(hash)
+	if !ok || entryA == nil {
+		t.Fatal("failed to create entry A")
+	}
+
+	var callbackCount atomic.Int32
+	scheduler := NewSubscriptionScheduler(SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		OnSubReenabledNode: func(node.Hash, *node.NodeEntry) {
+			callbackCount.Add(1)
+		},
+	})
+	scheduler.beforeReenabledRuntimeHook = func() {
+		pool.RemoveNodeFromSub(hash, sub.ID)
+		pool.AddNodeFromSub(hash, raw, sub.ID)
+		entryB, ok := pool.GetEntry(hash)
+		if !ok || entryB == nil || entryB == entryA {
+			t.Fatalf("same-hash replacement did not create entry B")
+		}
+	}
+
+	scheduler.SetSubscriptionEnabled(sub, true)
+	if got := callbackCount.Load(); got != 0 {
+		t.Fatalf("stale re-enable callback count = %d, want 0", got)
 	}
 }
 
@@ -1310,7 +2085,7 @@ func TestScheduler_SetSubscriptionEnabled_ReenabledCallbackSkipsAlreadyEnabledSh
 	sched := NewSubscriptionScheduler(SchedulerConfig{
 		SubManager: subMgr,
 		Pool:       pool,
-		OnSubReenabledNode: func(h node.Hash) {
+		OnSubReenabledNode: func(h node.Hash, _ *node.NodeEntry) {
 			got = append(got, h)
 		},
 	})

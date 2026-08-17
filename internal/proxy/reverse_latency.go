@@ -12,6 +12,7 @@ import (
 type reverseLatencyReporter struct {
 	health HealthRecorder
 	hash   node.Hash
+	entry  *node.NodeEntry
 	domain string
 
 	requestStart time.Time
@@ -19,10 +20,11 @@ type reverseLatencyReporter struct {
 	reported     atomic.Bool
 }
 
-func newReverseLatencyReporter(health HealthRecorder, hash node.Hash, domain string) *reverseLatencyReporter {
+func newReverseLatencyReporter(health HealthRecorder, hash node.Hash, entry *node.NodeEntry, domain string) *reverseLatencyReporter {
 	return &reverseLatencyReporter{
 		health:       health,
 		hash:         hash,
+		entry:        entry,
 		domain:       domain,
 		requestStart: time.Now(),
 	}
@@ -60,5 +62,8 @@ func (r *reverseLatencyReporter) reportSince(start time.Time) {
 	if latency <= 0 {
 		latency = time.Nanosecond
 	}
-	go r.health.RecordLatency(r.hash, r.domain, &latency)
+	target := directHealthRecorder(r.health)
+	submitHealthWrite(r.health, func() {
+		target.RecordLatencyForEntry(r.hash, r.entry, r.domain, &latency)
+	})
 }

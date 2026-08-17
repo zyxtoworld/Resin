@@ -350,3 +350,42 @@ func TestPlatform_FullRebuild_ClearsOld(t *testing.T) {
 		t.Fatal("h2 should have been removed by rebuild")
 	}
 }
+
+func TestPlatform_FullRebuildKeepsPublishedViewDuringScan(t *testing.T) {
+	p := NewPlatform("p1", "Test", nil, nil)
+	h := makeHash(`{"type":"rebuild-gap"}`)
+	entry := makeFullyRoutableEntry(h, "sub1")
+
+	p.FullRebuild(func(fn func(node.Hash, *node.NodeEntry) bool) {
+		fn(h, entry)
+	}, alwaysLookup, usGeoLookup)
+
+	scanEntered := make(chan struct{})
+	releaseScan := make(chan struct{})
+	rebuildDone := make(chan struct{})
+	go func() {
+		p.FullRebuild(func(fn func(node.Hash, *node.NodeEntry) bool) {
+			close(scanEntered)
+			<-releaseScan
+			fn(h, entry)
+		}, alwaysLookup, usGeoLookup)
+		close(rebuildDone)
+	}()
+
+	select {
+	case <-scanEntered:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not enter pool scan")
+	}
+
+	if got := p.View().Size(); got != 1 {
+		t.Fatalf("published view during rebuild scan: got %d nodes, want previous complete view with 1 node", got)
+	}
+
+	close(releaseScan)
+	select {
+	case <-rebuildDone:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not finish after scan release")
+	}
+}

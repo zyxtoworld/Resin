@@ -122,6 +122,10 @@ func extractErrnoCode(err error) string {
 }
 
 func normalizeErrno(errno syscall.Errno) string {
+	if normalized, ok := normalizePlatformErrno(errno); ok {
+		return normalized
+	}
+
 	switch errno {
 	case syscall.ECONNREFUSED:
 		return "ECONNREFUSED"

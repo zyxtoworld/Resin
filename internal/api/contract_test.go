@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -72,7 +73,7 @@ func newControlPlaneTestServerWithBodyLimit(
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
 		SubManager: subMgr,
 		Pool:       pool,
-		Fetcher: func(string) ([]byte, error) {
+		Fetcher: func(context.Context, string) ([]byte, error) {
 			return nil, errors.New("test fetcher failure")
 		},
 	})
@@ -246,19 +247,23 @@ func newObservabilityTestServer(t *testing.T) (*Server, *requestlog.Repo, *metri
 	t.Cleanup(func() { _ = metricsRepo.Close() })
 
 	platformID := "platform-1"
-	metricsManager := metrics.NewManager(metrics.ManagerConfig{
-		Repo:                        metricsRepo,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		BucketSeconds:               300,
-		ThroughputRealtimeCapacity:  16,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 16,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      16,
-		LeasesIntervalSec:           5,
-		RuntimeStats:                contractRuntimeStats{platformID: platformID},
+	metricsManager, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    metricsRepo,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       5,
+		RuntimeStats:            contractRuntimeStats{platformID: platformID},
 	})
+	if err != nil {
+		t.Fatalf("metrics.NewManager: %v", err)
+	}
+	t.Cleanup(metricsManager.Stop)
 
 	srv := NewServer(0, testAdminToken, systemInfo, runtimeCfg, nil, nil, 1<<20, requestlogRepo, metricsManager)
 	return srv, requestlogRepo, metricsManager, platformID
@@ -364,16 +369,7 @@ func seedObservabilityData(
 		Op:         metrics.LeaseOpRemove,
 		LifetimeNs: int64(30 * time.Second),
 	})
-	metricsManager.Stop() // ForceFlush bucket data without starting background loops.
-
-	trafficRows, err := metricsManager.Repo().QueryTraffic(0, time.Now().Add(time.Hour).Unix())
-	if err != nil {
-		t.Fatalf("metrics QueryTraffic: %v", err)
-	}
-	if len(trafficRows) == 0 {
-		t.Fatal("expected flushed traffic rows")
-	}
-	bucketStart := trafficRows[0].BucketStartUnix
+	bucketStart := (time.Now().Unix() / 300) * 300
 
 	if err := metricsManager.Repo().WriteNodePoolSnapshot(bucketStart, 20, 15, 6); err != nil {
 		t.Fatalf("WriteNodePoolSnapshot: %v", err)

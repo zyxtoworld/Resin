@@ -102,7 +102,7 @@ func HandleCreateSubscription(cp *service.ControlPlaneService) http.HandlerFunc 
 			writeDecodeBodyError(w, err)
 			return
 		}
-		s, err := cp.CreateSubscription(req)
+		s, err := cp.CreateSubscriptionContext(r.Context(), req)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -122,7 +122,7 @@ func HandleUpdateSubscription(cp *service.ControlPlaneService) http.HandlerFunc 
 		if !ok {
 			return
 		}
-		s, err := cp.UpdateSubscription(id, body)
+		s, err := cp.UpdateSubscriptionContext(r.Context(), id, body)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -138,7 +138,7 @@ func HandleDeleteSubscription(cp *service.ControlPlaneService) http.HandlerFunc 
 		if !ok {
 			return
 		}
-		if err := cp.DeleteSubscription(id); err != nil {
+		if err := cp.DeleteSubscriptionContext(r.Context(), id); err != nil {
 			writeServiceError(w, err)
 			return
 		}
@@ -153,7 +153,7 @@ func HandleRefreshSubscription(cp *service.ControlPlaneService) http.HandlerFunc
 		if !ok {
 			return
 		}
-		if err := cp.RefreshSubscription(id); err != nil {
+		if err := cp.RefreshSubscriptionContext(r.Context(), id); err != nil {
 			writeServiceError(w, err)
 			return
 		}
@@ -169,7 +169,7 @@ func HandleCleanupSubscriptionCircuitOpenNodes(cp *service.ControlPlaneService) 
 		if !ok {
 			return
 		}
-		cleanedCount, err := cp.CleanupSubscriptionCircuitOpenNodes(id)
+		cleanedCount, err := cp.CleanupSubscriptionCircuitOpenNodesContext(r.Context(), id)
 		if err != nil {
 			writeServiceError(w, err)
 			return

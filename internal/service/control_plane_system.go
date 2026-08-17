@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -12,10 +13,12 @@ import (
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/geoip"
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/probe"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/state"
+	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/topology"
 )
 
@@ -24,6 +27,60 @@ type ServiceError struct {
 	Code    string // INVALID_ARGUMENT, NOT_FOUND, CONFLICT, INTERNAL
 	Message string
 	Err     error
+}
+
+// cancellableMutex serializes a mutation owner without turning a canceled
+// request into an unbounded wait on sync.Mutex. Its zero value is ready for
+// use, matching the previous configMu field semantics.
+type cancellableMutex struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *cancellableMutex) init() {
+	m.token = make(chan struct{}, 1)
+	m.token <- struct{}{}
+}
+
+func (m *cancellableMutex) lockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.once.Do(m.init)
+	select {
+	case <-m.token:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *cancellableMutex) unlock() {
+	m.once.Do(m.init)
+	m.token <- struct{}{}
+}
+
+func (m *cancellableMutex) Lock() {
+	_ = m.lockContext(context.Background())
+}
+
+func (m *cancellableMutex) Unlock() {
+	m.unlock()
+}
+
+// TryLock preserves the non-blocking inspection used by package tests while
+// keeping the production owner cancellable for request-bound mutations.
+func (m *cancellableMutex) TryLock() bool {
+	m.once.Do(m.init)
+	select {
+	case <-m.token:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *ServiceError) Error() string { return e.Message }
@@ -62,9 +119,149 @@ type ControlPlaneService struct {
 	EnvCfg          *config.EnvConfig
 	EndpointRuntime EndpointRuntime
 
-	configMu      sync.Mutex
+	configMu      cancellableMutex
 	configVersion int
 	endpointMu    sync.RWMutex
+	platformMu    cancellableMutex
+	ruleMu        sync.Mutex
+
+	// platformMutationHook is used by package tests to force a precise
+	// interleaving around the real platform mutation path.
+	platformMutationHook func(platformMutationStage)
+
+	// subscriptionMutationHook is used by package tests to force a precise
+	// interleaving around the real subscription mutation path.
+	subscriptionMutationHook func(subscriptionMutationStage)
+
+	// afterSubscriptionPersistHook is a package-test seam after the
+	// subscription row is persisted and before its runtime mutation.
+	afterSubscriptionPersistHook func()
+
+	// afterSubscriptionRuntimeMutationHook is a package-test seam after a
+	// subscription PATCH has applied its in-memory configuration and before
+	// the subscription operation lock is released. Production leaves it nil.
+	afterSubscriptionRuntimeMutationHook func()
+
+	// afterSubscriptionNameReadHook is a package-test seam used to hold a
+	// response after its immutable configuration snapshot is copied.
+	// Production leaves it nil.
+	afterSubscriptionNameReadHook func()
+
+	// afterSubscriptionCleanupMutationHook is a package-test seam after the
+	// cleanup operation lock is released. Production leaves it nil.
+	afterSubscriptionCleanupMutationHook func()
+
+	// beforeSubscriptionCleanupLockHook is a package-test seam between the
+	// initial subscription lookup and acquisition of its operation lock.
+	beforeSubscriptionCleanupLockHook func(id string, sub *subscription.Subscription)
+
+	// ruleMutationHook is used by package tests to force a precise interleaving
+	// around the real account-rule mutation path.
+	ruleMutationHook func(ruleMutationStage)
+
+	// beforeLeaseServiceRouterReadHook is a package-test seam immediately before
+	// the atomic Router platform read.
+	beforeLeaseServiceRouterReadHook func()
+
+	// beforeLeaseInheritanceRouterCallHook is a package-test seam after a
+	// platform name has been resolved and immediately before lease inheritance
+	// is handed to Router. Production leaves it nil.
+	beforeLeaseInheritanceRouterCallHook func()
+
+	// beforePlatformRebuildHook is a package-test seam immediately before the
+	// platform view rebuild. Production leaves it nil.
+	beforePlatformRebuildHook func()
+
+	// beforeProbeManagerCallHook is a package-test seam after a control-plane
+	// probe has captured its entry and immediately before handing off to the
+	// probe manager. Production leaves it nil.
+	beforeProbeManagerCallHook func()
+
+	// afterProbeManagerResultHook is a package-test seam after the probe
+	// manager has completed and before the control-plane response is built.
+	// Production leaves it nil.
+	afterProbeManagerResultHook func()
+
+	// afterRuntimeReadLockHook is a package-test seam after a service runtime
+	// read has acquired the pool read owner. Production leaves it nil.
+	afterRuntimeReadLockHook func()
+
+	// beforePlatformReadHook is a package-test seam immediately before a
+	// platform read enters the service-owned platform generation boundary.
+	// Production leaves it nil.
+	beforePlatformReadHook func()
+
+	// afterPlatformPersistHook is a package-test seam after the platform row is
+	// persisted and before the runtime pool publish. Production leaves it nil.
+	afterPlatformPersistHook func()
+
+	// afterRuntimeConfigPersistHook is a package-test seam after the system
+	// config row is persisted and before the runtime snapshot publish.
+	afterRuntimeConfigPersistHook func()
+
+	// Runtime config lock seams are package-test coordination around the
+	// cancellable config mutation owner. Production leaves them nil.
+	beforeRuntimeConfigLockHook func()
+	afterRuntimeConfigLockHook  func()
+}
+
+// withRuntimeRead keeps responses that combine subscription ManagedNodes with
+// pool/node state on one published runtime generation. Pure database-only
+// control-plane reads do not need this boundary.
+func (s *ControlPlaneService) withRuntimeRead(fn func()) {
+	if fn == nil {
+		return
+	}
+	if s != nil && s.Pool != nil {
+		s.Pool.WithRuntimeRead(func() {
+			if hook := s.afterRuntimeReadLockHook; hook != nil {
+				hook()
+			}
+			fn()
+		})
+		return
+	}
+	fn()
+}
+
+type platformMutationStage uint8
+
+const (
+	platformMutationBeforeLock platformMutationStage = iota
+	platformMutationAfterLoad
+)
+
+func (s *ControlPlaneService) runPlatformMutationHook(stage platformMutationStage) {
+	if s.platformMutationHook != nil {
+		s.platformMutationHook(stage)
+	}
+}
+
+type subscriptionMutationStage uint8
+
+const (
+	subscriptionMutationBeforeLock subscriptionMutationStage = iota
+	subscriptionMutationAfterLoad
+)
+
+func (s *ControlPlaneService) runSubscriptionMutationHook(stage subscriptionMutationStage) {
+	if s.subscriptionMutationHook != nil {
+		s.subscriptionMutationHook(stage)
+	}
+}
+
+type ruleMutationStage uint8
+
+const (
+	ruleMutationBeforeLock ruleMutationStage = iota
+	ruleMutationAfterSnapshot
+	ruleMutationAfterPersist
+)
+
+func (s *ControlPlaneService) runRuleMutationHook(stage ruleMutationStage) {
+	if s.ruleMutationHook != nil {
+		s.ruleMutationHook(stage)
+	}
 }
 
 // ------------------------------------------------------------------
@@ -154,43 +351,77 @@ func copyRuntimeConfig(cfg *config.RuntimeConfig) *config.RuntimeConfig {
 // null values are rejected.
 // Pipeline: validate → persist → atomic swap.
 func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*config.RuntimeConfig, error) {
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
+	return s.PatchRuntimeConfigContext(context.Background(), patchJSON)
+}
 
-	// 3. Deep-copy current config → apply patch.
-	newCfg := copyRuntimeConfig(s.RuntimeCfg.Load())
-	if verr := parseRuntimeConfigPatch(patchJSON, newCfg); verr != nil {
-		return nil, verr
+// PatchRuntimeConfigContext applies a runtime config patch with caller
+// cancellation. Background callers retain the ordinary non-cancelable
+// behavior through PatchRuntimeConfig.
+func (s *ControlPlaneService) PatchRuntimeConfigContext(ctx context.Context, patchJSON json.RawMessage) (*config.RuntimeConfig, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	// 4. Additional validation.
-	if err := validateRuntimeConfig(newCfg); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	// On process start, initialize local configVersion from persisted state
-	// so PATCH keeps monotonically increasing versions across restarts.
-	if s.configVersion == 0 && s.Engine != nil {
-		_, persistedVersion, err := s.Engine.GetSystemConfig()
-		if err != nil {
-			return nil, internal("load persisted config version", err)
-		}
-		if persistedVersion > s.configVersion {
-			s.configVersion = persistedVersion
-		}
+	if hook := s.beforeRuntimeConfigLockHook; hook != nil {
+		hook()
+	}
+	if err := s.configMu.lockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer s.configMu.unlock()
+	if hook := s.afterRuntimeConfigLockHook; hook != nil {
+		hook()
 	}
 
-	// 5. Persist.
-	newVersion := s.configVersion + 1
-	if err := s.Engine.SaveSystemConfig(newCfg, newVersion, time.Now().UnixNano()); err != nil {
-		return nil, internal("persist config", err)
+	var published *config.RuntimeConfig
+	err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		// 3. Deep-copy current config → apply patch.
+		newCfg := copyRuntimeConfig(s.RuntimeCfg.Load())
+		if verr := parseRuntimeConfigPatch(patchJSON, newCfg); verr != nil {
+			return verr
+		}
+
+		// 4. Additional validation.
+		if err := validateRuntimeConfig(newCfg); err != nil {
+			return err
+		}
+
+		// On process start, initialize local configVersion from persisted state
+		// so PATCH keeps monotonically increasing versions across restarts.
+		if s.configVersion == 0 && s.Engine != nil {
+			_, persistedVersion, err := s.Engine.GetSystemConfigContext(writeCtx)
+			if err != nil {
+				return internal("load persisted config version", err)
+			}
+			if persistedVersion > s.configVersion {
+				s.configVersion = persistedVersion
+			}
+		}
+
+		// 5. Persist.
+		newVersion := s.configVersion + 1
+		if err := s.Engine.SaveSystemConfigContext(writeCtx, newCfg, newVersion, time.Now().UnixNano()); err != nil {
+			return internal("persist config", err)
+		}
+		if hook := s.afterRuntimeConfigPersistHook; hook != nil {
+			hook()
+		}
+
+		// 6. Atomic swap.
+		s.RuntimeCfg.Store(newCfg)
+		s.configVersion = newVersion
+		published = newCfg
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// 6. Atomic swap.
-	s.RuntimeCfg.Store(newCfg)
-	s.configVersion = newVersion
-
-	return newCfg, nil
+	return published, nil
 }
 
 func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
@@ -206,18 +437,8 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")
 	}
-	// Request log bytes fields must be non-negative.
-	if cfg.ReverseProxyLogReqHeadersMaxBytes < 0 {
-		return invalidArg("reverse_proxy_log_req_headers_max_bytes: must be non-negative")
-	}
-	if cfg.ReverseProxyLogReqBodyMaxBytes < 0 {
-		return invalidArg("reverse_proxy_log_req_body_max_bytes: must be non-negative")
-	}
-	if cfg.ReverseProxyLogRespHeadersMaxBytes < 0 {
-		return invalidArg("reverse_proxy_log_resp_headers_max_bytes: must be non-negative")
-	}
-	if cfg.ReverseProxyLogRespBodyMaxBytes < 0 {
-		return invalidArg("reverse_proxy_log_resp_body_max_bytes: must be non-negative")
+	if err := config.ValidateRuntimeLogCaptureLimits(cfg); err != nil {
+		return invalidArg(err.Error())
 	}
 	minProbeInterval := 30 * time.Second
 	// Probe intervals must be at least 30s (DESIGN.md).
@@ -255,5 +476,15 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 			cfg.LatencyAuthorities = append(cfg.LatencyAuthorities, latencyDomain)
 		}
 	}
+	if err := node.ValidateLatencyAuthorities(cfg.LatencyAuthorities); err != nil {
+		return invalidArg("latency_authorities: " + err.Error())
+	}
 	return nil
+}
+
+// ValidateRuntimeConfig applies the same complete contract used by runtime
+// PATCH to a configuration loaded from persistence. The validator may append
+// the latency-test URL's authority to cfg, matching PATCH semantics.
+func ValidateRuntimeConfig(cfg *config.RuntimeConfig) error {
+	return validateRuntimeConfig(cfg)
 }

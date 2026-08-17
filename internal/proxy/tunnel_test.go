@@ -1,8 +1,14 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
+	"os"
+	"runtime"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -203,5 +209,231 @@ func TestPumpPreparedTunnelReader_ClientReadResetAfterIngressDoesNotFail(t *test
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected upstream side to finish")
+	}
+}
+
+type scriptedTunnelConn struct {
+	readFn       func([]byte) (int, error)
+	writeFn      func([]byte) (int, error)
+	closeWriteFn func() error
+}
+
+func (c *scriptedTunnelConn) Read(p []byte) (int, error) {
+	return c.readFn(p)
+}
+
+func (c *scriptedTunnelConn) Write(p []byte) (int, error) {
+	return c.writeFn(p)
+}
+
+func (c *scriptedTunnelConn) Close() error { return nil }
+
+func (c *scriptedTunnelConn) CloseWrite() error {
+	if c.closeWriteFn != nil {
+		return c.closeWriteFn()
+	}
+	return nil
+}
+
+func (c *scriptedTunnelConn) LocalAddr() net.Addr  { return stubAddr("local") }
+func (c *scriptedTunnelConn) RemoteAddr() net.Addr { return stubAddr("remote") }
+
+func (c *scriptedTunnelConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedTunnelConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedTunnelConn) SetWriteDeadline(time.Time) error { return nil }
+
+type delayedCancelTunnelContext struct {
+	done     chan struct{}
+	canceled atomic.Bool
+}
+
+func newDelayedCancelTunnelContext() *delayedCancelTunnelContext {
+	return &delayedCancelTunnelContext{done: make(chan struct{})}
+}
+
+func (c *delayedCancelTunnelContext) requestCancel() {
+	c.canceled.Store(true)
+}
+
+func (c *delayedCancelTunnelContext) release() {
+	close(c.done)
+}
+
+func (c *delayedCancelTunnelContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *delayedCancelTunnelContext) Done() <-chan struct{}       { return c.done }
+func (c *delayedCancelTunnelContext) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+func (c *delayedCancelTunnelContext) Value(any) any { return nil }
+
+type cancelOnCloseTunnelConn struct {
+	*scriptedTunnelConn
+	onClose func()
+}
+
+func (c *cancelOnCloseTunnelConn) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
+
+func TestPumpPreparedTunnelReader_CancellationAfterCopiesBeforeMonitorStopIsNotFailure(t *testing.T) {
+	ctx := newDelayedCancelTunnelContext()
+	defer ctx.release()
+
+	clientConn := &cancelOnCloseTunnelConn{
+		scriptedTunnelConn: &scriptedTunnelConn{
+			readFn:  func([]byte) (int, error) { return 0, io.EOF },
+			writeFn: func(p []byte) (int, error) { return len(p), nil },
+		},
+		onClose: ctx.requestCancel,
+	}
+	upstreamConn := &scriptedTunnelConn{
+		readFn:  func([]byte) (int, error) { return 0, io.EOF },
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+	}
+
+	result := pumpPreparedTunnelReader(
+		clientConn,
+		clientConn,
+		&preparedTunnel{upstreamConn: upstreamConn},
+		tunnelPumpOptions{
+			ctx:                         ctx,
+			requireBidirectionalTraffic: true,
+		},
+	)
+	if !result.canceled {
+		t.Fatalf("cancellation after copies was not classified as cancellation: %+v", result)
+	}
+	if !result.netOK || result.proxyErr != nil || result.upstreamStage != "" {
+		t.Fatalf("cancellation after copies became a relay failure: %+v", result)
+	}
+}
+
+func TestPumpPreparedTunnelReader_ClientReadResetAfterIngressIsOrdered(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("covers the Windows WSA connection-reset error contract")
+	}
+
+	const request = "client-hello"
+	const response = "server-reply"
+	resetErr := &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "wsarecv", Err: syscall.Errno(10054)},
+	}
+
+	allowReset := make(chan struct{})
+	ingressDone := make(chan struct{}, 1)
+	clientReads := 0
+	clientConn := &scriptedTunnelConn{
+		readFn: func(p []byte) (int, error) {
+			clientReads++
+			if clientReads == 1 {
+				return copy(p, request), nil
+			}
+			<-allowReset
+			return 0, resetErr
+		},
+		writeFn: func(p []byte) (int, error) {
+			if string(p) != response {
+				return 0, io.ErrUnexpectedEOF
+			}
+			return len(p), nil
+		},
+		closeWriteFn: func() error {
+			ingressDone <- struct{}{}
+			return nil
+		},
+	}
+
+	requestWritten := make(chan struct{}, 1)
+	upstreamReads := 0
+	upstreamConn := &scriptedTunnelConn{
+		readFn: func(p []byte) (int, error) {
+			upstreamReads++
+			if upstreamReads == 1 {
+				<-requestWritten
+				return copy(p, response), nil
+			}
+			return 0, io.EOF
+		},
+		writeFn: func(p []byte) (int, error) {
+			if string(p) != request {
+				return 0, io.ErrUnexpectedEOF
+			}
+			requestWritten <- struct{}{}
+			return len(p), nil
+		},
+	}
+
+	resultCh := make(chan tunnelRelayResult, 1)
+	go func() {
+		resultCh <- pumpPreparedTunnelReader(
+			clientConn,
+			clientConn,
+			&preparedTunnel{
+				upstreamConn: upstreamConn,
+				recordResult: func(bool) {},
+			},
+			tunnelPumpOptions{},
+		)
+	}()
+
+	select {
+	case <-ingressDone:
+	case <-time.After(time.Second):
+		t.Fatal("expected ingress copy to finish before releasing client reset")
+	}
+	close(allowReset)
+
+	select {
+	case result := <-resultCh:
+		if !result.netOK {
+			t.Fatalf("netOK: got false, want true (stage=%q err=%v)", result.upstreamStage, result.upstreamErr)
+		}
+		if result.proxyErr != nil || result.upstreamStage != "" {
+			t.Fatalf("unexpected relay error: proxyErr=%+v stage=%q err=%v", result.proxyErr, result.upstreamStage, result.upstreamErr)
+		}
+		if result.ingressBytes != int64(len(response)) || result.egressBytes != int64(len(request)) {
+			t.Fatalf("bytes: ingress=%d egress=%d, want ingress=%d egress=%d", result.ingressBytes, result.egressBytes, len(response), len(request))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected ordered tunnel relay result")
+	}
+}
+
+func TestPumpPreparedTunnelReader_CancellationDoesNotHideRealCopyError(t *testing.T) {
+	sentinelErr := errors.New("upstream copy failed before cancellation")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	clientConn := &scriptedTunnelConn{
+		readFn:  func([]byte) (int, error) { return 0, sentinelErr },
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+	}
+	upstreamConn := &scriptedTunnelConn{
+		readFn:  func([]byte) (int, error) { return 0, io.EOF },
+		writeFn: func(p []byte) (int, error) { return len(p), nil },
+	}
+
+	result := pumpPreparedTunnelReader(
+		clientConn,
+		clientConn,
+		&preparedTunnel{upstreamConn: upstreamConn},
+		tunnelPumpOptions{ctx: ctx},
+	)
+	if result.canceled {
+		t.Fatal("real copy error was incorrectly classified as cancellation")
+	}
+	if result.netOK {
+		t.Fatal("real copy error was incorrectly classified as network success")
+	}
+	if result.proxyErr == nil || result.upstreamErr == nil {
+		t.Fatalf("real copy error was lost: proxyErr=%v upstreamErr=%v", result.proxyErr, result.upstreamErr)
 	}
 }

@@ -1,12 +1,14 @@
 package service
 
 import (
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/routing"
+	"github.com/Resinat/Resin/internal/state"
 )
 
 // ------------------------------------------------------------------
@@ -22,6 +24,22 @@ type LeaseResponse struct {
 	EgressIP     string `json:"egress_ip"`
 	Expiry       string `json:"expiry"`
 	LastAccessed string `json:"last_accessed"`
+}
+
+// withLeaseMutation keeps the state-write admission open through a control
+// plane lease mutation and its synchronous Router lease event. Test-only
+// services without persistence keep the existing in-memory behavior.
+func (s *ControlPlaneService) withLeaseMutation(fn func() error) error {
+	if s.Engine == nil {
+		return fn()
+	}
+	if err := s.Engine.WithStateWriteAdmission(fn); err != nil {
+		if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
+			return internal("lease mutation", err)
+		}
+		return err
+	}
+	return nil
 }
 
 func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
@@ -53,42 +71,60 @@ func (s *ControlPlaneService) resolveLeaseNodeTagFromHex(hashHex string) string 
 
 // ListLeases returns all leases for a platform.
 func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, error) {
-	if _, ok := s.Pool.GetPlatform(platformID); !ok {
-		return nil, notFound("platform not found")
+	if s.beforeLeaseServiceRouterReadHook != nil {
+		s.beforeLeaseServiceRouterReadHook()
 	}
 	var result []LeaseResponse
-	s.Router.RangeLeases(platformID, func(account string, lease routing.Lease) bool {
-		result = append(result, leaseToResponse(model.Lease{
-			PlatformID:     platformID,
-			Account:        account,
-			NodeHash:       lease.NodeHash.Hex(),
-			EgressIP:       lease.EgressIP.String(),
-			ExpiryNs:       lease.ExpiryNs,
-			LastAccessedNs: lease.LastAccessedNs,
-		}, s.resolveLeaseNodeTag(lease.NodeHash)))
-		return true
+	var resultErr error
+	s.withRuntimeRead(func() {
+		leases, exists := s.Router.ListLeasesForPlatform(platformID)
+		if !exists {
+			resultErr = notFound("platform not found")
+			return
+		}
+		result = make([]LeaseResponse, 0, len(leases))
+		for _, lease := range leases {
+			result = append(result, leaseToResponse(lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
+		}
 	})
-	if result == nil {
-		result = []LeaseResponse{}
+	if resultErr != nil {
+		return nil, resultErr
 	}
 	return result, nil
 }
 
 // GetLease returns a single lease.
 func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseResponse, error) {
-	if _, ok := s.Pool.GetPlatform(platformID); !ok {
-		return nil, notFound("platform not found")
+	var result *LeaseResponse
+	var resultErr error
+	s.withRuntimeRead(func() {
+		ml, exists := s.Router.ReadLeaseForPlatform(model.LeaseKey{PlatformID: platformID, Account: account})
+		if !exists {
+			resultErr = notFound("platform not found")
+			return
+		}
+		if ml == nil {
+			resultErr = notFound("lease not found")
+			return
+		}
+		resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
+		result = &resp
+	})
+	if resultErr != nil {
+		return nil, resultErr
 	}
-	ml := s.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: account})
-	if ml == nil {
-		return nil, notFound("lease not found")
-	}
-	resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
-	return &resp, nil
+	return result, nil
 }
 
 // InheritLeaseByPlatformName copies a valid parent lease onto newAccount.
 func (s *ControlPlaneService) InheritLeaseByPlatformName(platformName, parentAccount, newAccount string) error {
+	return s.inheritLeaseByPlatformNameAt(platformName, parentAccount, newAccount, time.Now())
+}
+
+func (s *ControlPlaneService) inheritLeaseByPlatformNameAt(
+	platformName, parentAccount, newAccount string,
+	now time.Time,
+) error {
 	platformName = strings.TrimSpace(platformName)
 	if platformName == "" {
 		return invalidArg("platform: must be non-empty")
@@ -105,24 +141,32 @@ func (s *ControlPlaneService) InheritLeaseByPlatformName(platformName, parentAcc
 		return invalidArg("new_account: must differ from parent_account")
 	}
 
+	s.platformMu.Lock()
+	defer s.platformMu.Unlock()
+
 	plat, ok := s.Pool.GetPlatformByName(platformName)
 	if !ok || plat == nil {
 		return notFound("platform not found")
 	}
 
-	parentLease := s.Router.ReadLease(model.LeaseKey{
-		PlatformID: plat.ID,
-		Account:    parentAccount,
-	})
-	nowNs := time.Now().UnixNano()
-	if parentLease == nil || parentLease.ExpiryNs < nowNs {
-		return notFound("parent lease not found")
+	if hook := s.beforeLeaseInheritanceRouterCallHook; hook != nil {
+		hook()
 	}
 
-	next := *parentLease
-	next.Account = newAccount
-	if err := s.Router.UpsertLease(next); err != nil {
-		return internal("inherit lease", err)
+	if err := s.withLeaseMutation(func() error {
+		if err := s.Router.InheritLeaseForPlatformExact(plat, parentAccount, newAccount, now); err != nil {
+			switch {
+			case errors.Is(err, routing.ErrPlatformNotFound):
+				return notFound("platform not found")
+			case errors.Is(err, routing.ErrLeaseNotFound):
+				return notFound("parent lease not found")
+			default:
+				return internal("inherit lease", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	return nil
@@ -130,22 +174,27 @@ func (s *ControlPlaneService) InheritLeaseByPlatformName(platformName, parentAcc
 
 // DeleteLease removes a single lease.
 func (s *ControlPlaneService) DeleteLease(platformID, account string) error {
-	if _, ok := s.Pool.GetPlatform(platformID); !ok {
-		return notFound("platform not found")
-	}
-	if !s.Router.DeleteLease(platformID, account) {
-		return notFound("lease not found")
-	}
-	return nil
+	return s.withLeaseMutation(func() error {
+		deleted, exists := s.Router.DeleteLeaseForPlatform(platformID, account)
+		if !exists {
+			return notFound("platform not found")
+		}
+		if !deleted {
+			return notFound("lease not found")
+		}
+		return nil
+	})
 }
 
 // DeleteAllLeases removes all leases for a platform.
 func (s *ControlPlaneService) DeleteAllLeases(platformID string) error {
-	if _, ok := s.Pool.GetPlatform(platformID); !ok {
-		return notFound("platform not found")
-	}
-	s.Router.DeleteAllLeases(platformID)
-	return nil
+	return s.withLeaseMutation(func() error {
+		_, exists := s.Router.DeleteAllLeasesForPlatform(platformID)
+		if !exists {
+			return notFound("platform not found")
+		}
+		return nil
+	})
 }
 
 // IPLoadEntry is the API response for IP load stats.
@@ -156,10 +205,10 @@ type IPLoadEntry struct {
 
 // GetIPLoad returns IP load stats for a platform.
 func (s *ControlPlaneService) GetIPLoad(platformID string) ([]IPLoadEntry, error) {
-	if _, ok := s.Pool.GetPlatform(platformID); !ok {
+	snapshot, exists := s.Router.SnapshotIPLoadForPlatform(platformID)
+	if !exists {
 		return nil, notFound("platform not found")
 	}
-	snapshot := s.Router.SnapshotIPLoad(platformID)
 	result := make([]IPLoadEntry, 0, len(snapshot))
 	for ip, count := range snapshot {
 		result = append(result, IPLoadEntry{

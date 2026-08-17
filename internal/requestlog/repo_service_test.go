@@ -1,18 +1,249 @@
 package requestlog
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/proxy"
+	"github.com/Resinat/Resin/internal/state"
 )
 
 func ptrInt(v int) *int { return &v }
+
+func TestRepo_InsertBatchContext_DiscardsConnectionWhenBusyTimeoutRestoreFails(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	repo.activeDB.SetMaxOpenConns(1)
+	repo.beforeContextConnResetHook = func(conn *sql.Conn) {
+		if err := conn.Raw(func(driverConn any) error {
+			closer, ok := driverConn.(interface{ Close() error })
+			if !ok {
+				return fmt.Errorf("driver connection %T does not expose Close", driverConn)
+			}
+			return closer.Close()
+		}); err != nil {
+			t.Fatalf("close raw driver connection: %v", err)
+		}
+	}
+
+	entry := proxy.RequestLogEntry{
+		ID:          "restore-failure-1",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+	}
+	if n, err := repo.InsertBatchContext(context.Background(), []proxy.RequestLogEntry{entry}); err != nil || n != 1 {
+		t.Fatalf("InsertBatchContext: n=%d err=%v, want n=1 and no error", n, err)
+	}
+
+	entry.ID = "restore-failure-2"
+	if n, err := repo.InsertBatch([]proxy.RequestLogEntry{entry}); err != nil || n != 1 {
+		t.Fatalf("ordinary InsertBatch after failed restore: n=%d err=%v, want n=1 and no error", n, err)
+	}
+	if row, err := repo.GetByID(entry.ID); err != nil || row == nil {
+		t.Fatalf("GetByID after failed restore: row=%v err=%v", row, err)
+	}
+}
+
+func TestRepo_InsertBatchContext_CanceledBeforeRotationHasNoSideEffects(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	// Set the threshold after Open so the test forces the real rotation check;
+	// NewRepo intentionally normalizes non-positive configuration values.
+	repo.maxBytes = 0
+	beforeDB := repo.activeDB
+	beforePath := repo.activePath
+	beforeFiles, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("list files before canceled insert: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := repo.InsertBatchContext(ctx, []proxy.RequestLogEntry{{ID: "must-not-rotate"}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("InsertBatchContext error = %v, want context.Canceled", err)
+	}
+
+	afterFiles, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("list files after canceled insert: %v", err)
+	}
+	if repo.activeDB != beforeDB || repo.activePath != beforePath {
+		t.Fatalf("canceled insert changed active owner: before=(%p,%q), after=(%p,%q)", beforeDB, beforePath, repo.activeDB, repo.activePath)
+	}
+	if !reflect.DeepEqual(afterFiles, beforeFiles) {
+		t.Fatalf("canceled insert changed request-log files: before=%v, after=%v", beforeFiles, afterFiles)
+	}
+	row, err := repo.GetByID("must-not-rotate")
+	if err != nil {
+		t.Fatalf("GetByID after canceled insert: %v", err)
+	}
+	if row != nil {
+		t.Fatalf("canceled insert wrote request-log row: %+v", row)
+	}
+}
+
+func TestRepo_InsertBatchContext_CanceledBeforeRotationCommitDiscardsPreparedDB(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	repo.maxBytes = 0
+
+	beforeDB := repo.activeDB
+	beforePath := repo.activePath
+	beforeFiles, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("list files before staged rotation: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stagedDB *sql.DB
+	var stagedPath string
+	repo.beforeContextRotationCommitHook = func(db *sql.DB, path string) {
+		stagedDB = db
+		stagedPath = path
+		cancel()
+	}
+
+	if _, err := repo.InsertBatchContext(ctx, []proxy.RequestLogEntry{{ID: "must-not-commit-rotation"}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("InsertBatchContext error = %v, want context.Canceled", err)
+	}
+	if stagedDB == nil || stagedPath == "" {
+		t.Fatal("rotation did not reach the prepared-db commit seam")
+	}
+	if err := stagedDB.Ping(); err == nil {
+		t.Fatal("canceled rotation left the staged database open")
+	}
+	if repo.activeDB != beforeDB || repo.activePath != beforePath {
+		t.Fatalf("canceled rotation changed active owner: before=(%p,%q), after=(%p,%q)", beforeDB, beforePath, repo.activeDB, repo.activePath)
+	}
+	afterFiles, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("list files after canceled staged rotation: %v", err)
+	}
+	if !reflect.DeepEqual(afterFiles, beforeFiles) {
+		t.Fatalf("canceled rotation changed request-log files: before=%v, after=%v", beforeFiles, afterFiles)
+	}
+	if _, err := os.Stat(stagedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged request-log artifact still exists: path=%q err=%v", stagedPath, err)
+	}
+	row, err := repo.GetByID("must-not-commit-rotation")
+	if err != nil {
+		t.Fatalf("GetByID after canceled staged rotation: %v", err)
+	}
+	if row != nil {
+		t.Fatalf("canceled rotation wrote request-log row: %+v", row)
+	}
+}
+
+func TestService_StopContextWaitsForDBLockReleasedBeforeDeadline(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	blocker, err := state.OpenDB(repo.activePath)
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err := blocker.Begin()
+	if err != nil {
+		blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO request_logs (id, ts_ns, proxy_type) VALUES (?, ?, ?)", "held-until-release", 1, 1); err != nil {
+		tx.Rollback()
+		blocker.Close()
+		t.Fatalf("blocker lock write: %v", err)
+	}
+
+	var releaseOnce sync.Once
+	released := make(chan struct{})
+	release := func() {
+		releaseOnce.Do(func() {
+			_ = tx.Rollback()
+			_ = blocker.Close()
+			close(released)
+		})
+	}
+	defer release()
+
+	beginReady := make(chan struct{})
+	allowBegin := make(chan struct{})
+	var beginOnce sync.Once
+	gateBegin := func() {
+		beginOnce.Do(func() {
+			close(beginReady)
+			<-allowBegin
+		})
+	}
+	repo.beforeContextTxBeginHook = gateBegin
+	repo.beforeTxBeginHook = gateBegin
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "waited-request-log",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.StopContext(ctx) }()
+	select {
+	case <-beginReady:
+	case <-time.After(time.Second):
+		t.Fatal("requestlog final drain did not reach transaction begin gate")
+	}
+	close(allowBegin)
+	timer := time.AfterFunc(250*time.Millisecond, release)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		t.Fatalf("requestlog StopContext returned before the held lock was released: %v", err)
+	case <-released:
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("StopContext after lock release: %v", err)
+	}
+	row, err := repo.GetByID("waited-request-log")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if row == nil {
+		t.Fatal("requestlog final drain lost the row after the lock was released")
+	}
+}
 
 func TestRepo_InsertListGetPayloads(t *testing.T) {
 	repo := NewRepo(t.TempDir(), 1<<20, 5)
@@ -244,6 +475,239 @@ func TestRepo_InsertListGetPayloads(t *testing.T) {
 	}
 }
 
+func TestRepo_ListDoesNotLoseSnapshottedShardDuringRotation(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 1)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	if _, err := repo.InsertBatch([]proxy.RequestLogEntry{{
+		ID:          "must-survive-list-rotation",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+	}}); err != nil {
+		t.Fatalf("seed request log: %v", err)
+	}
+
+	// Force the next production InsertBatch path to rotate before inserting.
+	repo.maxBytes = 1
+	readSnapshotted := make(chan struct{})
+	allowReadOpen := make(chan struct{})
+	rotationReached := make(chan struct{})
+	writeBlocked := make(chan struct{})
+	allowInsert := make(chan struct{})
+	var releaseReadOnce, releaseInsertOnce sync.Once
+	releaseRead := func() { releaseReadOnce.Do(func() { close(allowReadOpen) }) }
+	releaseInsert := func() { releaseInsertOnce.Do(func() { close(allowInsert) }) }
+	t.Cleanup(func() {
+		releaseRead()
+		releaseInsert()
+	})
+	repo.beforeReadShardOpenHook = func(files []string) {
+		if len(files) == 0 {
+			t.Errorf("read snapshot unexpectedly empty")
+		}
+		close(readSnapshotted)
+		<-allowReadOpen
+	}
+	repo.beforeTxBeginHook = func() {
+		close(rotationReached)
+		<-allowInsert
+	}
+	repo.beforeWriteShardWaitHook = func() {
+		close(writeBlocked)
+	}
+
+	type listResult struct {
+		rows []LogSummary
+		err  error
+	}
+	listDone := make(chan listResult, 1)
+	go func() {
+		rows, _, _, err := repo.List(ListFilter{Limit: 10})
+		listDone <- listResult{rows: rows, err: err}
+	}()
+	<-readSnapshotted
+
+	insertDone := make(chan error, 1)
+	go func() {
+		_, err := repo.InsertBatch([]proxy.RequestLogEntry{{
+			ID:          "rotation-trigger",
+			StartedAtNs: time.Now().UnixNano(),
+			ProxyType:   proxy.ProxyTypeForward,
+		}})
+		insertDone <- err
+	}()
+	// The writer must wait for the read lease before it can prepare/commit a
+	// rotation. The pre-fix path signaled rotationReached here, which is the
+	// deterministic old-code red state captured separately.
+	select {
+	case <-writeBlocked:
+	case <-rotationReached:
+		t.Fatal("rotation started while a reader still held its shard snapshot")
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation writer did not reach the shard wait gate")
+	}
+
+	releaseRead()
+	result := <-listDone
+	if result.err != nil {
+		t.Fatalf("repo.List: %v", result.err)
+	}
+	found := false
+	for _, row := range result.rows {
+		if row.ID == "must-survive-list-rotation" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		releaseInsert()
+		t.Fatalf("list lost a row from its shard snapshot during concurrent rotation: %+v", result.rows)
+	}
+
+	releaseInsert()
+	if err := <-insertDone; err != nil {
+		t.Fatalf("rotation-trigger insert: %v", err)
+	}
+}
+
+func TestRepo_CloseContextDoesNotWaitPastReadLeaseDeadline(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 2)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+
+	readSnapshotted := make(chan struct{})
+	allowReadOpen := make(chan struct{})
+	writeBlocked := make(chan struct{})
+	var releaseReadOnce sync.Once
+	releaseRead := func() { releaseReadOnce.Do(func() { close(allowReadOpen) }) }
+	t.Cleanup(func() {
+		releaseRead()
+		_ = repo.Close()
+	})
+	repo.beforeReadShardOpenHook = func(files []string) {
+		if len(files) == 0 {
+			t.Errorf("read snapshot unexpectedly empty")
+		}
+		close(readSnapshotted)
+		<-allowReadOpen
+	}
+	repo.beforeWriteShardWaitHook = func() {
+		close(writeBlocked)
+	}
+
+	listDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := repo.List(ListFilter{Limit: 10})
+		listDone <- err
+	}()
+	<-readSnapshotted
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- repo.CloseContext(stopCtx) }()
+	<-writeBlocked
+	cancel()
+	if err := <-closeDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("CloseContext error = %v, want context.Canceled", err)
+	}
+	if repo.activeDB == nil {
+		t.Fatal("CloseContext closed the active DB after its deadline")
+	}
+
+	releaseRead()
+	if err := <-listDone; err != nil {
+		t.Fatalf("repo.List after canceled CloseContext: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("repo.Close after read lease release: %v", err)
+	}
+}
+
+func TestRepo_ListContextCancellationWhileWriterPending(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 2)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+
+	readEntered := make(chan struct{})
+	allowRead := make(chan struct{})
+	writerWaiting := make(chan struct{})
+	readWaiting := make(chan struct{})
+	var readOnce, writerOnce, waitOnce, releaseOnce sync.Once
+	releaseRead := func() { releaseOnce.Do(func() { close(allowRead) }) }
+	t.Cleanup(func() {
+		releaseRead()
+		_ = repo.Close()
+	})
+	repo.beforeReadShardOpenHook = func(files []string) {
+		if len(files) == 0 {
+			t.Error("read snapshot unexpectedly empty")
+		}
+		readOnce.Do(func() { close(readEntered) })
+		<-allowRead
+	}
+	repo.beforeWriteShardWaitHook = func() {
+		writerOnce.Do(func() { close(writerWaiting) })
+	}
+	repo.beforeReadShardWaitHook = func() {
+		waitOnce.Do(func() { close(readWaiting) })
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := repo.List(ListFilter{Limit: 10})
+		firstDone <- err
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first request-log reader did not acquire its read snapshot")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- repo.CloseContext(context.Background()) }()
+	select {
+	case <-writerWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("request-log close did not become a queued writer")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := repo.ListContext(ctx, ListFilter{Limit: 10})
+		secondDone <- err
+	}()
+	select {
+	case <-readWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("canceled request-log reader did not reach the writer-priority gate")
+	}
+	cancel()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ListContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		releaseRead()
+		t.Fatal("ListContext remained blocked after its request context was canceled")
+	}
+
+	releaseRead()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first List: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseContext: %v", err)
+	}
+}
+
 func TestService_FlushesByBatchSize(t *testing.T) {
 	repo := NewRepo(t.TempDir(), 1<<20, 5)
 	if err := repo.Open(); err != nil {
@@ -298,6 +762,668 @@ func TestService_FlushesByBatchSize(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for service flush")
+}
+
+func TestService_StopRejectsLateEmit(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+	svc.Stop()
+
+	svc.EmitRequestLog(proxy.RequestLogEntry{ID: "late-log"})
+	if got := len(svc.queue); got != 0 {
+		t.Fatalf("late request log entered stopped queue: %d", got)
+	}
+}
+
+func TestService_StopBeforeStartFlushesQueuedEntries(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "before-start",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	svc.Stop()
+
+	row, err := repo.GetByID("before-start")
+	if err != nil {
+		t.Fatalf("repo.GetByID: %v", err)
+	}
+	if row == nil {
+		t.Fatal("Stop before Start dropped a queued request log")
+	}
+}
+
+func TestService_StopContextTimeoutOwnerDrainsQueuedEntry(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	stopFinalDrainEntered := make(chan struct{})
+	allowStopFinalDrain := make(chan struct{})
+	svc.beforeStopFinalDrainHook = func() {
+		close(stopFinalDrainEntered)
+		<-allowStopFinalDrain
+	}
+	svc.Start()
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "timeout-owner-drain",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- svc.StopContext(ctx) }()
+	select {
+	case <-stopFinalDrainEntered:
+	case <-time.After(time.Second):
+		t.Fatal("requestlog stop did not reach final drain gate")
+	}
+	<-ctx.Done()
+	var firstErr error
+	select {
+	case firstErr = <-firstDone:
+		if !errors.Is(firstErr, context.DeadlineExceeded) {
+			t.Fatalf("first StopContext error = %v, want deadline exceeded", firstErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		close(allowStopFinalDrain)
+		<-firstDone
+		t.Fatal("first StopContext did not honor its caller deadline")
+	}
+	close(allowStopFinalDrain)
+
+	if err := svc.StopContext(context.Background()); err != nil {
+		t.Fatalf("owner StopContext after waiter timeout: %v", err)
+	}
+	row, err := repo.GetByID("timeout-owner-drain")
+	if err != nil {
+		t.Fatalf("GetByID after owner drain: %v", err)
+	}
+	if row == nil {
+		t.Fatal("requestlog owner dropped queued entry after waiter timeout")
+	}
+}
+
+func TestService_StopContextCanceledBeforeStartStillDrainsQueue(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "canceled-pre-start",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := svc.StopContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first StopContext error = %v, want context canceled", err)
+	}
+	if err := svc.StopContext(context.Background()); err != nil {
+		t.Fatalf("owner StopContext after canceled waiter: %v", err)
+	}
+	row, err := repo.GetByID("canceled-pre-start")
+	if err != nil {
+		t.Fatalf("GetByID after canceled waiter: %v", err)
+	}
+	if row == nil {
+		t.Fatal("pre-start queue entry was dropped after canceled waiter")
+	}
+}
+
+func TestService_StopContextHonorsDeadlineDuringDBFlush(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "blocked-request-log",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	blocker, err := state.OpenDB(repo.activePath)
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err := blocker.Begin()
+	if err != nil {
+		blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO request_logs (id, ts_ns, proxy_type) VALUES (?, ?, ?)", "held-request-lock", 1, 1); err != nil {
+		tx.Rollback()
+		blocker.Close()
+		t.Fatalf("blocker lock write: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+		_ = blocker.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- svc.StopContext(ctx) }()
+
+	select {
+	case err := <-stopDone:
+		if err == nil {
+			t.Fatal("StopContext succeeded while requestlog DB lock was held")
+		}
+	case <-time.After(250 * time.Millisecond):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		select {
+		case <-stopDone:
+		case <-time.After(7 * time.Second):
+		}
+		t.Fatal("StopContext ignored shutdown deadline during requestlog DB flush")
+	}
+}
+
+func TestService_StopContextCancelsReadBarrierFlush(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "barrier-cancel-request",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	blocker, err := state.OpenDB(repo.activePath)
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err := blocker.Begin()
+	if err != nil {
+		blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO request_logs (id, ts_ns, proxy_type) VALUES (?, ?, ?)", "barrier-held-lock", 1, 1); err != nil {
+		tx.Rollback()
+		blocker.Close()
+		t.Fatalf("blocker lock write: %v", err)
+	}
+
+	beginEntered := make(chan struct{})
+	var beginOnce sync.Once
+	repo.beforeTxBeginHook = func() { beginOnce.Do(func() { close(beginEntered) }) }
+	connReleased := make(chan struct{})
+	var connReleaseOnce sync.Once
+	repo.beforeContextConnResetHook = func(*sql.Conn) {
+		connReleaseOnce.Do(func() { close(connReleased) })
+	}
+	flushDone := make(chan struct{})
+	go func() {
+		svc.FlushNow()
+		close(flushDone)
+	}()
+	select {
+	case <-beginEntered:
+	case <-time.After(time.Second):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		t.Fatal("FlushNow did not reach the SQLite transaction begin")
+	}
+
+	stopWaiting := make(chan struct{})
+	svc.beforeStopWorkerWaitHook = func() { close(stopWaiting) }
+	finalDrainReady := make(chan struct{})
+	allowFinalDrain := make(chan struct{})
+	svc.beforeStopFinalDrainHook = func() {
+		close(finalDrainReady)
+		<-allowFinalDrain
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- svc.StopContext(ctx) }()
+	select {
+	case <-stopWaiting:
+	case <-time.After(time.Second):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		t.Fatal("StopContext did not reach worker wait")
+	}
+	cancel()
+
+	select {
+	case <-connReleased:
+		// The fixed implementation must cancel the barrier transaction and
+		// reach connection cleanup without waiting for the held SQLite lock.
+	case <-time.After(2 * time.Second):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		select {
+		case <-stopDone:
+		case <-time.After(7 * time.Second):
+		}
+		t.Fatal("canceled read barrier did not release its SQLite connection")
+	}
+	select {
+	case <-finalDrainReady:
+		// The barrier has returned and the worker is at the final-drain
+		// boundary. The waiter context is already canceled; release the final
+		// gate and the SQLite lock so the independent owner can finish.
+		close(allowFinalDrain)
+		_ = tx.Rollback()
+		_ = blocker.Close()
+	case <-time.After(2 * time.Second):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		select {
+		case <-stopDone:
+		case <-time.After(7 * time.Second):
+		}
+		t.Fatal("worker did not reach the final-drain boundary")
+	}
+	select {
+	case <-stopDone:
+		// Stop must finish after the canceled worker has released its
+		// connection, without waiting for the held writer lock.
+	case <-time.After(2 * time.Second):
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		select {
+		case <-stopDone:
+		case <-time.After(7 * time.Second):
+		}
+		t.Fatal("StopContext waited for an uninterruptible read barrier flush")
+	}
+
+	select {
+	case <-flushDone:
+	case <-time.After(time.Second):
+		t.Fatal("FlushNow did not finish after StopContext canceled the worker")
+	}
+}
+
+func TestService_StopContextRetriesAbortedReadBarrierBatch(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+
+	if _, err := repo.activeDB.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		t.Fatalf("set requestlog busy timeout: %v", err)
+	}
+	blocker, err := state.OpenDB(repo.activePath)
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err := blocker.Begin()
+	if err != nil {
+		_ = blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+		_ = blocker.Close()
+	}()
+	if _, err := tx.Exec("INSERT INTO request_logs (id, ts_ns, proxy_type) VALUES (?, ?, ?)", "barrier-retry-held-lock", 1, 1); err != nil {
+		t.Fatalf("blocker lock write: %v", err)
+	}
+
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "barrier-retry-request",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	beginEntered := make(chan struct{})
+	var beginOnce sync.Once
+	repo.beforeTxBeginHook = func() { beginOnce.Do(func() { close(beginEntered) }) }
+	flushDone := make(chan struct{})
+	go func() {
+		svc.FlushNow()
+		close(flushDone)
+	}()
+	select {
+	case <-beginEntered:
+	case <-time.After(time.Second):
+		t.Fatal("FlushNow did not reach the SQLite transaction begin")
+	}
+
+	stopWaiting := make(chan struct{})
+	svc.beforeStopWorkerWaitHook = func() { close(stopWaiting) }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- svc.StopContext(ctx) }()
+	select {
+	case <-stopWaiting:
+	case <-ctx.Done():
+		t.Fatal("StopContext did not reach worker wait before its deadline")
+	}
+
+	// Stop has canceled the worker's barrier context and is now waiting for
+	// it. Releasing the lock must let the retained batch go through the final
+	// drain using the still-live shutdown context.
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("release blocker transaction: %v", err)
+	}
+	if err := blocker.Close(); err != nil {
+		t.Fatalf("release blocker DB: %v", err)
+	}
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("StopContext: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("StopContext did not finish within its live shutdown budget")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(time.Second):
+		t.Fatal("FlushNow did not return after StopContext completed")
+	}
+
+	var count int
+	if err := repo.activeDB.QueryRow("SELECT COUNT(*) FROM request_logs WHERE id = ?", "barrier-retry-request").Scan(&count); err != nil {
+		t.Fatalf("count retried request log: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retried request log count = %d, want exactly one", count)
+	}
+}
+
+func TestService_FlushNowRetriesAfterShortAttemptWhileContextLives(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+
+	var blocker *sql.DB
+	var tx *sql.Tx
+	var err error
+	var released bool
+	allowFirstAttemptReset := make(chan struct{})
+	var allowResetOnce sync.Once
+	allowReset := func() {
+		allowResetOnce.Do(func() { close(allowFirstAttemptReset) })
+	}
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if tx != nil {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Errorf("release blocker transaction: %v", err)
+			}
+		}
+		if blocker != nil {
+			if err := blocker.Close(); err != nil {
+				t.Errorf("release blocker DB: %v", err)
+			}
+		}
+	}
+	defer func() {
+		release()
+		allowReset()
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := svc.StopContext(stopCtx); err != nil {
+			t.Errorf("StopContext cleanup: %v", err)
+		}
+		_ = repo.Close()
+	}()
+
+	blocker, err = state.OpenDB(repo.activePath)
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err = blocker.Begin()
+	if err != nil {
+		_ = blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO request_logs (id, ts_ns, proxy_type) VALUES (?, ?, ?)", "short-attempt-held-lock", 1, 1); err != nil {
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		t.Fatalf("blocker lock write: %v", err)
+	}
+
+	svc.EmitRequestLog(proxy.RequestLogEntry{
+		ID:          "short-attempt-retry-request",
+		StartedAtNs: time.Now().UnixNano(),
+		ProxyType:   proxy.ProxyTypeForward,
+		HTTPMethod:  "GET",
+		HTTPStatus:  200,
+		NetOK:       true,
+	})
+
+	firstBegin := make(chan struct{})
+	var beginOnce sync.Once
+	repo.beforeContextTxBeginHook = func() {
+		beginOnce.Do(func() { close(firstBegin) })
+	}
+	firstAttemptReleased := make(chan struct{})
+	var releaseOnce sync.Once
+	repo.beforeContextConnResetHook = func(*sql.Conn) {
+		releaseOnce.Do(func() { close(firstAttemptReleased) })
+		<-allowFirstAttemptReset
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		svc.FlushNow()
+		close(flushDone)
+	}()
+	select {
+	case <-firstBegin:
+	case <-time.After(time.Second):
+		t.Fatal("FlushNow did not enter the first context transaction")
+	}
+	select {
+	case <-firstAttemptReleased:
+		// The first 100ms attempt has ended while the write lock is still held.
+	case <-time.After(time.Second):
+		t.Fatal("first short SQLite attempt did not release its connection")
+	}
+	release()
+	allowReset()
+
+	select {
+	case <-flushDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushNow did not complete after the SQLite lock was released")
+	}
+
+	var count int
+	if err := repo.activeDB.QueryRow("SELECT COUNT(*) FROM request_logs WHERE id = ?", "short-attempt-retry-request").Scan(&count); err != nil {
+		t.Fatalf("count retried request log: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retried request log count = %d, want exactly one", count)
+	}
+}
+
+func TestService_ConcurrentStopWaitsForAdmittedEmit(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	defer repo.Close()
+
+	svc := NewService(ServiceConfig{
+		Repo:          repo,
+		QueueSize:     8,
+		FlushBatch:    1000,
+		FlushInterval: time.Hour,
+	})
+	svc.Start()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	svc.beforeEmitHook = func() {
+		close(entered)
+		<-release
+	}
+	stopAdmissionClosed := make(chan struct{})
+	svc.beforeEmitDrainHook = func() { close(stopAdmissionClosed) }
+
+	emitDone := make(chan struct{})
+	go func() {
+		svc.EmitRequestLog(proxy.RequestLogEntry{
+			ID:          "admitted-log",
+			StartedAtNs: time.Now().UnixNano(),
+			ProxyType:   proxy.ProxyTypeForward,
+			HTTPMethod:  "GET",
+			HTTPStatus:  200,
+			NetOK:       true,
+		})
+		close(emitDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("EmitRequestLog did not enter admission")
+	}
+
+	stop1Done := make(chan struct{})
+	stop2Done := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stop1Done)
+	}()
+	select {
+	case <-stopAdmissionClosed:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not close emit admission")
+	}
+	go func() {
+		svc.Stop()
+		close(stop2Done)
+	}()
+	select {
+	case <-stop1Done:
+		t.Fatal("first Stop returned before admitted emit completed")
+	case <-stop2Done:
+		t.Fatal("second Stop returned before the first Stop completed")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-emitDone:
+	case <-time.After(time.Second):
+		t.Fatal("admitted EmitRequestLog did not finish")
+	}
+	select {
+	case <-stop1Done:
+	case <-time.After(time.Second):
+		t.Fatal("first Stop did not finish")
+	}
+	select {
+	case <-stop2Done:
+	case <-time.After(time.Second):
+		t.Fatal("second Stop did not finish")
+	}
+
+	row, err := repo.GetByID("admitted-log")
+	if err != nil {
+		t.Fatalf("repo.GetByID: %v", err)
+	}
+	if row == nil {
+		t.Fatal("final Stop flush lost admitted request log")
+	}
 }
 
 func TestService_RepoReadFlushesQueuedLogs(t *testing.T) {

@@ -129,7 +129,7 @@ func TestBootstrapRestart_RecoversTopologyAndStickyLease(t *testing.T) {
 		Pool:            pool1,
 		Authorities:     func() []string { return []string{latencyHost} },
 		P2CWindow:       func() time.Duration { return 5 * time.Minute },
-		NodeTagResolver: pool1.ResolveNodeDisplayTag,
+		NodeTagResolver: pool1.ResolveNodeDisplayTagForEntry,
 	})
 
 	firstRoute, err := router1.RouteRequest(platformName, account, "https://example.com/restart")
@@ -184,7 +184,7 @@ func TestBootstrapRestart_RecoversTopologyAndStickyLease(t *testing.T) {
 		Pool:            pool2,
 		Authorities:     func() []string { return []string{latencyHost} },
 		P2CWindow:       func() time.Duration { return 5 * time.Minute },
-		NodeTagResolver: pool2.ResolveNodeDisplayTag,
+		NodeTagResolver: pool2.ResolveNodeDisplayTagForEntry,
 	})
 	leases, err := engine2.LoadAllLeases()
 	if err != nil {
@@ -325,18 +325,21 @@ func TestBootstrapRestart_RecoversObservabilityPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metrics.NewMetricsRepo(first): %v", err)
 	}
-	metricsMgr1 := metrics.NewManager(metrics.ManagerConfig{
-		Repo:                        metricsRepo1,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		BucketSeconds:               300,
-		ThroughputRealtimeCapacity:  16,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 16,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      16,
-		LeasesIntervalSec:           5,
+	metricsMgr1, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    metricsRepo1,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       5,
 	})
+	if err != nil {
+		t.Fatalf("metrics.NewManager(first): %v", err)
+	}
 	metricsMgr1.OnTrafficDelta(100, 200)
 	metricsMgr1.OnRequestFinished(proxy.RequestFinishedEvent{
 		PlatformID: platformID,
@@ -432,18 +435,21 @@ func TestBootstrapRestart_RecoversObservabilityPersistence(t *testing.T) {
 		t.Fatalf("lease lifetime rows: got %+v", leaseRows)
 	}
 
-	metricsMgr2 := metrics.NewManager(metrics.ManagerConfig{
-		Repo:                        metricsRepo2,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		BucketSeconds:               300,
-		ThroughputRealtimeCapacity:  16,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 16,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      16,
-		LeasesIntervalSec:           5,
+	metricsMgr2, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    metricsRepo2,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  16,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 16,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      16,
+		LeasesIntervalSec:       5,
 	})
+	if err != nil {
+		t.Fatalf("metrics.NewManager(second): %v", err)
+	}
 	if _, ok := metricsMgr2.ThroughputRing().Latest(); ok {
 		t.Fatal("realtime throughput ring should not be recovered after restart")
 	}

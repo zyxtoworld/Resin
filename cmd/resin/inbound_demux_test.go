@@ -69,6 +69,48 @@ type temporaryErrorListener struct {
 	acceptErr error
 }
 
+type gatedInboundConn struct {
+	net.Conn
+	readEntered chan struct{}
+	allowRead   chan struct{}
+	closed      chan struct{}
+	readOnce    sync.Once
+	allowOnce   sync.Once
+	closeOnce   sync.Once
+	closedOnce  sync.Once
+}
+
+func (c *gatedInboundConn) Read(p []byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readEntered) })
+	<-c.allowRead
+	return c.Conn.Read(p)
+}
+
+func (c *gatedInboundConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.releaseRead()
+		c.closedOnce.Do(func() { close(c.closed) })
+	})
+	return c.Conn.Close()
+}
+
+func (c *gatedInboundConn) releaseRead() {
+	c.allowOnce.Do(func() { close(c.allowRead) })
+}
+
+type wrappingInboundListener struct {
+	net.Listener
+	wrap func(net.Conn) net.Conn
+}
+
+func (l *wrappingInboundListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.wrap(conn), nil
+}
+
 func (l *temporaryErrorListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	if !l.issued {
@@ -892,7 +934,7 @@ func TestConnChannelListener_CloseRejectsQueuedConnAndFutureEnqueue(t *testing.T
 
 func TestInboundDemux_TryStartConnWorkerStopsOnceShutdownBegins(t *testing.T) {
 	demux := &inboundDemuxServer{}
-	if !demux.tryStartConnWorker() {
+	if !demux.tryStartConnWorker(nil) {
 		t.Fatal("expected initial worker registration to succeed")
 	}
 
@@ -909,7 +951,7 @@ func TestInboundDemux_TryStartConnWorkerStopsOnceShutdownBegins(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if demux.tryStartConnWorker() {
+	if demux.tryStartConnWorker(nil) {
 		t.Fatal("should reject new worker registration after shutdown begins")
 	}
 
@@ -922,5 +964,97 @@ func TestInboundDemux_TryStartConnWorkerStopsOnceShutdownBegins(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for shutdown after worker completion")
+	}
+}
+
+func TestInboundDemux_ShutdownClosesConnAdmittedBeforeHandlerStarts(t *testing.T) {
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	readEntered := make(chan struct{})
+	allowRead := make(chan struct{})
+	gated := &gatedInboundConn{
+		readEntered: readEntered,
+		allowRead:   allowRead,
+		closed:      make(chan struct{}),
+	}
+	listener := &wrappingInboundListener{
+		Listener: baseListener,
+		wrap: func(conn net.Conn) net.Conn {
+			gated.Conn = conn
+			return gated
+		},
+	}
+	demux := newInboundDemuxServer(&http.Server{Handler: http.NotFoundHandler()}, nil)
+	admissionReached := make(chan struct{})
+	allowAdmission := make(chan struct{})
+	var admissionOnce sync.Once
+	demux.afterConnWorkerAdmissionHook = func() {
+		admissionOnce.Do(func() {
+			close(admissionReached)
+			<-allowAdmission
+		})
+	}
+	snapshotReached := make(chan struct{})
+	allowShutdownContinue := make(chan struct{})
+	var snapshotOnce sync.Once
+	demux.afterActiveConnCloseHook = func() {
+		snapshotOnce.Do(func() {
+			close(snapshotReached)
+			<-allowShutdownContinue
+		})
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- demux.Serve(listener) }()
+
+	client, err := net.Dial("tcp", baseListener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case <-admissionReached:
+	case <-time.After(time.Second):
+		t.Fatal("connection was not admitted before handler handoff")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- demux.Shutdown(ctx) }()
+	<-ctx.Done()
+	select {
+	case <-snapshotReached:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not reach the active-connection snapshot")
+	}
+	select {
+	case <-gated.closed:
+	case <-time.After(time.Second):
+		close(allowAdmission)
+		close(allowShutdownContinue)
+		_ = gated.Close()
+		t.Fatal("shutdown snapshot missed an admitted connection")
+	}
+	close(allowAdmission)
+	close(allowShutdownContinue)
+	select {
+	case err := <-shutdownDone:
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = gated.Close()
+		t.Fatal("shutdown did not finish after the connection was released")
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve did not stop")
 	}
 }

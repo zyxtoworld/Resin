@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -372,5 +373,330 @@ func TestEngine_ConcurrentMarkAndFlush(t *testing.T) {
 	nodes, _ := engine.LoadAllNodesStatic()
 	if len(nodes) != 100 {
 		t.Fatalf("expected 100 nodes, got %d (some lost in concurrent flush)", len(nodes))
+	}
+}
+
+func TestEngine_FlushWaitsForCompoundDirtyWriteBoundary(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+	const hash = "compound-dirty-node"
+	if err := engine.CacheRepo.BulkUpsertNodesStatic([]model.NodeStatic{{
+		Hash:        hash,
+		RawOptions:  json.RawMessage(`{"type":"compound"}`),
+		CreatedAtNs: 1,
+	}}); err != nil {
+		t.Fatalf("seed static node: %v", err)
+	}
+	if err := engine.CacheRepo.BulkUpsertNodesDynamic([]model.NodeDynamic{{
+		Hash:         hash,
+		FailureCount: 1,
+	}}); err != nil {
+		t.Fatalf("seed dynamic node: %v", err)
+	}
+
+	staticMarked := make(chan struct{})
+	allowDynamic := make(chan struct{})
+	mutationDone := make(chan bool, 1)
+	go func() {
+		mutationDone <- engine.WithDirtyWriteAdmission(func(admission *DirtyWriteAdmission) {
+			if !admission.MarkNodeStaticDelete(hash) {
+				t.Errorf("static delete was not admitted")
+			}
+			close(staticMarked)
+			<-allowDynamic
+			if !admission.MarkNodeDynamicDelete(hash) {
+				t.Errorf("dynamic delete was not admitted")
+			}
+		})
+	}()
+	select {
+	case <-staticMarked:
+	case <-time.After(time.Second):
+		t.Fatal("compound dirty mutation did not reach its first mark")
+	}
+
+	readers := CacheReaders{
+		ReadNodeStatic:       func(string) *model.NodeStatic { return nil },
+		ReadNodeDynamic:      func(string) *model.NodeDynamic { return nil },
+		ReadNodeLatency:      func(NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease:            func(LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- engine.FlushDirtySets(readers) }()
+	select {
+	case err := <-flushDone:
+		t.Fatalf("flush crossed an active compound dirty mutation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(allowDynamic)
+	select {
+	case ok := <-mutationDone:
+		if !ok {
+			t.Fatal("compound dirty mutation was rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("compound dirty mutation did not finish")
+	}
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("flush after compound mutation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flush did not finish after compound mutation")
+	}
+
+	static, err := engine.CacheRepo.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("load static nodes: %v", err)
+	}
+	if len(static) != 0 {
+		t.Fatalf("static delete was not flushed atomically: %+v", static)
+	}
+	dynamic, err := engine.CacheRepo.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("load dynamic nodes: %v", err)
+	}
+	if len(dynamic) != 0 {
+		t.Fatalf("dynamic delete was not flushed atomically: %+v", dynamic)
+	}
+}
+
+func TestEngine_ConcurrentFlushesDoNotCommitOlderSnapshotAfterNewer(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+
+	var current atomic.Pointer[model.NodeStatic]
+	current.Store(&model.NodeStatic{
+		Hash:        "ordered-node",
+		RawOptions:  json.RawMessage(`{"version":1}`),
+		CreatedAtNs: 1,
+	})
+	engine.MarkNodeStatic("ordered-node")
+
+	firstRead := make(chan struct{})
+	releaseFirstRead := make(chan struct{})
+	var readCalls atomic.Int32
+	readStatic := func(hash string) *model.NodeStatic {
+		if hash != "ordered-node" {
+			return nil
+		}
+		if readCalls.Add(1) == 1 {
+			value := current.Load()
+			if value == nil {
+				return nil
+			}
+			copy := *value
+			copy.RawOptions = append(json.RawMessage(nil), value.RawOptions...)
+			close(firstRead)
+			<-releaseFirstRead
+			return &copy
+		}
+		value := current.Load()
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		copy.RawOptions = append(json.RawMessage(nil), value.RawOptions...)
+		return &copy
+	}
+	readers := CacheReaders{
+		ReadNodeStatic:       readStatic,
+		ReadNodeDynamic:      func(string) *model.NodeDynamic { return nil },
+		ReadNodeLatency:      func(NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease:            func(LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+
+	firstFlushDone := make(chan struct{})
+	go func() {
+		if err := engine.FlushDirtySets(readers); err != nil {
+			t.Errorf("first flush: %v", err)
+		}
+		close(firstFlushDone)
+	}()
+	select {
+	case <-firstRead:
+	case <-time.After(time.Second):
+		t.Fatal("first flush did not reach the controlled reader")
+	}
+
+	current.Store(&model.NodeStatic{
+		Hash:        "ordered-node",
+		RawOptions:  json.RawMessage(`{"version":2}`),
+		CreatedAtNs: 2,
+	})
+	engine.MarkNodeStatic("ordered-node")
+
+	secondFlushDone := make(chan struct{})
+	go func() {
+		if err := engine.FlushDirtySets(readers); err != nil {
+			t.Errorf("second flush: %v", err)
+		}
+		close(secondFlushDone)
+	}()
+	select {
+	case <-secondFlushDone:
+		t.Fatal("newer flush committed while older flush still held the flush owner")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirstRead)
+
+	select {
+	case <-firstFlushDone:
+	case <-time.After(time.Second):
+		t.Fatal("older flush did not finish after release")
+	}
+	select {
+	case <-secondFlushDone:
+	case <-time.After(time.Second):
+		t.Fatal("newer flush did not finish after older flush released")
+	}
+
+	nodes, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || string(nodes[0].RawOptions) != `{"version":2}` {
+		t.Fatalf("older concurrent flush overwrote newer value: %+v", nodes)
+	}
+	if got := engine.DirtyCount(); got != 0 {
+		t.Fatalf("expected no dirty entries after ordered flushes, got %d", got)
+	}
+}
+
+func TestEngine_ConcurrentFlushesDoNotCommitOlderNodeTripletAfterNewer(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+	const hash = "ordered-node-triplet"
+
+	var currentStatic atomic.Pointer[model.NodeStatic]
+	var currentDynamic atomic.Pointer[model.NodeDynamic]
+	var currentLatency atomic.Pointer[model.NodeLatency]
+	currentStatic.Store(&model.NodeStatic{
+		Hash:        hash,
+		RawOptions:  json.RawMessage(`{"version":1}`),
+		CreatedAtNs: 1,
+	})
+	currentDynamic.Store(&model.NodeDynamic{
+		Hash:         hash,
+		FailureCount: 1,
+		EgressIP:     "203.0.113.1",
+	})
+	currentLatency.Store(&model.NodeLatency{
+		NodeHash:      hash,
+		Domain:        "ordered.example",
+		EwmaNs:        100,
+		LastUpdatedNs: 10,
+	})
+	if !engine.MarkNodeStatic(hash) || !engine.MarkNodeDynamic(hash) ||
+		!engine.MarkNodeLatency(hash, "ordered.example") {
+		t.Fatal("initial triplet dirty marks were rejected")
+	}
+
+	firstLatencyRead := make(chan struct{})
+	releaseFirstLatencyRead := make(chan struct{})
+	var latencyReads atomic.Int32
+	readers := CacheReaders{
+		ReadNodeStatic: func(readHash string) *model.NodeStatic {
+			value := currentStatic.Load()
+			if readHash != hash || value == nil {
+				return nil
+			}
+			copy := *value
+			copy.RawOptions = append(json.RawMessage(nil), value.RawOptions...)
+			return &copy
+		},
+		ReadNodeDynamic: func(readHash string) *model.NodeDynamic {
+			value := currentDynamic.Load()
+			if readHash != hash || value == nil {
+				return nil
+			}
+			copy := *value
+			return &copy
+		},
+		ReadNodeLatency: func(key NodeLatencyDirtyKey) *model.NodeLatency {
+			value := currentLatency.Load()
+			if key.NodeHash != hash || key.Domain != "ordered.example" || value == nil {
+				return nil
+			}
+			copy := *value
+			if latencyReads.Add(1) == 1 {
+				close(firstLatencyRead)
+				<-releaseFirstLatencyRead
+			}
+			return &copy
+		},
+		ReadLease:            func(LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- engine.FlushDirtySets(readers) }()
+	select {
+	case <-firstLatencyRead:
+	case <-time.After(time.Second):
+		t.Fatal("first flush did not reach the triplet reader barrier")
+	}
+
+	currentStatic.Store(&model.NodeStatic{
+		Hash:        hash,
+		RawOptions:  json.RawMessage(`{"version":2}`),
+		CreatedAtNs: 2,
+	})
+	currentDynamic.Store(&model.NodeDynamic{
+		Hash:         hash,
+		FailureCount: 2,
+		EgressIP:     "203.0.113.2",
+	})
+	currentLatency.Store(&model.NodeLatency{
+		NodeHash:      hash,
+		Domain:        "ordered.example",
+		EwmaNs:        200,
+		LastUpdatedNs: 20,
+	})
+	if !engine.MarkNodeStatic(hash) || !engine.MarkNodeDynamic(hash) ||
+		!engine.MarkNodeLatency(hash, "ordered.example") {
+		t.Fatal("newer triplet dirty marks were rejected")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- engine.FlushDirtySets(readers) }()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("newer flush committed while older triplet read was blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirstLatencyRead)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first triplet flush: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second triplet flush: %v", err)
+	}
+
+	staticRows, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("load static rows: %v", err)
+	}
+	dynamicRows, err := engine.LoadAllNodesDynamic()
+	if err != nil {
+		t.Fatalf("load dynamic rows: %v", err)
+	}
+	latencyRows, err := engine.LoadAllNodeLatency()
+	if err != nil {
+		t.Fatalf("load latency rows: %v", err)
+	}
+	if len(staticRows) != 1 || string(staticRows[0].RawOptions) != `{"version":2}` || staticRows[0].CreatedAtNs != 2 {
+		t.Fatalf("older static ticket overwrote newer value: %+v", staticRows)
+	}
+	if len(dynamicRows) != 1 || dynamicRows[0].FailureCount != 2 || dynamicRows[0].EgressIP != "203.0.113.2" {
+		t.Fatalf("older dynamic ticket overwrote newer value: %+v", dynamicRows)
+	}
+	if len(latencyRows) != 1 || latencyRows[0].EwmaNs != 200 || latencyRows[0].LastUpdatedNs != 20 {
+		t.Fatalf("older latency ticket overwrote newer value: %+v", latencyRows)
+	}
+	if got := engine.DirtyCount(); got != 0 {
+		t.Fatalf("expected no dirty triplet entries after ordered flushes, got %d", got)
 	}
 }

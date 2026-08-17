@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -45,6 +46,12 @@ type mmdbReader struct {
 	reader *maxminddb.Reader
 }
 
+// maxGeoIPDatabaseBytes bounds the resident memory used by an online reader.
+// The downloader enforces the same limit for remote GeoIP payloads; the file
+// check remains necessary because the live file may be supplied locally or
+// changed between Stat and Read.
+const maxGeoIPDatabaseBytes = 16 << 20
+
 type mmdbCountryRecord struct {
 	Country struct {
 		ISOCode string `maxminddb:"iso_code"`
@@ -81,7 +88,31 @@ func (m *mmdbReader) Close() error {
 
 // MMDBOpen opens a MaxMind-compatible mmdb database.
 func MMDBOpen(path string) (GeoReader, error) {
-	reader, err := maxminddb.Open(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if info.Size() > int64(maxGeoIPDatabaseBytes) {
+		_ = file.Close()
+		return nil, fmt.Errorf("geoip: database exceeds %d bytes", maxGeoIPDatabaseBytes)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, int64(maxGeoIPDatabaseBytes)+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if len(data) > maxGeoIPDatabaseBytes {
+		return nil, fmt.Errorf("geoip: database exceeds %d bytes", maxGeoIPDatabaseBytes)
+	}
+	reader, err := maxminddb.FromBytes(data)
 	if err != nil {
 		return nil, err
 	}
@@ -110,23 +141,44 @@ type Service struct {
 	mu     sync.RWMutex
 	reader GeoReader // nil until first load
 
-	cacheDir    string
-	dbFilename  string
-	openDB      OpenFunc
-	downloader  netutil.Downloader
-	cron        *cron.Cron
-	cronEntryID cron.EntryID
-	updateMu    sync.Mutex // serializes UpdateNow calls
-	lifeCtx     context.Context
-	lifeCancel  context.CancelFunc
+	readerCloseMu      sync.Mutex
+	readerClosePending int
+	readerCloseDone    chan struct{}
+
+	cacheDir         string
+	dbFilename       string
+	openDB           OpenFunc
+	downloader       netutil.Downloader
+	cron             *cron.Cron
+	cronEntryID      cron.EntryID
+	updateMu         sync.Mutex // serializes UpdateNow calls
+	updateStateMu    sync.Mutex
+	activeUpdateDone chan struct{}
+	startMu          sync.Mutex // serializes Start calls
+	lifecycleMu      sync.Mutex
+	started          bool
+	stopped          bool
+	lifeCtx          context.Context
+	lifeCancel       context.CancelFunc
+
+	// Package-private seams for deterministic lifecycle tests.
+	beforeGeoIPCommitHook       func()
+	afterGeoIPStopAdmissionHook func()
 }
 
 func (s *Service) isStopped() bool {
-	if s.lifeCtx == nil {
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		return true
+	}
+	lifeCtx := s.lifeCtx
+	s.lifecycleMu.Unlock()
+	if lifeCtx == nil {
 		return false
 	}
 	select {
-	case <-s.lifeCtx.Done():
+	case <-lifeCtx.Done():
 		return true
 	default:
 		return false
@@ -171,12 +223,42 @@ func NewService(cfg ServiceConfig) *Service {
 // Start loads the initial database (if present), checks for staleness
 // against the cron schedule, and starts the cron scheduler.
 func (s *Service) Start() error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		return context.Canceled
+	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	s.lifecycleMu.Unlock()
+
+	// Serialize initial reader loading with Stop. If Stop wins while this
+	// initialization is in progress, it waits for the same lifecycle owner as
+	// UpdateNow and closes any rejected reader after this method leaves.
+	s.updateMu.Lock()
+	updateDone := s.beginUpdate()
+	defer func() {
+		s.endUpdate(updateDone)
+		s.updateMu.Unlock()
+	}()
+	if s.isStopped() {
+		return context.Canceled
+	}
+
 	dbPath := filepath.Join(s.cacheDir, s.dbFilename)
 	info, err := os.Stat(dbPath)
 	if err == nil {
 		// Load existing database.
-		if err := s.reloadReader(dbPath); err != nil {
+		newReader, err := s.openReader(dbPath)
+		if err != nil {
 			log.Printf("[geoip] failed to load initial db: %v", err)
+		} else if !s.installReaderIfRunning(newReader) {
+			return context.Canceled
 		}
 
 		// Check staleness: if mtime is older than the scheduled interval,
@@ -200,7 +282,17 @@ func (s *Service) Start() error {
 	} else {
 		return fmt.Errorf("geoip: stat db %s: %w", dbPath, err)
 	}
-	s.cron.Start()
+
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		return context.Canceled
+	}
+	if s.cron != nil {
+		s.cron.Start()
+	}
+	s.started = true
+	s.lifecycleMu.Unlock()
 	return nil
 }
 
@@ -230,25 +322,161 @@ func (s *Service) isStale(modTime time.Time) bool {
 
 // Stop stops the cron scheduler and closes the reader.
 func (s *Service) Stop() {
-	if s.lifeCancel != nil {
-		s.lifeCancel()
+	_ = s.StopContext(context.Background())
+}
+
+// StopContext stops the cron scheduler and waits for an in-flight update until
+// ctx expires. A timed-out update remains canceled and cannot publish a staged
+// reader; it finishes its own cleanup after the caller has returned.
+func (s *Service) StopContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.lifecycleMu.Lock()
+	if !s.stopped {
+		s.stopped = true
+		if s.lifeCancel != nil {
+			s.lifeCancel()
+		}
+		if hook := s.afterGeoIPStopAdmissionHook; hook != nil {
+			hook()
+		}
+	}
+	c := s.cron
+	s.lifecycleMu.Unlock()
+
+	if c != nil {
+		// Stop prevents new scheduled jobs. The update owner below tracks the
+		// actual UpdateNow call and provides the cancelable wait.
+		c.Stop()
 	}
 
-	if s.cron != nil {
-		// Wait for in-flight scheduled jobs to finish.
-		<-s.cron.Stop().Done()
+	// Detach before waiting for any arbitrary reader Close. A reader is never
+	// exposed after shutdown admission, even if its Close implementation blocks.
+	s.closeReaderIfStopped()
+	for {
+		if done := s.activeUpdate(); done != nil {
+			if err := waitForDone(ctx, done); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.waitReaderCloses(ctx); err != nil {
+			return err
+		}
+		if s.activeUpdate() == nil {
+			return nil
+		}
 	}
+}
 
-	// Serialize Stop with UpdateNow to prevent post-stop reader reload.
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
+func waitForDone(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
+func (s *Service) activeUpdate() chan struct{} {
+	s.updateStateMu.Lock()
+	done := s.activeUpdateDone
+	s.updateStateMu.Unlock()
+	return done
+}
+
+func (s *Service) beginUpdate() chan struct{} {
+	done := make(chan struct{})
+	s.updateStateMu.Lock()
+	s.activeUpdateDone = done
+	s.updateStateMu.Unlock()
+	return done
+}
+
+func (s *Service) endUpdate(done chan struct{}) {
+	// If shutdown won the lifecycle admission, detach and register the reader
+	// close before publishing completion of the update owner. This prevents a
+	// waiter from observing activeUpdateDone == nil while the final close is
+	// still being admitted.
+	s.closeReaderIfStopped()
+	s.updateStateMu.Lock()
+	if s.activeUpdateDone == done {
+		s.activeUpdateDone = nil
+	}
+	close(done)
+	s.updateStateMu.Unlock()
+}
+
+func (s *Service) closeReaderIfStopped() {
+	s.lifecycleMu.Lock()
+	stopped := s.stopped
+	s.lifecycleMu.Unlock()
+	if !stopped {
+		return
+	}
 	s.mu.Lock()
 	r := s.reader
 	s.reader = nil
 	s.mu.Unlock()
 	if r != nil {
-		r.Close()
+		s.closeReaderAsync(r)
+	}
+}
+
+func (s *Service) beginReaderClose() func() {
+	s.readerCloseMu.Lock()
+	if s.readerClosePending == 0 {
+		s.readerCloseDone = make(chan struct{})
+	}
+	s.readerClosePending++
+	s.readerCloseMu.Unlock()
+	return func() {
+		s.readerCloseMu.Lock()
+		s.readerClosePending--
+		if s.readerClosePending == 0 {
+			close(s.readerCloseDone)
+			s.readerCloseDone = nil
+		}
+		s.readerCloseMu.Unlock()
+	}
+}
+
+func (s *Service) closeReader(reader GeoReader) {
+	_ = s.closeReaderChecked(reader)
+}
+
+func (s *Service) closeReaderChecked(reader GeoReader) error {
+	if reader == nil {
+		return nil
+	}
+	finish := s.beginReaderClose()
+	defer finish()
+	return reader.Close()
+}
+
+func (s *Service) closeReaderAsync(reader GeoReader) {
+	if reader == nil {
+		return
+	}
+	finish := s.beginReaderClose()
+	go func() {
+		defer finish()
+		_ = reader.Close()
+	}()
+}
+
+func (s *Service) waitReaderCloses(ctx context.Context) error {
+	for {
+		s.readerCloseMu.Lock()
+		done := s.readerCloseDone
+		s.readerCloseMu.Unlock()
+		if done == nil {
+			return nil
+		}
+		if err := waitForDone(ctx, done); err != nil {
+			return err
+		}
 	}
 }
 
@@ -280,8 +508,24 @@ type releaseInfo struct {
 // atomically replaces the local file, and hot-reloads the reader.
 // Serialized via updateMu to prevent concurrent temp file races.
 func (s *Service) UpdateNow() error {
+	return s.UpdateNowContext(context.Background())
+}
+
+// UpdateNowContext binds the update to both the caller and service lifetime.
+// A request cancellation stops an interactive update, while Stop still
+// cancels scheduled/background updates through the service lifetime.
+func (s *Service) UpdateNowContext(parent context.Context) error {
+	if parent == nil {
+		parent = context.Background()
+	}
 	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
+	updateDone := s.beginUpdate()
+	defer func() {
+		s.endUpdate(updateDone)
+		s.updateMu.Unlock()
+	}()
+	ctx, releaseContext := s.contextWithLifetime(parent)
+	defer releaseContext()
 
 	if s.isStopped() {
 		return context.Canceled
@@ -290,12 +534,10 @@ func (s *Service) UpdateNow() error {
 	if s.downloader == nil {
 		return fmt.Errorf("geoip: no downloader configured")
 	}
-
-	parent := context.Background()
-	if s.lifeCtx != nil {
-		parent = s.lifeCtx
+	if s.openDB == nil {
+		return fmt.Errorf("geoip: no OpenDB function configured")
 	}
-	ctx := parent
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -341,11 +583,19 @@ func (s *Service) UpdateNow() error {
 	}
 	tmpPath := tmpFile.Name()
 	if _, err := tmpFile.Write(dbData); err != nil {
-		tmpFile.Close()
+		_ = tmpFile.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("geoip: write temp: %w", err)
 	}
-	tmpFile.Close()
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("geoip: sync temp: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("geoip: close temp: %w", err)
+	}
 	// Clean up temp on any error after this point.
 	defer func() {
 		os.Remove(tmpPath) // no-op if already renamed
@@ -356,41 +606,248 @@ func (s *Service) UpdateNow() error {
 		return err
 	}
 
+	// Validate the candidate before replacing the live file. If the reader
+	// cannot open the downloaded database, the existing file and in-memory
+	// reader must remain untouched so a restart does not inherit a broken DB.
+	newReader, err := s.openDB(tmpPath)
+	if err != nil {
+		return fmt.Errorf("geoip: open candidate %s: %w", tmpPath, err)
+	}
+	if newReader == nil {
+		return fmt.Errorf("geoip: open candidate %s: nil reader", tmpPath)
+	}
+	keepReader := false
+	defer func() {
+		if !keepReader && newReader != nil {
+			s.closeReader(newReader)
+		}
+	}()
+	// The candidate reader only validates the downloaded bytes. On Windows a
+	// memory-mapped reader may deny delete/rename while it still owns tmpPath,
+	// so it must be closed before the file commit. The reader used for service
+	// lookups is opened from the published path below.
+	if err := s.closeReaderChecked(newReader); err != nil {
+		newReader = nil
+		return fmt.Errorf("geoip: close candidate %s: %w", tmpPath, err)
+	}
+	newReader = nil
+
 	// 5. Atomic rename.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	dbPath := filepath.Join(s.cacheDir, s.dbFilename)
-	if err := os.Rename(tmpPath, dbPath); err != nil {
-		return fmt.Errorf("geoip: atomic replace: %w", err)
+	if hook := s.beforeGeoIPCommitHook; hook != nil {
+		hook()
 	}
+	dbPath := filepath.Join(s.cacheDir, s.dbFilename)
+	rollbackPath, err := stageGeoIPRollbackCopy(dbPath)
+	if err != nil {
+		return fmt.Errorf("geoip: stage rollback copy: %w", err)
+	}
+	defer func() {
+		if rollbackPath != "" {
+			_ = os.Remove(rollbackPath)
+		}
+	}()
 
-	// 6. Hot-reload reader.
+	// Serialize the irreversible file replacement with Stop. If shutdown has
+	// already admitted, reject the staged reader without touching the live
+	// file. If this lock is acquired first, the replacement linearizes before
+	// Stop and Stop will then close the published reader.
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		return context.Canceled
+	}
 	if err := ctx.Err(); err != nil {
+		s.lifecycleMu.Unlock()
 		return err
 	}
-	return s.reloadReader(dbPath)
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		s.lifecycleMu.Unlock()
+		return fmt.Errorf("geoip: atomic replace: %w", err)
+	}
+	publishedReader, err := s.openReader(dbPath)
+	if err != nil {
+		rollbackErr := rollbackGeoIPReplacement(dbPath, rollbackPath)
+		s.lifecycleMu.Unlock()
+		if rollbackErr != nil {
+			return fmt.Errorf("geoip: open published %s: %v (rollback failed: %w)", dbPath, err, rollbackErr)
+		}
+		return fmt.Errorf("geoip: open published %s: %w", dbPath, err)
+	}
+	newReader = publishedReader
+	if err := ctx.Err(); err != nil {
+		closeErr := s.closeReaderChecked(newReader)
+		newReader = nil
+		rollbackErr := rollbackGeoIPReplacement(dbPath, rollbackPath)
+		s.lifecycleMu.Unlock()
+		if rollbackErr != nil {
+			return fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("%w (close published reader: %v)", err, closeErr)
+		}
+		return err
+	}
+
+	// 6. Hot-reload the validated reader opened from the published path. Keep
+	// the open and pointer swap under the same lifecycle lock so shutdown
+	// cannot observe a half-published generation. Only the pointer swap belongs
+	// lifecycle lock; closing the old reader may run user/driver code and must
+	// not block Stop from admitting shutdown.
+	oldReader := s.swapReader(newReader)
+	keepReader = true
+	s.lifecycleMu.Unlock()
+	if oldReader != nil {
+		s.closeReader(oldReader)
+	}
+	return nil
+}
+
+func (s *Service) contextWithLifetime(parent context.Context) (context.Context, func()) {
+	if s.lifeCtx == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stopLifetimeCancel := context.AfterFunc(s.lifeCtx, cancel)
+	return ctx, func() {
+		stopLifetimeCancel()
+		cancel()
+	}
 }
 
 // reloadReader atomically replaces the current reader with a new one.
 // Safe: RLock holders finish before old reader is closed.
 func (s *Service) reloadReader(path string) error {
+	newReader, err := s.openReader(path)
+	if err != nil {
+		return err
+	}
+	s.installReader(newReader)
+	return nil
+}
+
+func (s *Service) openReader(path string) (GeoReader, error) {
 	if s.openDB == nil {
-		return fmt.Errorf("geoip: no OpenDB function configured")
+		return nil, fmt.Errorf("geoip: no OpenDB function configured")
 	}
 	newReader, err := s.openDB(path)
 	if err != nil {
-		return fmt.Errorf("geoip: open %s: %w", path, err)
+		if newReader != nil {
+			s.closeReader(newReader)
+		}
+		return nil, fmt.Errorf("geoip: open %s: %w", path, err)
 	}
+	if newReader == nil {
+		return nil, fmt.Errorf("geoip: open %s: nil reader", path)
+	}
+	return newReader, nil
+}
+
+// stageGeoIPRollbackCopy copies the currently published database to a private
+// path. It is used only to undo a file replacement if reopening the published
+// generation fails; the normal commit never removes the live path first.
+func stageGeoIPRollbackCopy(path string) (string, error) {
+	source, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	backup, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".rollback.*")
+	if err != nil {
+		_ = source.Close()
+		return "", err
+	}
+	backupPath := backup.Name()
+	cleanup := func() {
+		_ = backup.Close()
+		_ = source.Close()
+		_ = os.Remove(backupPath)
+	}
+	if _, err := io.Copy(backup, source); err != nil {
+		cleanup()
+		return "", err
+	}
+	if err := backup.Sync(); err != nil {
+		cleanup()
+		return "", err
+	}
+	if err := backup.Close(); err != nil {
+		_ = source.Close()
+		_ = os.Remove(backupPath)
+		return "", err
+	}
+	if err := source.Close(); err != nil {
+		_ = os.Remove(backupPath)
+		return "", err
+	}
+	return backupPath, nil
+}
+
+// rollbackGeoIPReplacement restores the old live file after a failed
+// post-rename open. The replacement is moved aside first, so the old backup
+// is never renamed over a live file that still owns the new generation.
+func rollbackGeoIPReplacement(path, backupPath string) error {
+	if backupPath == "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	failed, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".failed.*")
+	if err != nil {
+		return err
+	}
+	failedPath := failed.Name()
+	if err := failed.Close(); err != nil {
+		_ = os.Remove(failedPath)
+		return err
+	}
+	if err := os.Remove(failedPath); err != nil {
+		return err
+	}
+	if err := os.Rename(path, failedPath); err != nil {
+		return err
+	}
+	if err := os.Rename(backupPath, path); err != nil {
+		_ = os.Rename(failedPath, path)
+		return err
+	}
+	return os.Remove(failedPath)
+}
+
+func (s *Service) installReader(newReader GeoReader) {
+	old := s.swapReader(newReader)
+	// Safe to close old: all RLock holders on old have released.
+	if old != nil {
+		s.closeReader(old)
+	}
+}
+
+func (s *Service) installReaderIfRunning(newReader GeoReader) bool {
+	s.lifecycleMu.Lock()
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		s.closeReader(newReader)
+		return false
+	}
+	oldReader := s.swapReader(newReader)
+	s.lifecycleMu.Unlock()
+	if oldReader != nil {
+		s.closeReader(oldReader)
+	}
+	return true
+}
+
+func (s *Service) swapReader(newReader GeoReader) GeoReader {
 	s.mu.Lock()
 	old := s.reader
 	s.reader = newReader
 	s.mu.Unlock()
-	// Safe to close old: all RLock holders on old have released.
-	if old != nil {
-		old.Close()
-	}
-	return nil
+	return old
 }
 
 // VerifySHA256 checks that the file at path has the expected SHA256 hash.

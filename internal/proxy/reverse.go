@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
@@ -19,6 +21,12 @@ import (
 type PlatformLookup interface {
 	GetPlatform(id string) (*platform.Platform, bool)
 	GetPlatformByName(name string) (*platform.Platform, bool)
+}
+
+// PlatformGenerationReader lets a handler observe account policy and route
+// selection under one complete published platform generation.
+type PlatformGenerationReader interface {
+	WithPlatformReadByName(name string, fn func(*platform.Platform)) bool
 }
 
 // ReverseProxyConfig holds dependencies for the reverse proxy.
@@ -49,7 +57,7 @@ type ReverseProxy struct {
 	transportConfig   OutboundTransportConfig
 	transportPool     *OutboundTransportPool
 	transportPoolOnce sync.Once
-	directTransport   *http.Transport
+	directTransport   atomic.Pointer[http.Transport]
 	directOnce        sync.Once
 	bypass            *TargetBypassMatcher
 }
@@ -86,14 +94,25 @@ func (p *ReverseProxy) outboundHTTPTransport(routed routedOutbound) *http.Transp
 			p.transportPool = NewOutboundTransportPool(p.transportConfig)
 		}
 	})
-	return p.transportPool.Get(routed.Route.NodeHash, routed.Outbound, p.metricsSink)
+	return p.transportPool.Get(routed.Route.NodeHash, routed.Entry, routed.Outbound, p.metricsSink)
 }
 
 func (p *ReverseProxy) directHTTPTransport() *http.Transport {
 	p.directOnce.Do(func() {
-		p.directTransport = newDirectHTTPTransport(p.transportConfig, p.metricsSink)
+		p.directTransport.Store(newDirectHTTPTransport(p.transportConfig, p.metricsSink))
 	})
-	return p.directTransport
+	return p.directTransport.Load()
+}
+
+// CloseIdleConnections releases direct/bypass HTTP keep-alive connections.
+// Routed transports are owned by OutboundTransportPool and are closed there.
+func (p *ReverseProxy) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	if transport := p.directTransport.Load(); transport != nil {
+		transport.CloseIdleConnections()
+	}
 }
 
 // parsedPath holds the result of parsing a reverse proxy request path.
@@ -271,54 +290,78 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lifecycle.finish()
 
-	// Resolve account in three phases:
-	// 1) Use path account directly when present.
-	// 2) If extraction fails, apply miss-action (REJECT or treat-as-empty).
-	// 3) Continue routing with the resulting account (possibly empty).
-	behaviorPlatform := p.resolvePlatformForAccountBehavior(parsed.PlatformName)
-	account, _, extractionFailed := p.resolveReverseProxyAccount(parsed, r, behaviorPlatform)
-	lifecycle.setAccount(account)
-
-	if shouldRejectReverseProxyAccountExtractionFailure(extractionFailed, behaviorPlatform) {
-		lifecycle.setProxyError(ErrAccountRejected)
-		lifecycle.setHTTPStatus(ErrAccountRejected.HTTPCode)
-		writeProxyError(w, ErrAccountRejected)
-		return
-	}
-
-	target, targetErr := buildReverseTargetURL(parsed, r.URL.RawQuery)
-	if targetErr != nil {
-		lifecycle.setProxyError(targetErr)
-		lifecycle.setHTTPStatus(targetErr.HTTPCode)
-		writeProxyError(w, targetErr)
-		return
-	}
-	lifecycle.setTarget(parsed.Host, target.String())
-
+	// Resolve account, apply miss-action, and select a route from one platform
+	// generation. The production pool holds its platform read owner across this
+	// callback; lightweight test lookups retain the legacy fallback.
+	var account string
+	var extractionFailed bool
+	var target *url.URL
+	var resolveErr *ProxyError
+	var routed routedOutbound
 	var route routing.RouteResult
+	var routeEntry *node.NodeEntry
 	var hasRoute bool
 	var transport *http.Transport
-	var nodeHashRaw = route.NodeHash
 	domain := netutil.ExtractDomain(parsed.Host)
-	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
-		transport = p.directHTTPTransport()
-	} else {
-		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, parsed.PlatformName, account, parsed.Host)
-		if routeErr != nil {
-			lifecycle.setProxyError(routeErr)
-			lifecycle.setHTTPStatus(routeErr.HTTPCode)
-			writeProxyError(w, routeErr)
+	resolve := func(plat *platform.Platform, generationBound bool) {
+		account, _, extractionFailed = p.resolveReverseProxyAccount(parsed, r, plat)
+		lifecycle.setAccount(account)
+		if shouldRejectReverseProxyAccountExtractionFailure(extractionFailed, plat) {
+			resolveErr = ErrAccountRejected
+			return
+		}
+
+		var targetErr *ProxyError
+		target, targetErr = buildReverseTargetURL(parsed, r.URL.RawQuery)
+		if targetErr != nil {
+			resolveErr = targetErr
+			return
+		}
+		lifecycle.setTarget(parsed.Host, target.String())
+		if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
+			return
+		}
+		if generationBound {
+			routed, resolveErr = resolveRoutedOutboundForPlatform(p.router, p.pool, plat, account, parsed.Host)
+		} else {
+			routed, resolveErr = resolveRoutedOutbound(p.router, p.pool, parsed.PlatformName, account, parsed.Host)
+		}
+		if resolveErr != nil {
 			return
 		}
 		route = routed.Route
+		routeEntry = routed.Entry
 		hasRoute = true
-		nodeHashRaw = route.NodeHash
 		lifecycle.setRouteResult(route)
 		if p.health != nil {
-			go p.health.RecordLatency(nodeHashRaw, domain, nil)
+			recordLatencyAsync(p.health, route.NodeHash, routeEntry, domain, nil)
 		}
+	}
+
+	if owner, ok := p.platLook.(PlatformGenerationReader); ok {
+		if !owner.WithPlatformReadByName(parsed.PlatformName, func(plat *platform.Platform) {
+			resolve(plat, true)
+		}) {
+			resolve(p.resolvePlatformForAccountBehavior(parsed.PlatformName), false)
+		}
+	} else {
+		resolve(p.resolvePlatformForAccountBehavior(parsed.PlatformName), false)
+	}
+	if resolveErr != nil {
+		lifecycle.setProxyError(resolveErr)
+		lifecycle.setHTTPStatus(resolveErr.HTTPCode)
+		writeProxyError(w, resolveErr)
+		return
+	}
+	if target == nil {
+		return
+	}
+	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
+		transport = p.directHTTPTransport()
+	} else {
 		transport = p.outboundHTTPTransport(routed)
 	}
+	var nodeHashRaw = route.NodeHash
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -333,7 +376,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			// Add httptrace for TLS latency measurement on HTTPS.
 			if parsed.Protocol == "https" && hasRoute && p.health != nil {
-				reporter := newReverseLatencyReporter(p.health, nodeHashRaw, domain)
+				reporter := newReverseLatencyReporter(p.health, nodeHashRaw, routeEntry, domain)
 				reqCtx = httptrace.WithClientTrace(reqCtx, reporter.clientTrace())
 			}
 			*req = *req.WithContext(reqCtx)
@@ -353,7 +396,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setNetOK(false)
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 			if hasRoute {
-				recordPassiveResultAsync(p.health, route, false)
+				recordPassiveResultAsync(p.health, route, routeEntry, false)
 			}
 			writeProxyError(rw, proxyErr)
 		},
@@ -378,7 +421,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				lifecycle.setNetOK(true)
 				if hasRoute {
-					recordPassiveResultAsync(p.health, route, true)
+					recordPassiveResultAsync(p.health, route, routeEntry, true)
 				}
 				return nil
 			}
@@ -405,7 +448,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// complexity is not worth it for the current phase.
 			lifecycle.setNetOK(true)
 			if hasRoute {
-				recordPassiveResultAsync(p.health, route, true)
+				recordPassiveResultAsync(p.health, route, routeEntry, true)
 			}
 			return nil
 		},

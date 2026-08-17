@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"net/netip"
 	"time"
 )
@@ -39,7 +40,13 @@ func (s *ControlPlaneService) LookupIP(ipStr string) (string, error) {
 
 // UpdateGeoIPNow triggers an immediate GeoIP database update (blocks).
 func (s *ControlPlaneService) UpdateGeoIPNow() error {
-	if err := s.GeoIP.UpdateNow(); err != nil {
+	return s.UpdateGeoIPNowContext(context.Background())
+}
+
+// UpdateGeoIPNowContext triggers an immediate GeoIP update bound to the
+// caller context and the GeoIP service lifetime.
+func (s *ControlPlaneService) UpdateGeoIPNowContext(ctx context.Context) error {
+	if err := s.GeoIP.UpdateNowContext(ctx); err != nil {
 		return internal("geoip update failed", err)
 	}
 	return nil

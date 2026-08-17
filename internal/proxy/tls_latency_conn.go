@@ -60,7 +60,10 @@ func (c *tlsLatencyConn) Read(b []byte) (int, error) {
 			if startNano > 0 {
 				latency := time.Duration(time.Now().UnixNano() - startNano)
 				if c.onLatency != nil {
-					go c.onLatency(latency)
+					// The callback is the lifecycle handoff into the shared health
+					// write owner. Keep that handoff on the Read path; the owner
+					// performs the actual write asynchronously after admission.
+					c.onLatency(latency)
 				}
 			}
 		}

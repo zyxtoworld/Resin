@@ -122,8 +122,31 @@ func TestRandomRoute_SingleNode(t *testing.T) {
 	if res.NodeHash != h1 {
 		t.Fatalf("expected hash %s, got %s", h1.Hex(), res.NodeHash.Hex())
 	}
+	entry, ok := pool.GetEntry(h1)
+	if !ok || res.SelectedEntry() != entry {
+		t.Fatal("random route did not carry the exact selected entry identity")
+	}
 	if res.PlatformID != platID || res.PlatformName != platName {
 		t.Fatalf("expected platform metadata id=%q name=%q, got id=%q name=%q", platID, platName, res.PlatformID, res.PlatformName)
+	}
+}
+
+func TestRouteResult_CapturesPassiveCircuitBreakerPolicy(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	plat, ok := pool.GetPlatform(platID)
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.PassiveCircuitBreakerDisabled = true
+	makeRoutableNode(t, pool, subMgr, `{"passive-policy":"captured"}`, "1.2.3.5", "cloudflare.com", 50*time.Millisecond)
+
+	router := makeRouter(pool, nil)
+	res, err := router.RouteRequest(platName, "", "example.com")
+	if err != nil {
+		t.Fatalf("RouteRequest: %v", err)
+	}
+	if !res.PassiveCircuitBreakerDisabled {
+		t.Fatal("route result did not capture the originating platform passive policy")
 	}
 }
 
@@ -170,6 +193,10 @@ func TestStickyLease_CreateAndHit(t *testing.T) {
 	if !res1.LeaseCreated {
 		t.Fatal("first request should create lease")
 	}
+	entry, ok := pool.GetEntry(res1.NodeHash)
+	if !ok || res1.SelectedEntry() != entry {
+		t.Fatal("sticky lease creation did not carry the exact selected entry identity")
+	}
 
 	// Second request should hit sticky lease → same node.
 	res2, err := router.RouteRequest(platName, "user-A", "example.com")
@@ -181,6 +208,9 @@ func TestStickyLease_CreateAndHit(t *testing.T) {
 	}
 	if res2.LeaseCreated {
 		t.Fatal("second request should NOT create lease")
+	}
+	if res2.SelectedEntry() != entry {
+		t.Fatal("sticky lease hit did not carry the exact selected entry identity")
 	}
 
 	// Verify lease create event was emitted.

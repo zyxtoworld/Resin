@@ -25,6 +25,8 @@ type LeaseEvent struct {
 	CreatedAtNs int64 // set on remove/expire for lifetime calculation
 }
 
-// LeaseEventFunc is invoked synchronously by routing/lease maintenance code.
-// Keep handlers lightweight and non-blocking; push heavy work to async queues.
+// LeaseEventFunc is invoked synchronously after the routing lifecycle lock is
+// released. A handler may re-enter Router read APIs, but must not call a
+// Router mutation that emits another lease event. The caller waits for the
+// handler, preserving dirty-set and metrics durability/backpressure.
 type LeaseEventFunc func(event LeaseEvent)

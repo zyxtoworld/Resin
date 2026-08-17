@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +21,23 @@ type EndpointRuntimeStatus struct {
 	LastError string
 }
 
-// EndpointRuntime applies persisted endpoint configuration to network listeners.
+// EndpointRuntimeStage owns a prepared listener/runtime candidate. Prepare
+// happens before the strong-persist write; Abort closes an unpublished
+// candidate, while Commit publishes it without another failure point.
+type EndpointRuntimeStage interface {
+	// BeginPersist reserves the stage across the database mutation. Shutdown
+	// may cancel a prepared stage before this point, but must not abandon a
+	// stage once its owning control-plane mutation has started persisting.
+	BeginPersist() bool
+	Abort()
+	Commit()
+}
+
+// EndpointRuntime prepares and publishes persisted endpoint configuration to
+// network listeners. Enabled creates and port changes must use the staged
+// path so a bind/build failure happens before the database mutation.
 type EndpointRuntime interface {
-	ApplyEndpoint(model.Endpoint) error
+	PrepareEndpoint(model.Endpoint) (EndpointRuntimeStage, error)
 	RemoveEndpoint(id string)
 	EndpointStatus(id string) EndpointRuntimeStatus
 }
@@ -156,6 +171,23 @@ func (s *ControlPlaneService) validateEndpoint(endpoint model.Endpoint) *Service
 	return nil
 }
 
+// withEndpointMutation keeps state-db admission active through the matching
+// runtime publish/remove. Shutdown must not observe an idle state database
+// while the same endpoint mutation can still change the live listener set.
+func (s *ControlPlaneService) withEndpointMutation(fn func() error) error {
+	return s.withEndpointMutationContext(context.Background(), func(context.Context) error {
+		return fn()
+	})
+}
+
+func (s *ControlPlaneService) withEndpointMutationContext(ctx context.Context, fn func(context.Context) error) error {
+	err := s.Engine.WithStateWriteAdmissionContext(ctx, fn)
+	if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
+		return internal("endpoint mutation", err)
+	}
+	return err
+}
+
 func (s *ControlPlaneService) ListEndpoints() ([]EndpointResponse, error) {
 	if s == nil || s.Engine == nil {
 		return nil, internal("endpoint service is not initialized", nil)
@@ -198,50 +230,102 @@ func (s *ControlPlaneService) GetEndpoint(id string) (*EndpointResponse, error) 
 }
 
 func (s *ControlPlaneService) CreateEndpoint(req CreateEndpointRequest) (*EndpointResponse, error) {
+	return s.CreateEndpointContext(context.Background(), req)
+}
+
+// CreateEndpointContext creates an endpoint while honoring request
+// cancellation during persistence. Prepared runtime stages still obey their
+// prepare -> single DB write -> commit/abort ownership contract.
+func (s *ControlPlaneService) CreateEndpointContext(ctx context.Context, req CreateEndpointRequest) (*EndpointResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s == nil || s.Engine == nil {
 		return nil, internal("endpoint service is not initialized", nil)
 	}
 	s.endpointMu.Lock()
 	defer s.endpointMu.Unlock()
 
-	allowProxy := boolOrDefault(req.AllowProxy, true)
-	now := time.Now().UnixNano()
-	endpoint := model.Endpoint{
-		ID:                   uuid.New().String(),
-		Port:                 req.Port,
-		Enabled:              boolOrDefault(req.Enabled, true),
-		AllowManagement:      boolOrDefault(req.AllowManagement, false),
-		AllowProxy:           allowProxy,
-		RequireProxyAuthInfo: boolOrDefault(req.RequireProxyAuthInfo, false),
-		AllowHTTPForward:     boolOrDefault(req.AllowHTTPForward, allowProxy),
-		AllowHTTPReverse:     boolOrDefault(req.AllowHTTPReverse, allowProxy),
-		AllowSOCKS5:          boolOrDefault(req.AllowSOCKS5, allowProxy),
-		CreatedAtNs:          now,
-		UpdatedAtNs:          now,
-	}
-	if err := s.validateEndpoint(endpoint); err != nil {
+	var response *EndpointResponse
+	err := s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
+		allowProxy := boolOrDefault(req.AllowProxy, true)
+		now := time.Now().UnixNano()
+		endpoint := model.Endpoint{
+			ID:                   uuid.New().String(),
+			Port:                 req.Port,
+			Enabled:              boolOrDefault(req.Enabled, true),
+			AllowManagement:      boolOrDefault(req.AllowManagement, false),
+			AllowProxy:           allowProxy,
+			RequireProxyAuthInfo: boolOrDefault(req.RequireProxyAuthInfo, false),
+			AllowHTTPForward:     boolOrDefault(req.AllowHTTPForward, allowProxy),
+			AllowHTTPReverse:     boolOrDefault(req.AllowHTTPReverse, allowProxy),
+			AllowSOCKS5:          boolOrDefault(req.AllowSOCKS5, allowProxy),
+			CreatedAtNs:          now,
+			UpdatedAtNs:          now,
+		}
+		if err := s.validateEndpoint(endpoint); err != nil {
+			return err
+		}
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		var runtimeStage EndpointRuntimeStage
+		if endpoint.Enabled && s.EndpointRuntime != nil {
+			var prepareErr error
+			runtimeStage, prepareErr = s.EndpointRuntime.PrepareEndpoint(endpoint)
+			if prepareErr != nil {
+				return conflict(fmt.Sprintf("listen on port %d: %v", endpoint.Port, prepareErr))
+			}
+			if !runtimeStage.BeginPersist() {
+				runtimeStage.Abort()
+				return internal("endpoint runtime unavailable", errors.New("endpoint stage canceled"))
+			}
+		}
+		if err := writeCtx.Err(); err != nil {
+			if runtimeStage != nil {
+				runtimeStage.Abort()
+			}
+			return err
+		}
+		if err := s.Engine.InsertEndpointContext(writeCtx, endpoint); err != nil {
+			if runtimeStage != nil {
+				runtimeStage.Abort()
+			}
+			if errors.Is(err, state.ErrConflict) {
+				return conflict("endpoint port already exists")
+			}
+			return internal("persist endpoint", err)
+		}
+		if runtimeStage != nil {
+			runtimeStage.Commit()
+		}
+		responseValue := s.endpointResponse(endpoint, "database", false)
+		response = &responseValue
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := s.Engine.InsertEndpoint(endpoint); err != nil {
-		if errors.Is(err, state.ErrConflict) {
-			return nil, conflict("endpoint port already exists")
-		}
-		return nil, internal("persist endpoint", err)
-	}
-	if endpoint.Enabled && s.EndpointRuntime != nil {
-		if err := s.EndpointRuntime.ApplyEndpoint(endpoint); err != nil {
-			s.EndpointRuntime.RemoveEndpoint(endpoint.ID)
-			if rollbackErr := s.Engine.DeleteEndpoint(endpoint.ID); rollbackErr != nil {
-				return nil, internal("rollback endpoint after listener failure", errors.Join(err, rollbackErr))
-			}
-			return nil, conflict(fmt.Sprintf("listen on port %d: %v", endpoint.Port, err))
-		}
-	}
-	response := s.endpointResponse(endpoint, "database", false)
-	return &response, nil
+	return response, nil
 }
 
 func (s *ControlPlaneService) UpdateEndpoint(id string, patchJSON json.RawMessage) (*EndpointResponse, error) {
+	return s.UpdateEndpointContext(context.Background(), id, patchJSON)
+}
+
+// UpdateEndpointContext updates an endpoint while honoring request
+// cancellation during persistence. A prepared runtime candidate is aborted
+// on every pre-commit failure and committed only after the DB write succeeds.
+func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id string, patchJSON json.RawMessage) (*EndpointResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if id == DefaultEndpointID {
 		return nil, conflict("default endpoint is read-only")
 	}
@@ -260,75 +344,112 @@ func (s *ControlPlaneService) UpdateEndpoint(id string, patchJSON json.RawMessag
 
 	s.endpointMu.Lock()
 	defer s.endpointMu.Unlock()
-	current, err := s.Engine.GetEndpoint(id)
-	if errors.Is(err, state.ErrNotFound) {
-		return nil, notFound("endpoint not found")
-	}
-	if err != nil {
-		return nil, internal("get endpoint", err)
-	}
-	next := *current
-	if value, ok, parseErr := patch.optionalInt("port"); parseErr != nil {
-		return nil, parseErr
-	} else if ok {
-		next.Port = value
-	}
-	boolFields := []struct {
-		name string
-		set  func(bool)
-	}{
-		{"enabled", func(v bool) { next.Enabled = v }},
-		{"allow_management", func(v bool) { next.AllowManagement = v }},
-		{"allow_proxy", func(v bool) { next.AllowProxy = v }},
-		{"require_proxy_auth_info", func(v bool) { next.RequireProxyAuthInfo = v }},
-		{"allow_http_forward", func(v bool) { next.AllowHTTPForward = v }},
-		{"allow_http_reverse", func(v bool) { next.AllowHTTPReverse = v }},
-		{"allow_socks5", func(v bool) { next.AllowSOCKS5 = v }},
-	}
-	for _, field := range boolFields {
-		value, ok, parseErr := patch.optionalBool(field.name)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		if ok {
-			field.set(value)
-		}
-	}
-	if validationErr := s.validateEndpoint(next); validationErr != nil {
-		return nil, validationErr
-	}
-	if next == *current {
-		response := s.endpointResponse(*current, "database", false)
-		return &response, nil
-	}
-	next.UpdatedAtNs = time.Now().UnixNano()
-	if err := s.Engine.UpdateEndpoint(next); err != nil {
-		if errors.Is(err, state.ErrConflict) {
-			return nil, conflict("endpoint port already exists")
-		}
+	var response *EndpointResponse
+	err := s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
+		current, err := s.Engine.GetEndpointContext(writeCtx, id)
 		if errors.Is(err, state.ErrNotFound) {
-			return nil, notFound("endpoint not found")
+			return notFound("endpoint not found")
 		}
-		return nil, internal("persist endpoint", err)
-	}
-	if next.Enabled && s.EndpointRuntime != nil {
-		if applyErr := s.EndpointRuntime.ApplyEndpoint(next); applyErr != nil {
-			if !current.Enabled {
-				s.EndpointRuntime.RemoveEndpoint(next.ID)
-			}
-			if rollbackErr := s.Engine.UpdateEndpoint(*current); rollbackErr != nil {
-				return nil, internal("rollback endpoint after listener failure", errors.Join(applyErr, rollbackErr))
-			}
-			return nil, conflict(fmt.Sprintf("listen on port %d: %v", next.Port, applyErr))
+		if err != nil {
+			return internal("get endpoint", err)
 		}
-	} else if s.EndpointRuntime != nil {
-		s.EndpointRuntime.RemoveEndpoint(next.ID)
+		next := *current
+		if value, ok, parseErr := patch.optionalInt("port"); parseErr != nil {
+			return parseErr
+		} else if ok {
+			next.Port = value
+		}
+		boolFields := []struct {
+			name string
+			set  func(bool)
+		}{
+			{"enabled", func(v bool) { next.Enabled = v }},
+			{"allow_management", func(v bool) { next.AllowManagement = v }},
+			{"allow_proxy", func(v bool) { next.AllowProxy = v }},
+			{"require_proxy_auth_info", func(v bool) { next.RequireProxyAuthInfo = v }},
+			{"allow_http_forward", func(v bool) { next.AllowHTTPForward = v }},
+			{"allow_http_reverse", func(v bool) { next.AllowHTTPReverse = v }},
+			{"allow_socks5", func(v bool) { next.AllowSOCKS5 = v }},
+		}
+		for _, field := range boolFields {
+			value, ok, parseErr := patch.optionalBool(field.name)
+			if parseErr != nil {
+				return parseErr
+			}
+			if ok {
+				field.set(value)
+			}
+		}
+		if validationErr := s.validateEndpoint(next); validationErr != nil {
+			return validationErr
+		}
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		if next == *current {
+			responseValue := s.endpointResponse(*current, "database", false)
+			response = &responseValue
+			return nil
+		}
+		next.UpdatedAtNs = time.Now().UnixNano()
+		var runtimeStage EndpointRuntimeStage
+		if next.Enabled && s.EndpointRuntime != nil {
+			var prepareErr error
+			runtimeStage, prepareErr = s.EndpointRuntime.PrepareEndpoint(next)
+			if prepareErr != nil {
+				return conflict(fmt.Sprintf("listen on port %d: %v", next.Port, prepareErr))
+			}
+			if !runtimeStage.BeginPersist() {
+				runtimeStage.Abort()
+				return internal("endpoint runtime unavailable", errors.New("endpoint stage canceled"))
+			}
+		}
+		if err := writeCtx.Err(); err != nil {
+			if runtimeStage != nil {
+				runtimeStage.Abort()
+			}
+			return err
+		}
+		if err := s.Engine.UpdateEndpointContext(writeCtx, next); err != nil {
+			if runtimeStage != nil {
+				runtimeStage.Abort()
+			}
+			if errors.Is(err, state.ErrConflict) {
+				return conflict("endpoint port already exists")
+			}
+			if errors.Is(err, state.ErrNotFound) {
+				return notFound("endpoint not found")
+			}
+			return internal("persist endpoint", err)
+		}
+		if runtimeStage != nil {
+			runtimeStage.Commit()
+		} else if s.EndpointRuntime != nil {
+			s.EndpointRuntime.RemoveEndpoint(next.ID)
+		}
+		responseValue := s.endpointResponse(next, "database", false)
+		response = &responseValue
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	response := s.endpointResponse(next, "database", false)
-	return &response, nil
+	return response, nil
 }
 
 func (s *ControlPlaneService) DeleteEndpoint(id string) error {
+	return s.DeleteEndpointContext(context.Background(), id)
+}
+
+// DeleteEndpointContext deletes an endpoint while honoring request
+// cancellation during the state write admission and SQL delete.
+func (s *ControlPlaneService) DeleteEndpointContext(ctx context.Context, id string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if id == DefaultEndpointID {
 		return conflict("default endpoint is read-only")
 	}
@@ -337,14 +458,16 @@ func (s *ControlPlaneService) DeleteEndpoint(id string) error {
 	}
 	s.endpointMu.Lock()
 	defer s.endpointMu.Unlock()
-	if err := s.Engine.DeleteEndpoint(id); err != nil {
-		if errors.Is(err, state.ErrNotFound) {
-			return notFound("endpoint not found")
+	return s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
+		if err := s.Engine.DeleteEndpointContext(writeCtx, id); err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				return notFound("endpoint not found")
+			}
+			return internal("delete endpoint", err)
 		}
-		return internal("delete endpoint", err)
-	}
-	if s.EndpointRuntime != nil {
-		s.EndpointRuntime.RemoveEndpoint(id)
-	}
-	return nil
+		if s.EndpointRuntime != nil {
+			s.EndpointRuntime.RemoveEndpoint(id)
+		}
+		return nil
+	})
 }

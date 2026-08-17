@@ -3,7 +3,10 @@ package metrics
 import "testing"
 
 func TestCollector_RecordLatency_BoundaryAndOverflowBuckets(t *testing.T) {
-	c := NewCollector(100, 3000)
+	c, err := NewCollector(100, 3000)
+	if err != nil {
+		t.Fatalf("NewCollector: %v", err)
+	}
 
 	// Boundary value: overflow_ms itself should go to overflow bucket.
 	c.RecordRequest("", true, 3000, false)
@@ -33,7 +36,10 @@ func TestCollector_RecordLatency_BoundaryAndOverflowBuckets(t *testing.T) {
 }
 
 func TestCollector_SwapConnectionWindowMax_TracksPeakAndResetsBaseline(t *testing.T) {
-	c := NewCollector(100, 3000)
+	c, err := NewCollector(100, 3000)
+	if err != nil {
+		t.Fatalf("NewCollector: %v", err)
+	}
 
 	// inbound: 0 -> 1 -> 2 -> 1, outbound: 0 -> 1 -> 0
 	c.RecordConnection(ConnInbound, 1)

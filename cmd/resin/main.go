@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
@@ -26,6 +27,7 @@ import (
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/routing"
+	"github.com/Resinat/Resin/internal/service"
 	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/topology"
@@ -85,8 +87,18 @@ func loadRuntimeConfig(engine *state.StateEngine) *config.RuntimeConfig {
 		log.Println("No persisted runtime config found, using defaults")
 		return config.NewDefaultRuntimeConfig()
 	}
+	if err := validateLoadedRuntimeConfig(runtimeCfg); err != nil {
+		fatalf("load system config: invalid persisted runtime config: %v", err)
+	}
 	log.Printf("Loaded persisted runtime config (version %d)", ver)
 	return runtimeCfg
+}
+
+func validateLoadedRuntimeConfig(runtimeCfg *config.RuntimeConfig) error {
+	if runtimeCfg == nil {
+		return nil
+	}
+	return service.ValidateRuntimeConfig(runtimeCfg)
 }
 
 func newDirectDownloader(
@@ -125,57 +137,55 @@ type requestLogRuntimeSettings struct {
 	FlushInterval time.Duration
 }
 
-func deriveRequestLogRuntimeSettings(envCfg *config.EnvConfig) requestLogRuntimeSettings {
-	return requestLogRuntimeSettings{
-		DBMaxBytes:    int64(envCfg.RequestLogDBMaxMB) * 1024 * 1024,
-		DBRetainCount: envCfg.RequestLogDBRetainCount,
-		QueueSize:     envCfg.RequestLogQueueSize,
-		FlushBatch:    envCfg.RequestLogQueueFlushBatchSize,
-		FlushInterval: envCfg.RequestLogQueueFlushInterval,
+func deriveRequestLogRuntimeSettings(envCfg *config.EnvConfig) (requestLogRuntimeSettings, error) {
+	dbMaxBytes, err := config.RequestLogDBMaxBytes(envCfg.RequestLogDBMaxMB)
+	if err != nil {
+		return requestLogRuntimeSettings{}, err
 	}
+	queueSize := envCfg.RequestLogQueueSize
+	if queueSize <= 0 {
+		queueSize = 8192
+	}
+	batchSize := envCfg.RequestLogQueueFlushBatchSize
+	if batchSize <= 0 {
+		batchSize = 4096
+	}
+	if err := config.ValidateRequestLogQueueConfig(queueSize, batchSize); err != nil {
+		return requestLogRuntimeSettings{}, err
+	}
+	return requestLogRuntimeSettings{
+		DBMaxBytes:    dbMaxBytes,
+		DBRetainCount: envCfg.RequestLogDBRetainCount,
+		QueueSize:     queueSize,
+		FlushBatch:    batchSize,
+		FlushInterval: envCfg.RequestLogQueueFlushInterval,
+	}, nil
 }
 
 type metricsManagerSettings struct {
-	LatencyBinMs                int
-	LatencyOverflowMs           int
-	BucketSeconds               int
-	ThroughputIntervalSec       int
-	ThroughputRealtimeCapacity  int
-	ConnectionsIntervalSec      int
-	ConnectionsRealtimeCapacity int
-	LeasesIntervalSec           int
-	LeasesRealtimeCapacity      int
+	LatencyBinMs            int
+	LatencyOverflowMs       int
+	BucketSeconds           int
+	ThroughputIntervalSec   int
+	ThroughputRetentionSec  int
+	ConnectionsIntervalSec  int
+	ConnectionsRetentionSec int
+	LeasesIntervalSec       int
+	LeasesRetentionSec      int
 }
 
 func deriveMetricsManagerSettings(envCfg *config.EnvConfig) metricsManagerSettings {
 	return metricsManagerSettings{
-		LatencyBinMs:                envCfg.MetricLatencyBinWidthMS,
-		LatencyOverflowMs:           envCfg.MetricLatencyBinOverflowMS,
-		BucketSeconds:               envCfg.MetricBucketSeconds,
-		ThroughputIntervalSec:       envCfg.MetricThroughputIntervalSeconds,
-		ThroughputRealtimeCapacity:  realtimeCapacity(envCfg.MetricThroughputRetentionSeconds, envCfg.MetricThroughputIntervalSeconds),
-		ConnectionsIntervalSec:      envCfg.MetricConnectionsIntervalSeconds,
-		ConnectionsRealtimeCapacity: realtimeCapacity(envCfg.MetricConnectionsRetentionSeconds, envCfg.MetricConnectionsIntervalSeconds),
-		LeasesIntervalSec:           envCfg.MetricLeasesIntervalSeconds,
-		LeasesRealtimeCapacity:      realtimeCapacity(envCfg.MetricLeasesRetentionSeconds, envCfg.MetricLeasesIntervalSeconds),
+		LatencyBinMs:            envCfg.MetricLatencyBinWidthMS,
+		LatencyOverflowMs:       envCfg.MetricLatencyBinOverflowMS,
+		BucketSeconds:           envCfg.MetricBucketSeconds,
+		ThroughputIntervalSec:   envCfg.MetricThroughputIntervalSeconds,
+		ThroughputRetentionSec:  envCfg.MetricThroughputRetentionSeconds,
+		ConnectionsIntervalSec:  envCfg.MetricConnectionsIntervalSeconds,
+		ConnectionsRetentionSec: envCfg.MetricConnectionsRetentionSeconds,
+		LeasesIntervalSec:       envCfg.MetricLeasesIntervalSeconds,
+		LeasesRetentionSec:      envCfg.MetricLeasesRetentionSeconds,
 	}
-}
-
-func realtimeCapacity(retentionSec, intervalSec int) int {
-	if intervalSec <= 0 {
-		intervalSec = 1
-	}
-	if retentionSec <= 0 {
-		retentionSec = intervalSec
-	}
-	capacity := retentionSec / intervalSec
-	if retentionSec%intervalSec != 0 {
-		capacity++
-	}
-	if capacity <= 0 {
-		capacity = 1
-	}
-	return capacity
 }
 
 func newGeoIPService(
@@ -220,6 +230,23 @@ func newTopologyRuntime(
 				engine.MarkSubscriptionNodeDelete(subID, hash.Hex())
 			}
 		},
+		OnNodeAddedWithPersistence: func(hash node.Hash, admission topology.PersistenceAdmission) {
+			admission.MarkNodeStatic(hash.Hex())
+		},
+		OnSubNodeChangedWithPersistence: func(subID string, hash node.Hash, added bool, admission topology.PersistenceAdmission) {
+			if added {
+				admission.MarkSubscriptionNode(subID, hash.Hex())
+			} else {
+				admission.MarkSubscriptionNodeDelete(subID, hash.Hex())
+			}
+		},
+		OnFinalNodeRemoved: func(subID string, hash node.Hash, entry *node.NodeEntry) {
+			markFinalNodeRemovedDirty(engine, subID, hash, entry)
+		},
+		OnFinalNodeRemovedWithPersistence: func(subID string, hash node.Hash, entry *node.NodeEntry, admission topology.PersistenceAdmission) {
+			admission.MarkSubscriptionNodeDelete(subID, hash.Hex())
+			markNodeRemovedDirtyWithAdmission(admission, hash, entry)
+		},
 		OnNodeDynamicChanged: func(hash node.Hash) {
 			engine.MarkNodeDynamic(hash.Hex())
 		},
@@ -250,18 +277,18 @@ func newTopologyRuntime(
 	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
 		Pool:        pool,
 		Concurrency: envCfg.ProbeConcurrency,
-		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), envCfg.ProbeTimeout)
+		Fetcher: func(ctx context.Context, entry *node.NodeEntry, url string) ([]byte, time.Duration, error) {
+			ctx, cancel := context.WithTimeout(ctx, envCfg.ProbeTimeout)
 			defer cancel()
-			entry, ok := pool.GetEntry(hash)
-			if !ok {
+			if entry == nil {
 				return nil, 0, fmt.Errorf("node not found")
 			}
-			outboundPtr := entry.Outbound.Load()
-			if outboundPtr == nil {
+			nodeOutbound, release, ready := entry.AcquireOutbound()
+			if !ready {
 				return nil, 0, outbound.ErrOutboundNotReady
 			}
-			return netutil.HTTPGetViaOutbound(ctx, *outboundPtr, url, netutil.OutboundHTTPOptions{
+			defer release()
+			return netutil.HTTPGetViaOutbound(ctx, nodeOutbound, url, netutil.OutboundHTTPOptions{
 				RequireStatusOK: false,
 				OnConnLifecycle: func(op netutil.ConnLifecycleOp) {
 					if onProbeConnLifecycle != nil {
@@ -289,12 +316,13 @@ func newTopologyRuntime(
 
 	pool.SetOnNodeAdded(func(hash node.Hash) {
 		engine.MarkNodeStatic(hash.Hex())
-		outboundMgr.EnsureNodeOutbound(hash)
+	})
+	pool.SetOnNodeAddedRuntime(func(hash node.Hash, expected *node.NodeEntry) {
+		outboundMgr.EnsureNodeOutboundForEntry(hash, expected)
 		// No NotifyNodeDirty here — AddNodeFromSub already notifies all platforms.
-		probeMgr.TriggerImmediateEgressProbe(hash)
+		probeMgr.TriggerImmediateEgressProbeForEntry(hash, expected)
 	})
 	pool.SetOnNodeRemoved(func(hash node.Hash, entry *node.NodeEntry) {
-		markNodeRemovedDirty(engine, hash, entry)
 		outboundMgr.RemoveNodeOutbound(entry)
 		if entry != nil && entry.LatencyTable != nil {
 			entry.LatencyTable.Close()
@@ -309,18 +337,25 @@ func newTopologyRuntime(
 		SubManager: subManager,
 		Pool:       pool,
 		Downloader: downloader,
-		OnSubReenabledNode: func(hash node.Hash) {
-			outboundMgr.EnsureNodeOutbound(hash)
-			probeMgr.TriggerImmediateEgressProbe(hash)
-			probeMgr.TriggerImmediateLatencyProbe(hash)
+		RunRefreshMutation: func(fn func(topology.PersistenceAdmission)) bool {
+			return engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
+				fn(admission)
+			})
+		},
+		OnSubReenabledNode: func(hash node.Hash, expected *node.NodeEntry) {
+			outboundMgr.EnsureNodeOutboundForEntry(hash, expected)
+			probeMgr.TriggerImmediateEgressProbeForEntry(hash, expected)
+			probeMgr.TriggerImmediateLatencyProbeForEntry(hash, expected)
 		},
 	})
 	ephemeralCleaner := topology.NewEphemeralCleaner(
 		subManager,
 		pool,
 	)
-	ephemeralCleaner.SetOnNodeEvicted(func(subID string, hash node.Hash) {
-		engine.MarkSubscriptionNode(subID, hash.Hex())
+	ephemeralCleaner.SetPersistenceMutationRunner(func(fn func(topology.PersistenceAdmission)) bool {
+		return engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
+			fn(admission)
+		})
 	})
 
 	return &topologyRuntime{
@@ -334,16 +369,54 @@ func newTopologyRuntime(
 	}, nil
 }
 
+// beforeNodeRemovedDirtyMarkHook is a package-test seam for the compound
+// node-removal dirty-write boundary. Production leaves it nil.
+var beforeNodeRemovedDirtyMarkHook func(index int)
+
+// beforeFlushNodeDynamicReadHook is a package-test seam immediately before
+// the production cache reader loads one node's dynamic value. Production
+// leaves it nil; tests use it to place a runtime mutation between the static
+// and dynamic reads of one flush.
+var beforeFlushNodeDynamicReadHook func(string)
+
 func markNodeRemovedDirty(engine *state.StateEngine, hash node.Hash, entry *node.NodeEntry) {
+	engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
+		markNodeRemovedDirtyWithAdmission(admission, hash, entry)
+	})
+}
+
+func markFinalNodeRemovedDirty(
+	engine *state.StateEngine,
+	subID string,
+	hash node.Hash,
+	entry *node.NodeEntry,
+) {
+	engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
+		admission.MarkSubscriptionNodeDelete(subID, hash.Hex())
+		markNodeRemovedDirtyWithAdmission(admission, hash, entry)
+	})
+}
+
+func markNodeRemovedDirtyWithAdmission(
+	admission topology.PersistenceAdmission,
+	hash node.Hash,
+	entry *node.NodeEntry,
+) {
+	if admission == nil {
+		return
+	}
 	hashHex := hash.Hex()
-	engine.MarkNodeStaticDelete(hashHex)
-	engine.MarkNodeDynamicDelete(hashHex)
+	admission.MarkNodeStaticDelete(hashHex)
+	if hook := beforeNodeRemovedDirtyMarkHook; hook != nil {
+		hook(1)
+	}
+	admission.MarkNodeDynamicDelete(hashHex)
 
 	if entry == nil || entry.LatencyTable == nil {
 		return
 	}
 	entry.LatencyTable.Range(func(domain string, _ node.DomainLatencyStats) bool {
-		engine.MarkNodeLatencyDelete(hashHex, domain)
+		admission.MarkNodeLatencyDelete(hashHex, domain)
 		return true
 	})
 }
@@ -390,7 +463,15 @@ func bootstrapTopology(
 		if err != nil {
 			return err
 		}
-		pool.RegisterPlatform(plat)
+		if err := pool.RegisterPlatform(plat); err != nil {
+			if errors.Is(err, topology.ErrPlatformAlreadyRegistered) {
+				if err := pool.ReplacePlatform(plat); err != nil {
+					return fmt.Errorf("replace bootstrapped platform %s: %w", mp.ID, err)
+				}
+				continue
+			}
+			return fmt.Errorf("register bootstrapped platform %s: %w", mp.ID, err)
+		}
 	}
 	log.Printf("Loaded %d platforms from state.db", len(dbPlats))
 	return nil
@@ -471,6 +552,13 @@ func newFlushReaders(
 	router *routing.Router,
 ) state.CacheReaders {
 	return state.CacheReaders{
+		WithNodeSnapshot: func(fn func()) {
+			if pool == nil {
+				fn()
+				return
+			}
+			pool.WithRuntimeRead(fn)
+		},
 		ReadNodeStatic: func(hash string) *model.NodeStatic {
 			h, err := node.ParseHex(hash)
 			if err != nil {
@@ -487,6 +575,9 @@ func newFlushReaders(
 			}
 		},
 		ReadNodeDynamic: func(hash string) *model.NodeDynamic {
+			if hook := beforeFlushNodeDynamicReadHook; hook != nil {
+				hook(hash)
+			}
 			h, err := node.ParseHex(hash)
 			if err != nil {
 				return nil
@@ -533,7 +624,7 @@ func newFlushReaders(
 			}
 		},
 		ReadLease: func(key model.LeaseKey) *model.Lease {
-			return router.ReadLease(key)
+			return router.ReadLeaseForPersistence(key)
 		},
 		ReadSubscriptionNode: func(key model.SubscriptionNodeKey) *model.SubscriptionNode {
 			h, err := node.ParseHex(key.NodeHash)
@@ -578,118 +669,159 @@ type runtimeStatsAdapter struct {
 	pool        *topology.GlobalNodePool
 	router      *routing.Router
 	authorities func() []string
+
+	// beforePlatformStatsViewSnapshotHook is a package-private deterministic
+	// test seam after capturing a platform view and before reading pool entries.
+	// Production leaves it nil.
+	beforePlatformStatsViewSnapshotHook func()
 }
 
-func (a *runtimeStatsAdapter) TotalNodes() int { return a.pool.Size() }
+func (a *runtimeStatsAdapter) TotalNodes() (count int) {
+	a.pool.WithRuntimeRead(func() {
+		count = a.pool.Size()
+	})
+	return count
+}
 
 func (a *runtimeStatsAdapter) HealthyNodes() int {
 	count := 0
-	isHealthyAndEnabled := a.pool.MakeHealthyAndEnabledEvaluator()
-	a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
-		if isHealthyAndEnabled(entry) {
-			count++
-		}
-		return true
+	a.pool.WithRuntimeRead(func() {
+		isHealthyAndEnabled := a.pool.MakeHealthyAndEnabledEvaluator()
+		a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
+			if isHealthyAndEnabled(entry) {
+				count++
+			}
+			return true
+		})
 	})
 	return count
 }
 
 func (a *runtimeStatsAdapter) EgressIPCount() int {
 	seen := make(map[netip.Addr]struct{})
-	a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
-		if ip := entry.GetEgressIP(); ip.IsValid() {
-			seen[ip] = struct{}{}
-		}
-		return true
+	a.pool.WithRuntimeRead(func() {
+		a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
+			if ip := entry.GetEgressIP(); ip.IsValid() {
+				seen[ip] = struct{}{}
+			}
+			return true
+		})
 	})
 	return len(seen)
 }
 
 func (a *runtimeStatsAdapter) UniqueHealthyEgressIPCount() int {
 	seen := make(map[netip.Addr]struct{})
-	isHealthyAndEnabled := a.pool.MakeHealthyAndEnabledEvaluator()
-	a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
-		if !isHealthyAndEnabled(entry) {
+	a.pool.WithRuntimeRead(func() {
+		isHealthyAndEnabled := a.pool.MakeHealthyAndEnabledEvaluator()
+		a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
+			if !isHealthyAndEnabled(entry) {
+				return true
+			}
+			if ip := entry.GetEgressIP(); ip.IsValid() {
+				seen[ip] = struct{}{}
+			}
 			return true
-		}
-		if ip := entry.GetEgressIP(); ip.IsValid() {
-			seen[ip] = struct{}{}
-		}
-		return true
+		})
 	})
 	return len(seen)
 }
 
 func (a *runtimeStatsAdapter) LeaseCountsByPlatform() map[string]int {
 	result := make(map[string]int)
-	a.pool.RangePlatforms(func(plat *platform.Platform) bool {
-		count := 0
-		a.router.RangeLeases(plat.ID, func(_ string, _ routing.Lease) bool {
-			count++
+	a.pool.WithRuntimeRead(func() {
+		a.pool.RangePlatforms(func(plat *platform.Platform) bool {
+			count := 0
+			a.router.RangeLeases(plat.ID, func(_ string, _ routing.Lease) bool {
+				count++
+				return true
+			})
+			if count > 0 {
+				result[plat.ID] = count
+			}
 			return true
 		})
-		if count > 0 {
-			result[plat.ID] = count
-		}
-		return true
 	})
 	return result
 }
 
 func (a *runtimeStatsAdapter) RoutableNodeCount(platformID string) (int, bool) {
-	plat, ok := a.pool.GetPlatform(platformID)
-	if !ok {
-		return 0, false
-	}
-	return plat.View().Size(), true
+	count := 0
+	ok := false
+	a.pool.WithRuntimeRead(func() {
+		entries, found := a.pool.SnapshotPlatformViewEntries(platformID)
+		if !found {
+			return
+		}
+		ok = true
+		for _, viewEntry := range entries {
+			entry, found := a.pool.GetEntry(viewEntry.Hash)
+			if found && entry == viewEntry.Entry {
+				count++
+			}
+		}
+	})
+	return count, ok
 }
 
 func (a *runtimeStatsAdapter) PlatformEgressIPCount(platformID string) (int, bool) {
-	plat, ok := a.pool.GetPlatform(platformID)
-	if !ok {
-		return 0, false
-	}
 	seen := make(map[netip.Addr]struct{})
-	plat.View().Range(func(h node.Hash) bool {
-		entry, ok := a.pool.GetEntry(h)
-		if ok {
+	ok := false
+	a.pool.WithRuntimeRead(func() {
+		viewEntries, found := a.pool.SnapshotPlatformViewEntries(platformID)
+		if !found {
+			return
+		}
+		ok = true
+		if hook := a.beforePlatformStatsViewSnapshotHook; hook != nil {
+			hook()
+		}
+		for _, viewEntry := range viewEntries {
+			entry, found := a.pool.GetEntry(viewEntry.Hash)
+			if !found || entry != viewEntry.Entry {
+				continue
+			}
 			if ip := entry.GetEgressIP(); ip.IsValid() {
 				seen[ip] = struct{}{}
 			}
 		}
-		return true
 	})
-	return len(seen), true
+	return len(seen), ok
 }
 
 func (a *runtimeStatsAdapter) CollectNodeEWMAs(platformID string) []float64 {
 	authorities := a.authorities()
 	var ewmas []float64
 
-	if platformID == "" {
-		// Global: iterate all nodes.
-		a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
-			if avg, ok := node.AverageEWMAForDomainsMs(entry, authorities); ok {
-				ewmas = append(ewmas, avg)
-			}
-			return true
-		})
-	} else {
-		// Platform-scoped: iterate only nodes routable by this platform.
-		plat, ok := a.pool.GetPlatform(platformID)
-		if !ok {
-			return nil
-		}
-		plat.View().Range(func(h node.Hash) bool {
-			entry, ok := a.pool.GetEntry(h)
-			if ok {
+	a.pool.WithRuntimeRead(func() {
+		if platformID == "" {
+			// Global: iterate all nodes.
+			a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
 				if avg, ok := node.AverageEWMAForDomainsMs(entry, authorities); ok {
 					ewmas = append(ewmas, avg)
 				}
+				return true
+			})
+			return
+		}
+		// Platform-scoped: iterate only nodes routable by this platform.
+		viewEntries, ok := a.pool.SnapshotPlatformViewEntries(platformID)
+		if !ok {
+			return
+		}
+		if hook := a.beforePlatformStatsViewSnapshotHook; hook != nil {
+			hook()
+		}
+		for _, viewEntry := range viewEntries {
+			entry, ok := a.pool.GetEntry(viewEntry.Hash)
+			if !ok || entry != viewEntry.Entry {
+				continue
 			}
-			return true
-		})
-	}
+			if avg, ok := node.AverageEWMAForDomainsMs(entry, authorities); ok {
+				ewmas = append(ewmas, avg)
+			}
+		}
+	})
 	return ewmas
 }
 
@@ -905,6 +1037,21 @@ func restoreBootstrapNodeLatencies(
 				regular = append(regular, row)
 			}
 		}
+		sort.SliceStable(authorities, func(i, j int) bool {
+			if authorities[i].LastUpdatedNs == authorities[j].LastUpdatedNs {
+				return authorities[i].Domain < authorities[j].Domain
+			}
+			return authorities[i].LastUpdatedNs > authorities[j].LastUpdatedNs
+		})
+		if len(authorities) > node.MaxLatencyAuthorityEntries {
+			for _, dropped := range authorities[node.MaxLatencyAuthorityEntries:] {
+				if !engine.MarkNodeLatencyDelete(dropped.NodeHash, dropped.Domain) {
+					return fmt.Errorf("mark trimmed node latency %s/%s", dropped.NodeHash, dropped.Domain)
+				}
+				trimmedCount++
+			}
+			authorities = authorities[:node.MaxLatencyAuthorityEntries]
+		}
 		sort.SliceStable(regular, func(i, j int) bool {
 			if regular[i].LastUpdatedNs == regular[j].LastUpdatedNs {
 				return regular[i].Domain < regular[j].Domain
@@ -920,11 +1067,17 @@ func restoreBootstrapNodeLatencies(
 		}
 
 		for _, row := range authorities {
-			entry.LatencyTable.LoadEntryClassified(row.Domain, node.DomainLatencyStats{
+			evictedDomain, evicted := entry.LatencyTable.LoadEntryClassified(row.Domain, node.DomainLatencyStats{
 				Ewma:        time.Duration(row.EwmaNs),
 				LastUpdated: time.Unix(0, row.LastUpdatedNs),
 			}, true)
 			loadedCount++
+			if evicted {
+				if !engine.MarkNodeLatencyDelete(nodeHash, evictedDomain) {
+					return fmt.Errorf("mark evicted node latency %s/%s", nodeHash, evictedDomain)
+				}
+				trimmedCount++
+			}
 		}
 		// regular is sorted by LastUpdated desc (newest -> oldest).
 		// Load in reverse so in-memory LRU order stays oldest -> newest.
@@ -957,6 +1110,12 @@ func bootstrapNodes(
 	}
 
 	warmupBootstrapOutbounds(hashes, outboundMgr)
+	bootstrapSucceeded := false
+	defer func() {
+		if !bootstrapSucceeded {
+			outboundMgr.RetireAllOutboundsAndWait()
+		}
+	}()
 
 	if err := restoreBootstrapSubscriptionBindings(engine, pool, subManager); err != nil {
 		return err
@@ -972,5 +1131,6 @@ func bootstrapNodes(
 	); err != nil {
 		return err
 	}
+	bootstrapSucceeded = true
 	return nil
 }

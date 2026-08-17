@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/node"
+	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -889,6 +891,83 @@ func TestSocks5Inbound_BaseContextCancelCancelsPrepareDial(t *testing.T) {
 	}
 
 	_ = clientConn.Close()
+}
+
+func TestSocks5Inbound_BaseContextCancelStopsEstablishedTunnel(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	hash := node.HashFromRawOptions([]byte(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	entry, ok := env.pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("node not found in pool")
+	}
+	outbound := &gatedRoundTripOutbound{
+		dialEntered:  make(chan struct{}),
+		allowDial:    make(chan struct{}),
+		closeEntered: make(chan struct{}),
+	}
+	close(outbound.allowDial)
+	var raw adapter.Outbound = outbound
+	entry.Outbound.Store(&raw)
+	defer entry.RetireOutbound()
+
+	inbound := NewSocks5Inbound(Socks5InboundConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+	})
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	done := make(chan struct{})
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	go func() {
+		defer close(done)
+		inbound.ServeConnContext(baseCtx, serverConn)
+	}()
+	defer serverConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+	writeAll(t, clientConn, []byte{socks5Version, 1, socks5MethodUserPass})
+	if got := readExactly(t, reader, 2); got[1] != socks5MethodUserPass {
+		t.Fatalf("selected method: got %d, want %d", got[1], socks5MethodUserPass)
+	}
+	writeAll(t, clientConn, socks5UserPassPacket("plat.acct", "tok"))
+	if got := readExactly(t, reader, 2); got[1] != socks5UserPassStatusSuccess {
+		t.Fatalf("auth status: got %d, want %d", got[1], socks5UserPassStatusSuccess)
+	}
+	writeAll(t, clientConn, socks5ConnectIPv4Packet("127.0.0.1:443"))
+	reply := readExactly(t, reader, 10)
+	if reply[0] != socks5Version || reply[1] != socks5ReplySucceeded {
+		t.Fatalf("connect reply: got %v, want success", reply)
+	}
+
+	// The base context is the real demux lifetime context. Once the SOCKS
+	// handshake and upstream dial have completed, cancellation must still tear
+	// down both copy directions and release the leased upstream connection.
+	cancelBase()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		// Unblock the old implementation so this red test does not leave a
+		// tunnel goroutine behind while reporting the failure.
+		_ = clientConn.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("established tunnel did not clean up after test release")
+		}
+		t.Fatal("base context cancellation did not stop the established tunnel")
+	}
+	entry.RetireOutbound()
+	select {
+	case <-outbound.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("established tunnel did not release its outbound lease")
+	}
+	if got := outbound.closeCount.Load(); got != 1 {
+		t.Fatalf("outbound close count = %d, want 1", got)
+	}
 }
 
 func TestSocks5Inbound_BaseContextCancelInterruptsHandshake(t *testing.T) {

@@ -1,17 +1,379 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/model"
 )
+
+func TestStateRepoCloseWriteAdmissionCancelsInFlightMutation(t *testing.T) {
+	repo := newTestStateRepo(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	repo.beforeWriteHook = func() {
+		close(entered)
+		<-release
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- repo.UpsertSubscription(model.Subscription{
+			ID:               "cancelled-write",
+			Name:             "cancelled-write",
+			SourceType:       "local",
+			Content:          "{}",
+			UpdateIntervalNs: int64(30 * time.Second),
+			CreatedAtNs:      1,
+			UpdatedAtNs:      1,
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("state write did not pass admission")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- repo.CloseStateWriteAdmissionAndWait(context.Background())
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close returned before admitted write exited: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-writeDone; err == nil {
+		t.Fatal("cancelled state write unexpectedly succeeded")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseStateWriteAdmissionAndWait: %v", err)
+	}
+
+	rows, err := repo.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("ListSubscriptions: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("cancelled state write persisted rows: %+v", rows)
+	}
+}
+
+func TestStateRepo_SaveSystemConfigContextHonorsCancellationWhileWriteOwnerIsHeld(t *testing.T) {
+	repo := newTestStateRepo(t)
+	repo.mu.Lock()
+	writeLockAttempted := make(chan struct{})
+	repo.beforeWriteMutexHook = func() {
+		close(writeLockAttempted)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- repo.SaveSystemConfigContext(
+			ctx,
+			config.NewDefaultRuntimeConfig(),
+			1,
+			time.Now().UnixNano(),
+		)
+	}()
+	select {
+	case <-writeLockAttempted:
+	case <-time.After(time.Second):
+		repo.mu.Unlock()
+		t.Fatal("state write did not reach the serialized write owner")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SaveSystemConfigContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		repo.mu.Unlock()
+		<-result
+		t.Fatal("canceled state write remained blocked on the write owner")
+	}
+
+	repo.mu.Unlock()
+}
+
+func TestStateRepo_EndpointContextWritesHonorRepositoryMutexCancellation(t *testing.T) {
+	tests := []struct {
+		name  string
+		call  func(context.Context, *StateRepo, model.Endpoint) error
+		check func(*testing.T, *StateRepo, model.Endpoint)
+	}{
+		{
+			name: "insert",
+			call: func(ctx context.Context, repo *StateRepo, endpoint model.Endpoint) error {
+				return repo.InsertEndpointContext(ctx, endpoint)
+			},
+			check: func(t *testing.T, repo *StateRepo, endpoint model.Endpoint) {
+				_, err := repo.GetEndpoint(endpoint.ID)
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("canceled insert left endpoint: %v", err)
+				}
+			},
+		},
+		{
+			name: "update",
+			call: func(ctx context.Context, repo *StateRepo, endpoint model.Endpoint) error {
+				endpoint.Port++
+				return repo.UpdateEndpointContext(ctx, endpoint)
+			},
+			check: func(t *testing.T, repo *StateRepo, endpoint model.Endpoint) {
+				got, err := repo.GetEndpoint(endpoint.ID)
+				if err != nil {
+					t.Fatalf("GetEndpoint after canceled update: %v", err)
+				}
+				if got.Port != endpoint.Port {
+					t.Fatalf("canceled update changed port to %d, want %d", got.Port, endpoint.Port)
+				}
+			},
+		},
+		{
+			name: "delete",
+			call: func(ctx context.Context, repo *StateRepo, endpoint model.Endpoint) error {
+				return repo.DeleteEndpointContext(ctx, endpoint.ID)
+			},
+			check: func(t *testing.T, repo *StateRepo, endpoint model.Endpoint) {
+				if _, err := repo.GetEndpoint(endpoint.ID); err != nil {
+					t.Fatalf("canceled delete removed endpoint: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newTestStateRepo(t)
+			endpoint := model.Endpoint{
+				ID:               "mutex-cancel-" + tc.name,
+				Port:             32600,
+				Enabled:          false,
+				AllowProxy:       true,
+				AllowHTTPForward: true,
+				AllowHTTPReverse: true,
+				AllowSOCKS5:      true,
+				CreatedAtNs:      1,
+				UpdatedAtNs:      1,
+			}
+			if tc.name != "insert" {
+				if err := repo.InsertEndpoint(endpoint); err != nil {
+					t.Fatalf("seed endpoint: %v", err)
+				}
+			}
+
+			mutexAttempted := make(chan struct{})
+			repo.beforeWriteMutexHook = func() { close(mutexAttempted) }
+			repo.mu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					repo.mu.Unlock()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- tc.call(ctx, repo, endpoint) }()
+			select {
+			case <-mutexAttempted:
+			case <-time.After(time.Second):
+				t.Fatal("endpoint write did not reach the repository mutex boundary")
+			}
+			cancel()
+
+			var err error
+			select {
+			case err = <-result:
+			case <-time.After(300 * time.Millisecond):
+				repo.mu.Unlock()
+				locked = false
+				err = <-result
+				t.Fatalf("canceled endpoint %s remained blocked on repository mutex: %v", tc.name, err)
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("endpoint %s error = %v, want context.Canceled", tc.name, err)
+			}
+			repo.mu.Unlock()
+			locked = false
+			tc.check(t, repo, endpoint)
+		})
+	}
+}
+
+func TestPersistenceCloser_CloseContextHonorsDeadlineForBlockedStateWrite(t *testing.T) {
+	engine, closer, err := PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+
+	writeEntered := make(chan struct{})
+	writeRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	engine.StateRepo.beforeWriteHook = func() {
+		close(writeEntered)
+		<-writeRelease
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- engine.UpsertSubscription(model.Subscription{
+			ID:               "blocked-close-write",
+			Name:             "blocked-close-write",
+			SourceType:       "local",
+			Content:          "{}",
+			UpdateIntervalNs: int64(30 * time.Second),
+			CreatedAtNs:      1,
+			UpdatedAtNs:      1,
+		})
+	}()
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		releaseOnce.Do(func() { close(writeRelease) })
+		_ = closer.Close()
+		t.Fatal("state write did not pass admission")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- closer.CloseContext(ctx)
+	}()
+	select {
+	case err = <-closeDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			releaseOnce.Do(func() { close(writeRelease) })
+			<-writeDone
+			_ = closer.Close()
+			t.Fatalf("CloseContext error = %v, want context deadline exceeded", err)
+		}
+		if err := engine.StateRepo.db.Ping(); err != nil {
+			releaseOnce.Do(func() { close(writeRelease) })
+			<-writeDone
+			_ = closer.Close()
+			t.Fatalf("CloseContext closed the DB while a state write was still active: %v", err)
+		}
+	case <-time.After(time.Second):
+		releaseOnce.Do(func() { close(writeRelease) })
+		<-writeDone
+		_ = closer.Close()
+		t.Fatal("CloseContext ignored its deadline while the state write was blocked")
+	}
+
+	releaseOnce.Do(func() { close(writeRelease) })
+	if err := <-writeDone; err == nil {
+		t.Fatal("blocked state write unexpectedly succeeded")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("final persistence close: %v", err)
+	}
+}
+
+func TestPersistenceCloser_DoesNotCloseCacheDBWhileFlushOwnerUnwinds(t *testing.T) {
+	engine, closer, err := PersistenceBootstrap(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	readers := CacheReaders{
+		ReadNodeStatic: func(hash string) *model.NodeStatic {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			return &model.NodeStatic{Hash: hash, RawOptions: []byte(`{}`), CreatedAtNs: 1}
+		},
+	}
+	worker := NewCacheFlushWorker(
+		engine,
+		readers,
+		func() int { return 10_000 },
+		func() time.Duration { return time.Hour },
+		time.Hour,
+	)
+	if !engine.MarkNodeStatic("flush-owner") {
+		t.Fatal("initial dirty mark was rejected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- worker.StopContext(ctx) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		<-stopDone
+		_ = closer.Close()
+		t.Fatal("final cache flush did not enter the blocking reader")
+	}
+	<-ctx.Done()
+	select {
+	case err := <-stopDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			close(release)
+			_ = worker.StopContext(context.Background())
+			_ = closer.Close()
+			t.Fatalf("StopContext error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-stopDone
+		_ = closer.Close()
+		t.Fatal("StopContext did not honor its deadline")
+	}
+
+	// The flush owner is still inside the reader. Persistence close must not
+	// close cache.db behind it merely because the caller's context expired.
+	if err := closer.CloseContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		close(release)
+		_ = worker.StopContext(context.Background())
+		_ = closer.Close()
+		t.Fatalf("CloseContext error = %v, want deadline exceeded", err)
+	}
+	if err := engine.CacheRepo.db.Ping(); err != nil {
+		close(release)
+		_ = worker.StopContext(context.Background())
+		_ = closer.Close()
+		t.Fatalf("CloseContext closed cache.db while flush owner was still active: %v", err)
+	}
+
+	close(release)
+	if err := worker.StopContext(context.Background()); err != nil {
+		t.Fatalf("second StopContext error = %v, want completed owner", err)
+	}
+	if dirty := engine.DirtyCount(); dirty != 0 {
+		t.Fatalf("flush owner left %d dirty entries after release", dirty)
+	}
+	nodes, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Hash != "flush-owner" {
+		t.Fatalf("flush owner did not persist after release: %+v", nodes)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("final persistence close: %v", err)
+	}
+}
 
 // helper: create a state.db in a temp dir, init DDL, return StateRepo + cleanup.
 func newTestStateRepo(t *testing.T) *StateRepo {
@@ -524,6 +886,40 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	}
 	if _, err := repo.GetPlatform("plat-1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+}
+
+func TestStateRepo_InsertPlatformRejectsDuplicateIDWithoutOverwrite(t *testing.T) {
+	repo := newTestStateRepo(t)
+	original := model.Platform{
+		ID:                     "platform-existing-id",
+		Name:                   "ExistingPlatform",
+		StickyTTLNs:            int64(time.Hour),
+		RegexFilters:           []string{},
+		RegionFilters:          []string{},
+		ReverseProxyMissAction: "TREAT_AS_EMPTY",
+		AllocationPolicy:       "BALANCED",
+		UpdatedAtNs:            1,
+	}
+	if err := repo.UpsertPlatform(original); err != nil {
+		t.Fatalf("seed platform: %v", err)
+	}
+
+	duplicate := original
+	duplicate.Name = "ReplacementPlatform"
+	duplicate.StickyTTLNs = int64(2 * time.Hour)
+	if err := repo.InsertPlatform(duplicate); err == nil {
+		t.Fatal("InsertPlatform unexpectedly overwrote an existing ID")
+	} else if !errors.Is(err, ErrConflict) {
+		t.Fatalf("InsertPlatform duplicate ID error = %v, want ErrConflict", err)
+	}
+
+	got, err := repo.GetPlatform(original.ID)
+	if err != nil {
+		t.Fatalf("GetPlatform after rejected insert: %v", err)
+	}
+	if got.Name != original.Name || got.StickyTTLNs != original.StickyTTLNs {
+		t.Fatalf("duplicate insert mutated existing platform: got name=%q ttl=%d", got.Name, got.StickyTTLNs)
 	}
 }
 

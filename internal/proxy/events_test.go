@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"sync/atomic"
+	"testing"
+)
 
 type recordingEmitter struct {
 	finished int
@@ -20,8 +23,10 @@ func (e *recordingEmitter) EmitRequestLog(entry RequestLogEntry) {
 func TestConfigAwareEventEmitter_DisabledRequestLog(t *testing.T) {
 	base := &recordingEmitter{}
 	emitter := ConfigAwareEventEmitter{
-		Base:              base,
-		RequestLogEnabled: func() bool { return false },
+		Base: base,
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			return RequestLogRuntimeConfig{Enabled: false}
+		},
 	}
 
 	emitter.EmitRequestFinished(RequestFinishedEvent{})
@@ -38,8 +43,10 @@ func TestConfigAwareEventEmitter_DisabledRequestLog(t *testing.T) {
 func TestConfigAwareEventEmitter_EnabledRequestLog(t *testing.T) {
 	base := &recordingEmitter{}
 	emitter := ConfigAwareEventEmitter{
-		Base:              base,
-		RequestLogEnabled: func() bool { return true },
+		Base: base,
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			return RequestLogRuntimeConfig{Enabled: true}
+		},
 	}
 
 	emitter.EmitRequestLog(RequestLogEntry{})
@@ -50,7 +57,9 @@ func TestConfigAwareEventEmitter_EnabledRequestLog(t *testing.T) {
 
 func TestConfigAwareEventEmitter_NilBase(t *testing.T) {
 	emitter := ConfigAwareEventEmitter{
-		RequestLogEnabled: func() bool { return true },
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			return RequestLogRuntimeConfig{Enabled: true}
+		},
 	}
 	emitter.EmitRequestFinished(RequestFinishedEvent{})
 	emitter.EmitRequestLog(RequestLogEntry{})
@@ -66,20 +75,16 @@ func TestConfigAwareEventEmitter_ReverseHeadersTruncationHotReload(t *testing.T)
 	detailEnabled := true
 
 	emitter := ConfigAwareEventEmitter{
-		Base:                         base,
-		RequestLogEnabled:            func() bool { return true },
-		ReverseProxyLogDetailEnabled: func() bool { return detailEnabled },
-		ReverseProxyLogReqHeadersMaxBytes: func() int {
-			return reqHeadersMaxBytes
-		},
-		ReverseProxyLogReqBodyMaxBytes: func() int {
-			return reqBodyMaxBytes
-		},
-		ReverseProxyLogRespHeadersMaxBytes: func() int {
-			return respHeadersMaxBytes
-		},
-		ReverseProxyLogRespBodyMaxBytes: func() int {
-			return respBodyMaxBytes
+		Base: base,
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			return RequestLogRuntimeConfig{
+				Enabled:             true,
+				DetailEnabled:       detailEnabled,
+				ReqHeadersMaxBytes:  reqHeadersMaxBytes,
+				ReqBodyMaxBytes:     reqBodyMaxBytes,
+				RespHeadersMaxBytes: respHeadersMaxBytes,
+				RespBodyMaxBytes:    respBodyMaxBytes,
+			}
 		},
 	}
 
@@ -186,5 +191,57 @@ func TestConfigAwareEventEmitter_ReverseHeadersTruncationHotReload(t *testing.T)
 	if base.lastLog.RespBodyLen != 0 || len(base.lastLog.RespBody) != 0 || base.lastLog.RespBodyTruncated {
 		t.Fatalf("RespBody(detail off) = len:%d payload:%d truncated:%v, want 0,0,false",
 			base.lastLog.RespBodyLen, len(base.lastLog.RespBody), base.lastLog.RespBodyTruncated)
+	}
+}
+
+func TestConfigAwareEventEmitter_DoesNotMixRuntimeConfigGenerations(t *testing.T) {
+	base := &recordingEmitter{}
+	var generation atomic.Int32
+
+	// The first limit read observes generation A and publishes generation B
+	// before the remaining limits are read. A single event must still use one
+	// complete configuration generation.
+	emitter := ConfigAwareEventEmitter{
+		Base: base,
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			if generation.CompareAndSwap(0, 1) {
+				return RequestLogRuntimeConfig{
+					Enabled:             true,
+					DetailEnabled:       true,
+					ReqHeadersMaxBytes:  1,
+					ReqBodyMaxBytes:     1,
+					RespHeadersMaxBytes: 1,
+					RespBodyMaxBytes:    1,
+				}
+			}
+			return RequestLogRuntimeConfig{
+				Enabled:             true,
+				DetailEnabled:       true,
+				ReqHeadersMaxBytes:  9,
+				ReqBodyMaxBytes:     9,
+				RespHeadersMaxBytes: 9,
+				RespBodyMaxBytes:    9,
+			}
+		},
+	}
+
+	emitter.EmitRequestLog(RequestLogEntry{
+		ProxyType:   ProxyTypeReverse,
+		ReqHeaders:  []byte("0123456789"),
+		ReqBody:     []byte("0123456789"),
+		RespHeaders: []byte("0123456789"),
+		RespBody:    []byte("0123456789"),
+	})
+
+	got := []int{
+		len(base.lastLog.ReqHeaders),
+		len(base.lastLog.ReqBody),
+		len(base.lastLog.RespHeaders),
+		len(base.lastLog.RespBody),
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] != got[0] {
+			t.Fatalf("mixed runtime config generations: captured lengths = %v", got)
+		}
 	}
 }

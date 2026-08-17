@@ -1,6 +1,14 @@
 package config
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
+
+// MaxReverseProxyLogCaptureBytes bounds each captured request/response header
+// or body field. Capture uses an in-memory bytes.Buffer, so an unbounded hot
+// configuration would turn one request into an unbounded allocation.
+const MaxReverseProxyLogCaptureBytes = 16 * 1024 * 1024
 
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
@@ -57,4 +65,30 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		CacheFlushInterval:       Duration(5 * time.Minute),
 		CacheFlushDirtyThreshold: 1000,
 	}
+}
+
+// ValidateRuntimeLogCaptureLimits validates all in-memory payload capture
+// limits shared by runtime PATCH and persisted-config bootstrap.
+func ValidateRuntimeLogCaptureLimits(cfg *RuntimeConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	limits := []struct {
+		name  string
+		value int
+	}{
+		{"reverse_proxy_log_req_headers_max_bytes", cfg.ReverseProxyLogReqHeadersMaxBytes},
+		{"reverse_proxy_log_req_body_max_bytes", cfg.ReverseProxyLogReqBodyMaxBytes},
+		{"reverse_proxy_log_resp_headers_max_bytes", cfg.ReverseProxyLogRespHeadersMaxBytes},
+		{"reverse_proxy_log_resp_body_max_bytes", cfg.ReverseProxyLogRespBodyMaxBytes},
+	}
+	for _, limit := range limits {
+		if limit.value < 0 {
+			return fmt.Errorf("%s: must be non-negative", limit.name)
+		}
+		if limit.value > MaxReverseProxyLogCaptureBytes {
+			return fmt.Errorf("%s: must be <= %d", limit.name, MaxReverseProxyLogCaptureBytes)
+		}
+	}
+	return nil
 }

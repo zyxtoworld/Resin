@@ -1,28 +1,76 @@
 package metrics
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
 )
 
-func (m *Manager) prepareHistoryRead(now time.Time) error {
+func (m *Manager) prepareHistoryRead(ctx context.Context, now time.Time) error {
+	if hook := m.beforeHistoryPrepareHook; hook != nil {
+		hook()
+	}
+	m.historyBucketMu.Lock()
+	defer m.historyBucketMu.Unlock()
+	return m.prepareHistoryReadNoBucketLock(ctx, now)
+}
+
+// prepareHistoryReadNoBucketLock prepares a history query while the caller
+// owns historyBucketMu's write side. The caller must not invoke it while
+// holding the read side: preparation may rotate buckets and persist tasks.
+func (m *Manager) prepareHistoryReadNoBucketLock(ctx context.Context, now time.Time) error {
 	if m.repo == nil {
 		return fmt.Errorf("metrics repo is nil")
 	}
-	// Ensure current bucket state is advanced even if bucketLoop is delayed.
-	m.advanceAndMaybeFlush(now)
-	// Opportunistically persist due/pending buckets.
-	m.flushPendingTasks("[metrics] history-triggered persistence failed, will retry next tick")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Ensure current bucket state is advanced even if bucketLoop is delayed and
+	// keep the persistence retry inside the same shutdown admission.
+	admitted := m.withFlushAdmission(func() {
+		if ctx.Err() != nil {
+			return
+		}
+		m.advanceAndMaybeFlushNoAdmission(now)
+		m.flushPendingTasksContext(ctx, "[metrics] history-triggered persistence failed, will retry next tick")
+	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !admitted {
+		return fmt.Errorf("metrics history flush admission is closed")
+	}
 	return nil
 }
 
 func (m *Manager) QueryHistoryTraffic(fromUnix, toUnix int64) ([]TrafficBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryTrafficContext(context.Background(), fromUnix, toUnix)
+}
+
+func (m *Manager) queryHistoryTrafficAt(fromUnix, toUnix int64, now time.Time) ([]TrafficBucketRow, error) {
+	return m.queryHistoryTrafficAtContext(context.Background(), fromUnix, toUnix, now)
+}
+
+// QueryHistoryTrafficContext reads traffic history while honoring both the
+// caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryTrafficContext(ctx context.Context, fromUnix, toUnix int64) ([]TrafficBucketRow, error) {
+	return m.queryHistoryTrafficAtContext(ctx, fromUnix, toUnix, time.Now())
+}
+
+func (m *Manager) queryHistoryTrafficAtContext(ctx context.Context, fromUnix, toUnix int64, now time.Time) ([]TrafficBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryTraffic(fromUnix, toUnix)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, now); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryTraffic(ctx, fromUnix, toUnix)
 	if err != nil {
 		return nil, err
 	}
@@ -52,10 +100,23 @@ func (m *Manager) QueryHistoryTraffic(fromUnix, toUnix int64) ([]TrafficBucketRo
 }
 
 func (m *Manager) QueryHistoryRequests(fromUnix, toUnix int64, platformID string) ([]RequestBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryRequestsContext(context.Background(), fromUnix, toUnix, platformID)
+}
+
+// QueryHistoryRequestsContext reads request history while honoring both the
+// caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryRequestsContext(ctx context.Context, fromUnix, toUnix int64, platformID string) ([]RequestBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryRequests(fromUnix, toUnix, platformID)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryRequests(ctx, fromUnix, toUnix, platformID)
 	if err != nil {
 		return nil, err
 	}
@@ -89,16 +150,30 @@ func (m *Manager) QueryHistoryRequests(fromUnix, toUnix int64, platformID string
 }
 
 func (m *Manager) QueryHistoryAccessLatency(fromUnix, toUnix int64, platformID string) ([]AccessLatencyBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryAccessLatencyContext(context.Background(), fromUnix, toUnix, platformID)
+}
+
+// QueryHistoryAccessLatencyContext reads access-latency history while
+// honoring both the caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryAccessLatencyContext(ctx context.Context, fromUnix, toUnix int64, platformID string) ([]AccessLatencyBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryAccessLatency(fromUnix, toUnix, platformID)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryAccessLatency(ctx, fromUnix, toUnix, platformID)
 	if err != nil {
 		return nil, err
 	}
 
-	currentBucketStart := m.bucket.CurrentBucketStartUnix()
-	currentBuckets := m.currentAccessLatencyBuckets(platformID)
+	m.stateMu.Lock()
+	currentBucketStart, currentBuckets := m.snapshotCurrentAccessLatencyBucketLocked(platformID)
+	m.stateMu.Unlock()
 	if bucketInRangeUnix(currentBucketStart, fromUnix, toUnix) {
 		merged := false
 		for i := range rows {
@@ -123,10 +198,23 @@ func (m *Manager) QueryHistoryAccessLatency(fromUnix, toUnix int64, platformID s
 }
 
 func (m *Manager) QueryHistoryProbes(fromUnix, toUnix int64) ([]ProbeBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryProbesContext(context.Background(), fromUnix, toUnix)
+}
+
+// QueryHistoryProbesContext reads probe history while honoring both the
+// caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryProbesContext(ctx context.Context, fromUnix, toUnix int64) ([]ProbeBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryProbes(fromUnix, toUnix)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryProbes(ctx, fromUnix, toUnix)
 	if err != nil {
 		return nil, err
 	}
@@ -154,10 +242,23 @@ func (m *Manager) QueryHistoryProbes(fromUnix, toUnix int64) ([]ProbeBucketRow, 
 }
 
 func (m *Manager) QueryHistoryNodePool(fromUnix, toUnix int64) ([]NodePoolBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryNodePoolContext(context.Background(), fromUnix, toUnix)
+}
+
+// QueryHistoryNodePoolContext reads node-pool history while honoring both the
+// caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryNodePoolContext(ctx context.Context, fromUnix, toUnix int64) ([]NodePoolBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryNodePool(fromUnix, toUnix)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryNodePool(ctx, fromUnix, toUnix)
 	if err != nil {
 		return nil, err
 	}
@@ -193,10 +294,23 @@ func (m *Manager) QueryHistoryNodePool(fromUnix, toUnix int64) ([]NodePoolBucket
 }
 
 func (m *Manager) QueryHistoryLeaseLifetime(fromUnix, toUnix int64, platformID string) ([]LeaseLifetimeBucketRow, error) {
-	if err := m.prepareHistoryRead(time.Now()); err != nil {
+	return m.QueryHistoryLeaseLifetimeContext(context.Background(), fromUnix, toUnix, platformID)
+}
+
+// QueryHistoryLeaseLifetimeContext reads lease-lifetime history while
+// honoring both the caller context and the metrics manager lifecycle context.
+func (m *Manager) QueryHistoryLeaseLifetimeContext(ctx context.Context, fromUnix, toUnix int64, platformID string) ([]LeaseLifetimeBucketRow, error) {
+	ctx, release, err := m.beginHistoryReadContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := m.repo.QueryLeaseLifetime(fromUnix, toUnix, platformID)
+	defer release()
+	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
+		return nil, err
+	}
+	m.historyBucketMu.RLock()
+	defer m.historyBucketMu.RUnlock()
+	rows, err := m.repo.queryLeaseLifetime(ctx, fromUnix, toUnix, platformID)
 	if err != nil {
 		return nil, err
 	}
@@ -232,19 +346,6 @@ func (m *Manager) QueryHistoryLeaseLifetime(fromUnix, toUnix int64, platformID s
 		}
 	}
 	return rows, nil
-}
-
-func (m *Manager) currentAccessLatencyBuckets(platformID string) []int64 {
-	if platformID == "" {
-		snap := m.collector.Snapshot()
-		return append([]int64(nil), snap.LatencyBuckets...)
-	}
-	snap, ok := m.collector.PlatformSnapshot(platformID)
-	if !ok {
-		globalSnap := m.collector.Snapshot()
-		return make([]int64, len(globalSnap.LatencyBuckets))
-	}
-	return append([]int64(nil), snap.LatencyBuckets...)
 }
 
 func bucketInRangeUnix(bucketStartUnix, fromUnix, toUnix int64) bool {

@@ -114,9 +114,12 @@ func buildLatencyHistogram(regularBuckets []int64, overflowCount int64, binMs, o
 	for i, c := range regularBuckets {
 		sampleCount += c
 		// Emit upper-inclusive bucket boundary so UI can show 0-99,100-199...
-		upperExclusive := (i + 1) * binMs
-		if upperExclusive > overMs {
-			upperExclusive = overMs
+		upperExclusive := overMs
+		bucketNumber := i + 1
+		if binMs > 0 && bucketNumber <= overMs/binMs {
+			// The division guard proves this multiplication cannot exceed
+			// overMs, so extreme validated int parameters cannot wrap.
+			upperExclusive = bucketNumber * binMs
 		}
 		leMs := upperExclusive - 1
 		if leMs < 0 {
@@ -243,7 +246,7 @@ func HandleHistoryTraffic(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryTraffic(from.Unix(), to.Unix())
+		rows, err := mgr.QueryHistoryTrafficContext(r.Context(), from.Unix(), to.Unix())
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -277,7 +280,7 @@ func HandleHistoryRequests(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryRequests(from.Unix(), to.Unix(), platformID)
+		rows, err := mgr.QueryHistoryRequestsContext(r.Context(), from.Unix(), to.Unix(), platformID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -316,7 +319,7 @@ func HandleHistoryAccessLatency(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryAccessLatency(from.Unix(), to.Unix(), platformID)
+		rows, err := mgr.QueryHistoryAccessLatencyContext(r.Context(), from.Unix(), to.Unix(), platformID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -358,7 +361,7 @@ func HandleHistoryProbes(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryProbes(from.Unix(), to.Unix())
+		rows, err := mgr.QueryHistoryProbesContext(r.Context(), from.Unix(), to.Unix())
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -390,7 +393,7 @@ func HandleHistoryNodePool(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryNodePool(from.Unix(), to.Unix())
+		rows, err := mgr.QueryHistoryNodePoolContext(r.Context(), from.Unix(), to.Unix())
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -425,7 +428,7 @@ func HandleHistoryLeaseLifetime(mgr *metrics.Manager) http.Handler {
 			return
 		}
 
-		rows, err := mgr.QueryHistoryLeaseLifetime(from.Unix(), to.Unix(), platformID)
+		rows, err := mgr.QueryHistoryLeaseLifetimeContext(r.Context(), from.Unix(), to.Unix(), platformID)
 		if err != nil {
 			WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 			return
@@ -532,7 +535,10 @@ func HandleSnapshotNodeLatencyDistribution(mgr *metrics.Manager) http.Handler {
 		if overMs <= 0 {
 			overMs = 5000
 		}
-		regularBins := (overMs + binMs - 1) / binMs // ceil(over/bin), buckets cover [0, overMs)
+		// Collector already validated and allocated this histogram layout. Use
+		// its regular-bucket count instead of repeating a potentially overflowing
+		// ceil(over/bin) calculation here.
+		regularBins := len(snap.LatencyBuckets) - 1
 		if regularBins <= 0 {
 			regularBins = 1
 		}

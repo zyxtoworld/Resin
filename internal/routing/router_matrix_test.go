@@ -22,6 +22,10 @@ func (p *getEntryCountPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
 	return p.inner.GetEntry(hash)
 }
 
+func (p *getEntryCountPool) IsNodeDisabled(hash node.Hash) bool {
+	return p.inner.IsNodeDisabled(hash)
+}
+
 func (p *getEntryCountPool) GetPlatform(id string) (*platform.Platform, bool) {
 	return p.inner.GetPlatform(id)
 }
@@ -45,6 +49,10 @@ func (p *transientMissingPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) 
 		return nil, false
 	}
 	return p.inner.GetEntry(hash)
+}
+
+func (p *transientMissingPool) IsNodeDisabled(hash node.Hash) bool {
+	return p.inner.IsNodeDisabled(hash)
 }
 
 func (p *transientMissingPool) GetPlatform(id string) (*platform.Platform, bool) {
@@ -125,7 +133,7 @@ func TestRouteRequest_EmptyAccount_TransientMissingEntryRetriesOnce(t *testing.T
 	}
 }
 
-func TestRandomRoute_SingleNodeTrustsViewWithoutPoolValidation(t *testing.T) {
+func TestRandomRoute_SingleNodeValidatesViewEntryIdentity(t *testing.T) {
 	basePool := newRouterTestPool()
 	plat := platform.NewPlatform("plat-single", "Plat-Single", nil, nil)
 	basePool.addPlatform(plat)
@@ -151,8 +159,8 @@ func TestRandomRoute_SingleNodeTrustsViewWithoutPoolValidation(t *testing.T) {
 	if got != h {
 		t.Fatalf("unexpected selected node: got=%s want=%s", got.Hex(), h.Hex())
 	}
-	if countingPool.getCalls != 0 {
-		t.Fatalf("single-node randomRoute should trust view and skip pool validation, getEntry calls=%d", countingPool.getCalls)
+	if countingPool.getCalls == 0 {
+		t.Fatal("single-node randomRoute must validate the published entry identity")
 	}
 }
 

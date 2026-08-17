@@ -5,10 +5,12 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/golang-migrate/migrate/v4"
 	migratedb "github.com/golang-migrate/migrate/v4/database"
 	migratesqlite "github.com/golang-migrate/migrate/v4/database/sqlite"
+	migratesource "github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
@@ -80,8 +82,90 @@ func migrateSQLiteDB(db *sql.DB, fsPath, migrationsTable string, preHook preMigr
 		return fmt.Errorf("migrate %s: init migrator: %w", fsPath, err)
 	}
 
+	_, initialDirty, err := dbDriver.Version()
+	if err != nil {
+		return fmt.Errorf("migrate %s: read initial version: %w", fsPath, err)
+	}
+
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		if !initialDirty {
+			if recoveryErr := recoverFailedMigration(db, dbDriver, sourceDriver, migrationsTable); recoveryErr != nil {
+				return fmt.Errorf(
+					"migrate %s: %w",
+					fsPath,
+					errors.Join(err, fmt.Errorf("recover failed migration: %w", recoveryErr)),
+				)
+			}
+		}
 		return fmt.Errorf("migrate %s: up: %w", fsPath, err)
+	}
+	return nil
+}
+
+// recoverFailedMigration is only used after golang-migrate's SQLite Run
+// returned an error. Its Run path uses the driver's transaction wrapper, so
+// the schema is at the predecessor of the dirty version. The version-table
+// repair itself is kept local so every failure rolls back and leaves the DB
+// dirty rather than pretending a partial migration is clean.
+func recoverFailedMigration(
+	db *sql.DB,
+	driver migratedb.Driver,
+	sourceDriver migratesource.Driver,
+	migrationsTable string,
+) error {
+	version, dirty, err := driver.Version()
+	if err != nil {
+		return fmt.Errorf("read dirty version: %w", err)
+	}
+	if !dirty {
+		return nil
+	}
+
+	previousVersion := migratedb.NilVersion
+	if version >= 0 {
+		prev, err := sourceDriver.Prev(uint(version))
+		if errors.Is(err, os.ErrNotExist) {
+			// The failed migration was the first one.
+		} else if err != nil {
+			return fmt.Errorf("find predecessor of version %d: %w", version, err)
+		} else {
+			previousVersion = int(prev)
+		}
+	}
+
+	return writeCleanMigrationVersion(db, migrationsTable, previousVersion)
+}
+
+func writeCleanMigrationVersion(db *sql.DB, migrationsTable string, version int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin version recovery: %w", err)
+	}
+
+	rollback := func(cause error) error {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			cause = errors.Join(cause, rollbackErr)
+		}
+		return cause
+	}
+
+	if _, err := tx.Exec("DELETE FROM " + migrationsTable); err != nil {
+		return rollback(fmt.Errorf("delete dirty version: %w", err))
+	}
+	if version >= 0 {
+		if _, err := tx.Exec(
+			fmt.Sprintf(`INSERT INTO %s (version, dirty) VALUES (?, ?)`, migrationsTable),
+			version,
+			false,
+		); err != nil {
+			return rollback(fmt.Errorf("write clean version %d: %w", version, err))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, rollbackErr)
+		}
+		return fmt.Errorf("commit version recovery: %w", err)
 	}
 	return nil
 }

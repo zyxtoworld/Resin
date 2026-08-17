@@ -29,26 +29,103 @@ type inboundDemuxServer struct {
 	httpListener *connChannelListener
 	socksHandler inboundConnHandler
 
-	mu           sync.Mutex
-	outer        net.Listener
-	shuttingDown bool
-	activeConns  map[net.Conn]struct{}
-	sniffConns   map[net.Conn]struct{}
-	workerWG     sync.WaitGroup
-	baseCtx      context.Context
-	cancelBase   context.CancelFunc
+	mu                     sync.Mutex
+	outer                  net.Listener
+	shuttingDown           bool
+	activeConns            map[net.Conn]struct{}
+	sniffConns             map[net.Conn]struct{}
+	workerWG               sync.WaitGroup
+	baseCtx                context.Context
+	cancelBase             context.CancelFunc
+	handlerMu              sync.Mutex
+	handlerDone            chan struct{}
+	activeHandlers         int
+	handlerAdmissionClosed bool
+	// Package-private seam for the admission-to-handler handoff test. It is
+	// intentionally nil in production.
+	afterConnWorkerAdmissionHook func()
+	// Package-private seam after Shutdown snapshots/closes active connections.
+	// It is intentionally nil in production.
+	afterActiveConnCloseHook func()
 }
 
 func newInboundDemuxServer(httpServer *http.Server, socksHandler inboundConnHandler) *inboundDemuxServer {
 	if httpServer == nil {
 		httpServer = &http.Server{Handler: http.NotFoundHandler()}
 	}
-	return &inboundDemuxServer{
+	originalHandler := httpServer.Handler
+	if originalHandler == nil {
+		originalHandler = http.NotFoundHandler()
+	}
+	s := &inboundDemuxServer{
 		httpServer:   httpServer,
 		httpListener: newConnChannelListener(),
 		socksHandler: socksHandler,
 		activeConns:  make(map[net.Conn]struct{}),
 		sniffConns:   make(map[net.Conn]struct{}),
+		handlerDone:  closedSignal(),
+	}
+	httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.beginHTTPHandler(w) {
+			return
+		}
+		defer s.endHTTPHandler()
+		originalHandler.ServeHTTP(w, r)
+	})
+	return s
+}
+
+func closedSignal() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func (s *inboundDemuxServer) beginHTTPHandler(w http.ResponseWriter) bool {
+	s.handlerMu.Lock()
+	if s.handlerAdmissionClosed {
+		s.handlerMu.Unlock()
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return false
+	}
+	if s.activeHandlers == 0 {
+		s.handlerDone = make(chan struct{})
+	}
+	s.activeHandlers++
+	s.handlerMu.Unlock()
+	return true
+}
+
+func (s *inboundDemuxServer) endHTTPHandler() {
+	s.handlerMu.Lock()
+	s.activeHandlers--
+	if s.activeHandlers == 0 {
+		close(s.handlerDone)
+	}
+	s.handlerMu.Unlock()
+}
+
+func (s *inboundDemuxServer) closeHTTPHandlerAdmission() {
+	s.handlerMu.Lock()
+	s.handlerAdmissionClosed = true
+	s.handlerMu.Unlock()
+}
+
+func (s *inboundDemuxServer) waitForHTTPHandlers(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.handlerMu.Lock()
+	done := s.handlerDone
+	s.handlerMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -83,13 +160,15 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 			return err
 		}
 		tempDelay = 0
-		if !s.tryStartConnWorker() {
+		if !s.tryStartConnWorker(conn) {
 			_ = conn.Close()
 			continue
 		}
+		if hook := s.afterConnWorkerAdmissionHook; hook != nil {
+			hook()
+		}
 		go s.handleAcceptedConn(conn)
 	}
-	return nil
 }
 
 func inboundDemuxAcceptRetryDelay(err error, prev time.Duration) (time.Duration, bool) {
@@ -108,6 +187,7 @@ func inboundDemuxAcceptRetryDelay(err error, prev time.Duration) (time.Duration,
 }
 
 func (s *inboundDemuxServer) Shutdown(ctx context.Context) error {
+	s.closeHTTPHandlerAdmission()
 	s.mu.Lock()
 	s.shuttingDown = true
 	outer := s.outer
@@ -148,6 +228,9 @@ func (s *inboundDemuxServer) Shutdown(ctx context.Context) error {
 		return httpErr
 	case <-ctx.Done():
 		s.closeActiveConns()
+		if hook := s.afterActiveConnCloseHook; hook != nil {
+			hook()
+		}
 		if s.httpServer != nil {
 			_ = s.httpServer.Close()
 		}
@@ -222,11 +305,19 @@ func (s *inboundDemuxServer) isShuttingDown() bool {
 	return s.shuttingDown
 }
 
-func (s *inboundDemuxServer) tryStartConnWorker() bool {
+func (s *inboundDemuxServer) tryStartConnWorker(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shuttingDown {
 		return false
+	}
+	if conn != nil {
+		if s.activeConns == nil {
+			s.activeConns = make(map[net.Conn]struct{})
+		}
+		// Register the connection in the same critical section as worker
+		// admission, so Shutdown cannot snapshot it before the handler starts.
+		s.activeConns[conn] = struct{}{}
 	}
 	// Registering the worker while holding mu keeps new Add(1) calls serialized
 	// with Shutdown() transitioning into workerWG.Wait().

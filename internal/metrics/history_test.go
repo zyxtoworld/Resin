@@ -16,17 +16,17 @@ func TestQueryHistoryTraffic_AdvancesStaleBucketWithoutBucketLoop(t *testing.T) 
 	t.Cleanup(func() { _ = repo.Close() })
 
 	const bucketSec = 3600
-	mgr := NewManager(ManagerConfig{
-		Repo:                        repo,
-		BucketSeconds:               bucketSec,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		ThroughputRealtimeCapacity:  8,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 8,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      8,
-		LeasesIntervalSec:           5,
+	mgr := mustNewManager(t, ManagerConfig{
+		Repo:                    repo,
+		BucketSeconds:           bucketSec,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		ThroughputRetentionSec:  8,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 8,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      8,
+		LeasesIntervalSec:       5,
 	})
 
 	nowUnix := time.Now().Unix()
@@ -77,17 +77,17 @@ func TestQueryHistoryRequests_AdvancesAndFlushesAggregatedCounters(t *testing.T)
 	const bucketSec = 3600
 	const platformID = "plat-1"
 
-	mgr := NewManager(ManagerConfig{
-		Repo:                        repo,
-		BucketSeconds:               bucketSec,
-		LatencyBinMs:                100,
-		LatencyOverflowMs:           3000,
-		ThroughputRealtimeCapacity:  8,
-		ThroughputIntervalSec:       1,
-		ConnectionsRealtimeCapacity: 8,
-		ConnectionsIntervalSec:      5,
-		LeasesRealtimeCapacity:      8,
-		LeasesIntervalSec:           5,
+	mgr := mustNewManager(t, ManagerConfig{
+		Repo:                    repo,
+		BucketSeconds:           bucketSec,
+		LatencyBinMs:            100,
+		LatencyOverflowMs:       3000,
+		ThroughputRetentionSec:  8,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 8,
+		ConnectionsIntervalSec:  5,
+		LeasesRetentionSec:      8,
+		LeasesIntervalSec:       5,
 	})
 
 	nowUnix := time.Now().Unix()
