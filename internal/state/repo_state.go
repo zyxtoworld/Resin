@@ -1254,7 +1254,16 @@ func (r *StateRepo) DeleteAccountHeaderRuleContext(ctx context.Context, prefix s
 
 // ListAccountHeaderRules returns all rules.
 func (r *StateRepo) ListAccountHeaderRules() ([]model.AccountHeaderRule, error) {
-	rows, err := r.db.Query("SELECT url_prefix, headers_json, updated_at_ns FROM account_header_rules")
+	return r.ListAccountHeaderRulesContext(context.Background())
+}
+
+// ListAccountHeaderRulesContext returns all rules while honoring caller
+// cancellation during the database query and row iteration.
+func (r *StateRepo) ListAccountHeaderRulesContext(ctx context.Context) ([]model.AccountHeaderRule, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT url_prefix, headers_json, updated_at_ns FROM account_header_rules")
 	if err != nil {
 		return nil, err
 	}
@@ -1273,6 +1282,9 @@ func (r *StateRepo) ListAccountHeaderRules() ([]model.AccountHeaderRule, error) 
 		}
 		rule.Headers = headers
 		result = append(result, rule)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return result, rows.Err()
 }

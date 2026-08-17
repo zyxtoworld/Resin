@@ -40,7 +40,7 @@ func filterRulesByKeyword(rules []service.RuleResponse, rawKeyword string) []ser
 // HandleListRules returns a handler for GET /api/v1/account-header-rules.
 func HandleListRules(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rules, err := cp.ListAccountHeaderRules()
+		rules, err := cp.ListAccountHeaderRulesContext(r.Context())
 		if err != nil {
 			writeServiceError(w, err)
 			return

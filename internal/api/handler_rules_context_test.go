@@ -124,3 +124,38 @@ func TestAccountHeaderRuleHandlerStopsOnCanceledRequestBeforeRuleAdmission(t *te
 		t.Fatalf("cancelled handler changed persisted rule: %+v", rules)
 	}
 }
+
+func TestAccountHeaderRuleListHonorsCanceledRequestContext(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	cacheDir := filepath.Join(root, "cache")
+	engine, closer, err := state.PersistenceBootstrap(stateDir, cacheDir)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	defer closer.Close()
+
+	cp := &service.ControlPlaneService{Engine: engine}
+	if _, _, err := cp.UpsertAccountHeaderRule("api.example.com/v1", []string{"old-header"}); err != nil {
+		t.Fatalf("seed account header rule: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account-header-rules", nil).WithContext(requestCtx)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleListRules(cp).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("canceled account-header list status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled account-header list did not return")
+	}
+}

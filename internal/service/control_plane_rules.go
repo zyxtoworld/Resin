@@ -73,8 +73,20 @@ func (s *ControlPlaneService) withRuleMutationContext(ctx context.Context, fn fu
 
 // ListAccountHeaderRules returns all rules.
 func (s *ControlPlaneService) ListAccountHeaderRules() ([]RuleResponse, error) {
-	rules, err := s.Engine.ListAccountHeaderRules()
+	return s.ListAccountHeaderRulesContext(context.Background())
+}
+
+// ListAccountHeaderRulesContext returns all rules while honoring request
+// cancellation during the persisted read.
+func (s *ControlPlaneService) ListAccountHeaderRulesContext(ctx context.Context) ([]RuleResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rules, err := s.Engine.ListAccountHeaderRulesContext(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, internal("list rules", err)
 	}
 	resp := make([]RuleResponse, len(rules))
