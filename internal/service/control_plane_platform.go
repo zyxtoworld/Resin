@@ -422,34 +422,51 @@ func (s *ControlPlaneService) withPlatformMutationAdmissionContext(ctx context.C
 
 // ListPlatforms returns all platforms from the database.
 func (s *ControlPlaneService) ListPlatforms() ([]PlatformResponse, error) {
+	return s.ListPlatformsContext(context.Background())
+}
+
+// ListPlatformsContext returns all platforms from one persisted/runtime
+// generation while honoring request cancellation before each blocking owner.
+func (s *ControlPlaneService) ListPlatformsContext(ctx context.Context) ([]PlatformResponse, error) {
 	if hook := s.beforePlatformReadHook; hook != nil {
 		hook()
 	}
 	// The database model and the runtime routable count are one published
 	// platform generation. Serialize this read with platform mutations so it
 	// cannot observe the row after persist but the old pool view before publish.
-	s.platformMu.Lock()
+	if err := s.platformMu.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.platformMu.Unlock()
 
-	platforms, err := s.Engine.ListPlatforms()
+	platforms, err := s.Engine.ListPlatformsContext(ctx)
 	if err != nil {
 		return nil, internal("list platforms", err)
 	}
 	var resp []PlatformResponse
-	s.withRuntimeRead(func() {
+	if err := s.withRuntimeReadContext(ctx, func() {
 		resp = make([]PlatformResponse, len(platforms))
 		for i, p := range platforms {
 			resp[i] = s.routableNodeCount(platformToResponse(p))
 		}
-	})
+	}); err != nil {
+		return nil, err
+	}
 	return resp, nil
 }
 
 func (s *ControlPlaneService) getPlatformModel(id string) (*model.Platform, error) {
-	p, err := s.Engine.GetPlatform(id)
+	return s.getPlatformModelContext(context.Background(), id)
+}
+
+func (s *ControlPlaneService) getPlatformModelContext(ctx context.Context, id string) (*model.Platform, error) {
+	p, err := s.Engine.GetPlatformContext(ctx, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return nil, notFound("platform not found")
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
 		}
 		return nil, internal("get platform", err)
 	}
@@ -458,22 +475,32 @@ func (s *ControlPlaneService) getPlatformModel(id string) (*model.Platform, erro
 
 // GetPlatform returns a single platform by ID.
 func (s *ControlPlaneService) GetPlatform(id string) (*PlatformResponse, error) {
+	return s.GetPlatformContext(context.Background(), id)
+}
+
+// GetPlatformContext returns one persisted/runtime platform generation while
+// honoring request cancellation before each blocking owner.
+func (s *ControlPlaneService) GetPlatformContext(ctx context.Context, id string) (*PlatformResponse, error) {
 	if hook := s.beforePlatformReadHook; hook != nil {
 		hook()
 	}
 	// Keep the persisted model and runtime projection in the same platform
 	// generation as UpdatePlatform/CreatePlatform/ResetPlatformToDefault.
-	s.platformMu.Lock()
+	if err := s.platformMu.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.platformMu.Unlock()
 
-	mp, err := s.getPlatformModel(id)
+	mp, err := s.getPlatformModelContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	var r PlatformResponse
-	s.withRuntimeRead(func() {
+	if err := s.withRuntimeReadContext(ctx, func() {
 		r = s.routableNodeCount(platformToResponse(*mp))
-	})
+	}); err != nil {
+		return nil, err
+	}
 	return &r, nil
 }
 

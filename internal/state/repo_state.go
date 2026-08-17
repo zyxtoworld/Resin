@@ -509,49 +509,77 @@ func (r *StateRepo) GetPlatformName(id string) (string, error) {
 	return name, nil
 }
 
-// GetPlatform returns one platform by ID.
-func (r *StateRepo) GetPlatform(id string) (*model.Platform, error) {
-	row := r.db.QueryRow(`SELECT id, name, sticky_ttl_ns, regex_filters_json, region_filters_json,
-			response_rules_json,
-			reverse_proxy_miss_action, reverse_proxy_empty_account_behavior,
-			reverse_proxy_fixed_account_header, allocation_policy,
-			passive_circuit_breaker_disabled, updated_at_ns
-			FROM platforms WHERE id = ?`, id)
+const platformSelectSQL = `SELECT id, name, sticky_ttl_ns, regex_filters_json, region_filters_json, response_rules_json,
+	reverse_proxy_miss_action, reverse_proxy_empty_account_behavior, reverse_proxy_fixed_account_header,
+	allocation_policy, passive_circuit_breaker_disabled, updated_at_ns FROM platforms`
 
+type platformRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPlatformRow(row platformRowScanner) (model.Platform, error) {
 	var p model.Platform
 	var regexFiltersJSON, regionFiltersJSON, responseRulesJSON string
 	var passiveCircuitBreakerDisabled int
 	if err := row.Scan(&p.ID, &p.Name, &p.StickyTTLNs, &regexFiltersJSON,
 		&regionFiltersJSON, &responseRulesJSON, &p.ReverseProxyMissAction, &p.ReverseProxyEmptyAccountBehavior,
 		&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled, &p.UpdatedAtNs); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrNotFound
-		}
-		return nil, err
+		return model.Platform{}, err
 	}
 	p.PassiveCircuitBreakerDisabled = passiveCircuitBreakerDisabled != 0
 	regexFilters, err := decodeStringSliceJSON(regexFiltersJSON)
 	if err != nil {
-		return nil, fmt.Errorf("decode platform %s regex_filters_json: %w", p.ID, err)
+		return model.Platform{}, fmt.Errorf("decode platform %s regex_filters_json: %w", p.ID, err)
 	}
 	regionFilters, err := decodeStringSliceJSON(regionFiltersJSON)
 	if err != nil {
-		return nil, fmt.Errorf("decode platform %s region_filters_json: %w", p.ID, err)
+		return model.Platform{}, fmt.Errorf("decode platform %s region_filters_json: %w", p.ID, err)
 	}
 	p.RegexFilters = regexFilters
 	p.RegionFilters = regionFilters
 	if err := json.Unmarshal([]byte(responseRulesJSON), &p.ResponseRules); err != nil {
-		return nil, fmt.Errorf("decode platform %s response_rules_json: %w", p.ID, err)
+		return model.Platform{}, fmt.Errorf("decode platform %s response_rules_json: %w", p.ID, err)
 	}
 	if p.ResponseRules == nil {
 		p.ResponseRules = []model.PlatformResponseRule{}
+	}
+	return p, nil
+}
+
+// GetPlatform returns one platform by ID.
+func (r *StateRepo) GetPlatform(id string) (*model.Platform, error) {
+	return r.GetPlatformContext(context.Background(), id)
+}
+
+// GetPlatformContext returns one platform by ID while honoring ctx during the
+// SQLite query. The context-aware form is used by request-bound API reads.
+func (r *StateRepo) GetPlatformContext(ctx context.Context, id string) (*model.Platform, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	row := r.db.QueryRowContext(ctx, platformSelectSQL+" WHERE id = ?", id)
+	p, err := scanPlatformRow(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, err
 	}
 	return &p, nil
 }
 
 // ListPlatforms returns all platforms.
 func (r *StateRepo) ListPlatforms() ([]model.Platform, error) {
-	rows, err := r.db.Query("SELECT id, name, sticky_ttl_ns, regex_filters_json, region_filters_json, response_rules_json, reverse_proxy_miss_action, reverse_proxy_empty_account_behavior, reverse_proxy_fixed_account_header, allocation_policy, passive_circuit_breaker_disabled, updated_at_ns FROM platforms")
+	return r.ListPlatformsContext(context.Background())
+}
+
+// ListPlatformsContext returns all platforms while honoring ctx during the
+// SQLite query and row iteration.
+func (r *StateRepo) ListPlatformsContext(ctx context.Context) ([]model.Platform, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := r.db.QueryContext(ctx, platformSelectSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -559,30 +587,9 @@ func (r *StateRepo) ListPlatforms() ([]model.Platform, error) {
 
 	var result []model.Platform
 	for rows.Next() {
-		var p model.Platform
-		var regexFiltersJSON, regionFiltersJSON, responseRulesJSON string
-		var passiveCircuitBreakerDisabled int
-		if err := rows.Scan(&p.ID, &p.Name, &p.StickyTTLNs, &regexFiltersJSON,
-			&regionFiltersJSON, &responseRulesJSON, &p.ReverseProxyMissAction, &p.ReverseProxyEmptyAccountBehavior,
-			&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled, &p.UpdatedAtNs); err != nil {
+		p, err := scanPlatformRow(rows)
+		if err != nil {
 			return nil, err
-		}
-		p.PassiveCircuitBreakerDisabled = passiveCircuitBreakerDisabled != 0
-		regexFilters, err := decodeStringSliceJSON(regexFiltersJSON)
-		if err != nil {
-			return nil, fmt.Errorf("decode platform %s regex_filters_json: %w", p.ID, err)
-		}
-		regionFilters, err := decodeStringSliceJSON(regionFiltersJSON)
-		if err != nil {
-			return nil, fmt.Errorf("decode platform %s region_filters_json: %w", p.ID, err)
-		}
-		p.RegexFilters = regexFilters
-		p.RegionFilters = regionFilters
-		if err := json.Unmarshal([]byte(responseRulesJSON), &p.ResponseRules); err != nil {
-			return nil, fmt.Errorf("decode platform %s response_rules_json: %w", p.ID, err)
-		}
-		if p.ResponseRules == nil {
-			p.ResponseRules = []model.PlatformResponseRule{}
 		}
 		result = append(result, p)
 	}

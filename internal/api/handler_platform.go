@@ -74,7 +74,7 @@ func comparePlatformsForList(a, b service.PlatformResponse, sorting Sorting) int
 // HandleListPlatforms returns a handler for GET /api/v1/platforms.
 func HandleListPlatforms(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		platforms, err := cp.ListPlatforms()
+		platforms, err := cp.ListPlatformsContext(r.Context())
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -105,7 +105,7 @@ func HandleGetPlatform(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
-		p, err := cp.GetPlatform(id)
+		p, err := cp.GetPlatformContext(r.Context(), id)
 		if err != nil {
 			writeServiceError(w, err)
 			return

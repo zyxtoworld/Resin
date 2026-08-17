@@ -209,19 +209,32 @@ type ControlPlaneService struct {
 // pool/node state on one published runtime generation. Pure database-only
 // control-plane reads do not need this boundary.
 func (s *ControlPlaneService) withRuntimeRead(fn func()) {
+	_ = s.withRuntimeReadContext(context.Background(), fn)
+}
+
+// withRuntimeReadContext admits a request-bound read into one complete
+// runtime generation. Cancellation is effective before admission; an
+// admitted callback still runs to completion.
+func (s *ControlPlaneService) withRuntimeReadContext(ctx context.Context, fn func()) error {
 	if fn == nil {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if s != nil && s.Pool != nil {
-		s.Pool.WithRuntimeRead(func() {
+		return s.Pool.WithRuntimeReadContext(ctx, func() {
 			if hook := s.afterRuntimeReadLockHook; hook != nil {
 				hook()
 			}
 			fn()
 		})
-		return
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	fn()
+	return nil
 }
 
 type platformMutationStage uint8

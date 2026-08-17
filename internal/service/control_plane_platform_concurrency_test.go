@@ -347,6 +347,118 @@ func TestPlatformReadsDoNotMixPersistedAndRuntimeGenerations(t *testing.T) {
 	}
 }
 
+func TestPlatformReadContextCancellationWhileMutationOwnsPlatformLock(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+
+	name := "platform-read-cancel"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("seed CreatePlatform: %v", err)
+	}
+
+	persisted := make(chan struct{})
+	releasePublish := make(chan struct{})
+	var persistOnce sync.Once
+	cp.afterPlatformPersistHook = func() {
+		persistOnce.Do(func() { close(persisted) })
+		<-releasePublish
+	}
+	defer func() {
+		select {
+		case <-releasePublish:
+		default:
+			close(releasePublish)
+		}
+	}()
+
+	updateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := cp.UpdatePlatformContext(context.Background(), created.ID, []byte(`{"sticky_ttl":"2h"}`))
+		updateDone <- updateErr
+	}()
+	select {
+	case <-persisted:
+	case <-time.After(time.Second):
+		t.Fatal("platform mutation did not reach post-persist owner")
+	}
+
+	readers := []struct {
+		name string
+		read func(context.Context) error
+	}{
+		{
+			name: "list",
+			read: func(ctx context.Context) error {
+				_, err := cp.ListPlatformsContext(ctx)
+				return err
+			},
+		},
+		{
+			name: "get",
+			read: func(ctx context.Context) error {
+				_, err := cp.GetPlatformContext(ctx, created.ID)
+				return err
+			},
+		},
+	}
+	for _, reader := range readers {
+		readStarted := make(chan struct{})
+		var readOnce sync.Once
+		cp.beforePlatformReadHook = func() {
+			readOnce.Do(func() { close(readStarted) })
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		readDone := make(chan error, 1)
+		go func() { readDone <- reader.read(ctx) }()
+		select {
+		case <-readStarted:
+		case <-time.After(time.Second):
+			cancel()
+			close(releasePublish)
+			t.Fatalf("%s platform read did not reach its lock boundary", reader.name)
+		}
+		cancel()
+
+		select {
+		case readErr := <-readDone:
+			if !errors.Is(readErr, context.Canceled) {
+				t.Fatalf("%s platform read error = %v, want context.Canceled", reader.name, readErr)
+			}
+		case <-time.After(time.Second):
+			close(releasePublish)
+			t.Fatalf("canceled %s platform read remained blocked by the mutation owner", reader.name)
+		}
+	}
+
+	close(releasePublish)
+	if err := <-updateDone; err != nil {
+		t.Fatalf("UpdatePlatformContext: %v", err)
+	}
+}
+
 func TestCreatePlatform_RejectsStickyTTLThatOverflowsLeaseExpiry(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
