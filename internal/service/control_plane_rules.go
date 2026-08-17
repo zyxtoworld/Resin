@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -57,7 +58,13 @@ func ruleToResponse(r model.AccountHeaderRule) (RuleResponse, error) {
 // immutable matcher publish. Shutdown must not observe an idle state database
 // while the same rule mutation can still change request-time behavior.
 func (s *ControlPlaneService) withRuleMutation(fn func() error) error {
-	err := s.Engine.WithStateWriteAdmission(fn)
+	return s.withRuleMutationContext(context.Background(), func(context.Context, context.Context) error {
+		return fn()
+	})
+}
+
+func (s *ControlPlaneService) withRuleMutationContext(ctx context.Context, fn func(context.Context, context.Context) error) error {
+	err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, fn)
 	if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
 		return internal("rule mutation", err)
 	}
@@ -83,6 +90,12 @@ func (s *ControlPlaneService) ListAccountHeaderRules() ([]RuleResponse, error) {
 
 // UpsertAccountHeaderRule creates or updates a rule. Returns (response, created, error).
 func (s *ControlPlaneService) UpsertAccountHeaderRule(prefix string, headers []string) (*RuleResponse, bool, error) {
+	return s.UpsertAccountHeaderRuleContext(context.Background(), prefix, headers)
+}
+
+// UpsertAccountHeaderRuleContext is the request-aware form of
+// UpsertAccountHeaderRule.
+func (s *ControlPlaneService) UpsertAccountHeaderRuleContext(ctx context.Context, prefix string, headers []string) (*RuleResponse, bool, error) {
 	normalizedPrefix, verr := normalizeRulePrefix(prefix)
 	if verr != nil {
 		return nil, false, verr
@@ -111,9 +124,11 @@ func (s *ControlPlaneService) UpsertAccountHeaderRule(prefix string, headers []s
 	s.runRuleMutationHook(ruleMutationBeforeLock)
 	var response *RuleResponse
 	var created bool
-	err := s.withRuleMutation(func() error {
-		s.ruleMu.Lock()
-		defer s.ruleMu.Unlock()
+	err := s.withRuleMutationContext(ctx, func(writeCtx, commitCtx context.Context) error {
+		if err := s.ruleMu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer s.ruleMu.unlock()
 
 		rules, err := s.Engine.ListAccountHeaderRules()
 		if err != nil {
@@ -134,7 +149,7 @@ func (s *ControlPlaneService) UpsertAccountHeaderRule(prefix string, headers []s
 		}
 		s.runRuleMutationHook(ruleMutationAfterSnapshot)
 
-		created, err = s.Engine.UpsertAccountHeaderRuleWithCreated(rule)
+		created, err = s.Engine.UpsertAccountHeaderRuleWithCreatedContext(commitCtx, rule)
 		if err != nil {
 			return internal("persist rule", err)
 		}
@@ -161,6 +176,12 @@ func (s *ControlPlaneService) UpsertAccountHeaderRule(prefix string, headers []s
 
 // DeleteAccountHeaderRule deletes a rule.
 func (s *ControlPlaneService) DeleteAccountHeaderRule(prefix string) error {
+	return s.DeleteAccountHeaderRuleContext(context.Background(), prefix)
+}
+
+// DeleteAccountHeaderRuleContext is the request-aware form of
+// DeleteAccountHeaderRule.
+func (s *ControlPlaneService) DeleteAccountHeaderRuleContext(ctx context.Context, prefix string) error {
 	normalizedPrefix, verr := normalizeRulePrefix(prefix)
 	if verr != nil {
 		return verr
@@ -170,9 +191,11 @@ func (s *ControlPlaneService) DeleteAccountHeaderRule(prefix string) error {
 	}
 
 	s.runRuleMutationHook(ruleMutationBeforeLock)
-	return s.withRuleMutation(func() error {
-		s.ruleMu.Lock()
-		defer s.ruleMu.Unlock()
+	return s.withRuleMutationContext(ctx, func(writeCtx, commitCtx context.Context) error {
+		if err := s.ruleMu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer s.ruleMu.unlock()
 
 		rules, err := s.Engine.ListAccountHeaderRules()
 		if err != nil {
@@ -192,7 +215,7 @@ func (s *ControlPlaneService) DeleteAccountHeaderRule(prefix string) error {
 		}
 		s.runRuleMutationHook(ruleMutationAfterSnapshot)
 
-		if err := s.Engine.DeleteAccountHeaderRule(normalizedPrefix); err != nil {
+		if err := s.Engine.DeleteAccountHeaderRuleContext(commitCtx, normalizedPrefix); err != nil {
 			if errors.Is(err, state.ErrNotFound) {
 				return notFound("rule not found")
 			}

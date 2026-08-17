@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +18,76 @@ import (
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
 )
+
+func TestListNodesContext_HonorsCancellationBeforeRuntimeGenerationAdmission(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr}
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseWriter) })
+	writerDone := make(chan struct{})
+	go func() {
+		pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not enter")
+	}
+
+	readAttempted := make(chan struct{})
+	var readAttemptOnce sync.Once
+	cp.beforeRuntimeReadLockHook = func() {
+		readAttemptOnce.Do(func() { close(readAttempted) })
+	}
+	readResult := make(chan error, 1)
+	cp.afterRuntimeReadAttemptHook = func(err error) {
+		readResult <- err
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listDone := make(chan struct{})
+	go func() {
+		_, _ = cp.ListNodesContext(requestCtx, NodeFilters{})
+		close(listDone)
+	}()
+
+	select {
+	case <-readAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("list did not attempt runtime read")
+	}
+	cancel()
+
+	select {
+	case err := <-readResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runtime read error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled list request remained blocked behind runtime mutation")
+	}
+	select {
+	case <-listDone:
+	case <-time.After(time.Second):
+		t.Fatal("list did not return after runtime read cancellation")
+	}
+
+	releaseOnce.Do(func() { close(releaseWriter) })
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not finish")
+	}
+}
 
 func newNodeListTestPool(subMgr *topology.SubscriptionManager) *topology.GlobalNodePool {
 	return topology.NewGlobalNodePool(topology.PoolConfig{

@@ -816,6 +816,9 @@ func (s *ControlPlaneService) DeletePlatformContext(ctx context.Context, id stri
 			return internal("delete platform", err)
 		}
 		s.Pool.UnregisterPlatform(id)
+		if s.afterPlatformUnregisterHook != nil {
+			s.afterPlatformUnregisterHook()
+		}
 		s.Router.RemovePlatformState(id)
 		s.Router.WaitForLeaseEvents()
 		return nil
@@ -1026,11 +1029,20 @@ func (s *ControlPlaneService) nodeEntryToSummary(h node.Hash, entry *node.NodeEn
 
 // PreviewFilter returns nodes matching the given filter spec.
 func (s *ControlPlaneService) PreviewFilter(req PreviewFilterRequest) ([]NodeSummary, error) {
+	return s.PreviewFilterContext(context.Background(), req)
+}
+
+// PreviewFilterContext is the request-aware form of PreviewFilter. Cancellation
+// is effective while waiting for a complete runtime generation; an admitted
+// snapshot still runs to completion.
+func (s *ControlPlaneService) PreviewFilterContext(ctx context.Context, req PreviewFilterRequest) ([]NodeSummary, error) {
 	var result []NodeSummary
 	var err error
-	s.withRuntimeRead(func() {
+	if readErr := s.withRuntimeReadContext(ctx, func() {
 		result, err = s.previewFilter(req)
-	})
+	}); readErr != nil {
+		return nil, readErr
+	}
 	return result, err
 }
 

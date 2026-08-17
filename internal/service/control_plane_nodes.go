@@ -32,11 +32,20 @@ type NodeFilters struct {
 
 // ListNodes returns nodes from the pool with optional filters.
 func (s *ControlPlaneService) ListNodes(filters NodeFilters) ([]NodeSummary, error) {
+	return s.ListNodesContext(context.Background(), filters)
+}
+
+// ListNodesContext is the request-aware form of ListNodes. Cancellation is
+// effective while waiting for a complete runtime generation; an admitted
+// snapshot still runs to completion.
+func (s *ControlPlaneService) ListNodesContext(ctx context.Context, filters NodeFilters) ([]NodeSummary, error) {
 	var result []NodeSummary
 	var err error
-	s.withRuntimeRead(func() {
+	if readErr := s.withRuntimeReadContext(ctx, func() {
 		result, err = s.listNodes(filters)
-	})
+	}); readErr != nil {
+		return nil, readErr
+	}
 	return result, err
 }
 
@@ -221,11 +230,20 @@ func (s *ControlPlaneService) nodeEntryMatchesFilters(
 
 // GetNode returns a single node by hash.
 func (s *ControlPlaneService) GetNode(hashStr string) (*NodeSummary, error) {
+	return s.GetNodeContext(context.Background(), hashStr)
+}
+
+// GetNodeContext is the request-aware form of GetNode. Cancellation is
+// effective while waiting for a complete runtime generation; an admitted
+// snapshot still runs to completion.
+func (s *ControlPlaneService) GetNodeContext(ctx context.Context, hashStr string) (*NodeSummary, error) {
 	var result *NodeSummary
 	var resultErr error
-	s.withRuntimeRead(func() {
+	if readErr := s.withRuntimeReadContext(ctx, func() {
 		result, resultErr = s.getNode(hashStr)
-	})
+	}); readErr != nil {
+		return nil, readErr
+	}
 	return result, resultErr
 }
 

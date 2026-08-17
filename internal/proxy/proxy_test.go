@@ -1372,6 +1372,64 @@ func TestReverseLatencyHealthWritebackUsesLifecycleBarrier(t *testing.T) {
 	}
 }
 
+func TestHealthWriteOwner_ConcurrentCloseWaitsForSameOwner(t *testing.T) {
+	target := &blockingLatencyHealthRecorder{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	owner := NewHealthWriteOwner(target)
+
+	latency := time.Millisecond
+	submitHealthWrite(owner, func() {
+		target.RecordLatencyForEntry(node.Hash{7}, nil, "example.com", &latency)
+	})
+	select {
+	case <-target.entered:
+	case <-time.After(time.Second):
+		t.Fatal("health write did not enter")
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(firstDone)
+	}()
+	select {
+	case <-owner.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first close did not close admission")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		owner.CloseAndWait()
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+		t.Fatal("second close returned before the admitted write completed")
+	default:
+	}
+
+	close(target.release)
+	select {
+	case <-target.done:
+	case <-time.After(time.Second):
+		t.Fatal("admitted health write did not finish")
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first close did not finish")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second close did not finish with the first close")
+	}
+}
+
 func TestTunnelTLSLatencyHealthWritebackUsesLifecycleBarrier(t *testing.T) {
 	target := &blockingLatencyHealthRecorder{
 		entered: make(chan struct{}),

@@ -146,7 +146,7 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 			filters.ProbedSince = &t
 		}
 
-		nodes, err := cp.ListNodes(filters)
+		nodes, err := cp.ListNodesContext(r.Context(), filters)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -177,7 +177,7 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 func HandleGetNode(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hash := PathParam(r, "hash")
-		n, err := cp.GetNode(hash)
+		n, err := cp.GetNodeContext(r.Context(), hash)
 		if err != nil {
 			writeServiceError(w, err)
 			return

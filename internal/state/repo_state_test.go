@@ -1286,6 +1286,116 @@ func TestStateRepo_EnsureAccountHeaderRule_InsertsOnlyWhenMissing(t *testing.T) 
 	}
 }
 
+func TestStateRepo_AccountHeaderRuleContextWritesHonorRepositoryMutexCancellation(t *testing.T) {
+	tests := []struct {
+		name           string
+		seed           *model.AccountHeaderRule
+		call           func(context.Context, *StateRepo, model.AccountHeaderRule) error
+		assertNoChange func(*testing.T, *StateRepo, model.AccountHeaderRule)
+	}{
+		{
+			name: "ensure",
+			call: func(ctx context.Context, repo *StateRepo, rule model.AccountHeaderRule) error {
+				_, err := repo.EnsureAccountHeaderRuleContext(ctx, rule)
+				return err
+			},
+			assertNoChange: func(t *testing.T, repo *StateRepo, rule model.AccountHeaderRule) {
+				list, err := repo.ListAccountHeaderRules()
+				if err != nil {
+					t.Fatalf("ListAccountHeaderRules: %v", err)
+				}
+				if len(list) != 0 {
+					t.Fatalf("cancelled ensure persisted rules: %+v", list)
+				}
+			},
+		},
+		{
+			name: "upsert",
+			seed: &model.AccountHeaderRule{URLPrefix: "api.example.com/v1", Headers: []string{"old"}, UpdatedAtNs: 1},
+			call: func(ctx context.Context, repo *StateRepo, rule model.AccountHeaderRule) error {
+				_, err := repo.UpsertAccountHeaderRuleWithCreatedContext(ctx, rule)
+				return err
+			},
+			assertNoChange: func(t *testing.T, repo *StateRepo, rule model.AccountHeaderRule) {
+				list, err := repo.ListAccountHeaderRules()
+				if err != nil {
+					t.Fatalf("ListAccountHeaderRules: %v", err)
+				}
+				if len(list) != 1 || !reflect.DeepEqual(list[0].Headers, []string{"old"}) {
+					t.Fatalf("cancelled upsert changed rules: %+v", list)
+				}
+			},
+		},
+		{
+			name: "delete",
+			seed: &model.AccountHeaderRule{URLPrefix: "api.example.com/v1", Headers: []string{"old"}, UpdatedAtNs: 1},
+			call: func(ctx context.Context, repo *StateRepo, rule model.AccountHeaderRule) error {
+				return repo.DeleteAccountHeaderRuleContext(ctx, rule.URLPrefix)
+			},
+			assertNoChange: func(t *testing.T, repo *StateRepo, rule model.AccountHeaderRule) {
+				list, err := repo.ListAccountHeaderRules()
+				if err != nil {
+					t.Fatalf("ListAccountHeaderRules: %v", err)
+				}
+				if len(list) != 1 || list[0].URLPrefix != rule.URLPrefix {
+					t.Fatalf("cancelled delete changed rules: %+v", list)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newTestStateRepo(t)
+			rule := model.AccountHeaderRule{
+				URLPrefix:   "api.example.com/v1",
+				Headers:     []string{"new"},
+				UpdatedAtNs: 2,
+			}
+			if tc.seed != nil {
+				if _, err := repo.UpsertAccountHeaderRuleWithCreated(*tc.seed); err != nil {
+					t.Fatalf("seed rule: %v", err)
+				}
+			}
+
+			mutexAttempted := make(chan struct{})
+			repo.beforeWriteMutexHook = func() { close(mutexAttempted) }
+			repo.mu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					repo.mu.Unlock()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- tc.call(ctx, repo, rule) }()
+			select {
+			case <-mutexAttempted:
+			case <-time.After(time.Second):
+				t.Fatal("account-header write did not reach the repository mutex boundary")
+			}
+			cancel()
+
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("error = %v, want context.Canceled", err)
+				}
+			case <-time.After(300 * time.Millisecond):
+				repo.mu.Unlock()
+				locked = false
+				<-result
+				t.Fatal("cancelled account-header write remained blocked on repository mutex")
+			}
+			repo.mu.Unlock()
+			locked = false
+			tc.assertNoChange(t, repo, rule)
+		})
+	}
+}
+
 // --- concurrent writes ---
 
 func TestStateRepo_ConcurrentWrites(t *testing.T) {

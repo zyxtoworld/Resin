@@ -864,6 +864,98 @@ func TestDeletePlatform_RemovesRouterStateAndPersistedLeases(t *testing.T) {
 	}
 }
 
+func TestDeletePlatform_RangeLeasesFailsClosedAfterPoolUnregister(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	const (
+		platformID = "platform-range-delete-boundary"
+		account    = "range-delete-account"
+	)
+	now := time.Now().UnixNano()
+	row := model.Platform{
+		ID:                               platformID,
+		Name:                             "range-delete-boundary",
+		StickyTTLNs:                      int64(time.Hour),
+		RegexFilters:                     []string{},
+		RegionFilters:                    []string{},
+		ResponseRules:                    []model.PlatformResponseRule{},
+		ReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+		ReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+		AllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		UpdatedAtNs:                      now,
+	}
+	if err := engine.UpsertPlatform(row); err != nil {
+		t.Fatalf("seed platform: %v", err)
+	}
+	plat, err := platform.BuildFromModel(row)
+	if err != nil {
+		t.Fatalf("BuildFromModel: %v", err)
+	}
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	if err := pool.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+	router := routing.NewRouter(routing.RouterConfig{Pool: pool})
+	leaseNode := node.HashFromRawOptions([]byte(`{"type":"range-delete-node"}`))
+	if err := router.UpsertLease(model.Lease{
+		PlatformID:     platformID,
+		Account:        account,
+		NodeHash:       leaseNode.Hex(),
+		EgressIP:       "203.0.113.21",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	}); err != nil {
+		t.Fatalf("UpsertLease: %v", err)
+	}
+
+	unregistered := make(chan struct{})
+	allowStateRemoval := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(allowStateRemoval) }) }
+	t.Cleanup(release)
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		Router: router,
+	}
+	cp.afterPlatformUnregisterHook = func() {
+		close(unregistered)
+		<-allowStateRemoval
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- cp.DeletePlatform(platformID) }()
+	select {
+	case <-unregistered:
+	case <-time.After(time.Second):
+		t.Fatal("DeletePlatform did not reach the post-unregister boundary")
+	}
+
+	count := 0
+	if ok := router.RangeLeases(platformID, func(string, routing.Lease) bool {
+		count++
+		return true
+	}); ok || count != 0 {
+		release()
+		t.Fatalf("RangeLeases exposed unregistered platform state: ok=%v count=%d", ok, count)
+	}
+	release()
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeletePlatform: %v", err)
+	}
+}
+
 func TestDeletePlatform_RejectsMissingRouterBeforePersistence(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(

@@ -77,7 +77,7 @@ func HandleUpsertRule(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
-		rule, created, err := cp.UpsertAccountHeaderRule(prefix, body.Headers)
+		rule, created, err := cp.UpsertAccountHeaderRuleContext(r.Context(), prefix, body.Headers)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -94,7 +94,7 @@ func HandleUpsertRule(cp *service.ControlPlaneService) http.HandlerFunc {
 func HandleDeleteRule(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		prefix := PathParam(r, "prefix")
-		if err := cp.DeleteAccountHeaderRule(prefix); err != nil {
+		if err := cp.DeleteAccountHeaderRuleContext(r.Context(), prefix); err != nil {
 			writeServiceError(w, err)
 			return
 		}

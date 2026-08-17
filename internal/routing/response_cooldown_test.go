@@ -168,6 +168,7 @@ func TestRouter_ResponseCooldownSkipsEgressIPAndRestoresAfterExpiry(t *testing.T
 		NodeHash:      blockedHash,
 		EgressIP:      blockedEntry.GetEgressIP(),
 		selectedEntry: blockedEntry,
+		platform:      plat,
 	}
 	until := now.Add(time.Minute)
 	router.QuarantineRoute(route, platform.ResponseRuleScopeEgressIP, until)
@@ -335,6 +336,41 @@ func TestRouter_LateOldEgressResponseCannotCoolRebuiltEntry(t *testing.T) {
 	}
 	if got.selectedEntry != newEntry {
 		t.Fatalf("late response route used entry %p, want rebuilt entry %p", got.selectedEntry, newEntry)
+	}
+}
+
+func TestRouter_LateResponseFromReplacedPlatformCannotCoolNewGeneration(t *testing.T) {
+	pool := newRouterTestPool()
+	oldPlat := platform.NewPlatform("plat-platform-generation", "Old-Platform-Generation", nil, nil)
+	pool.addPlatform(oldPlat)
+
+	const raw = `{"id":"platform-generation-response"}`
+	hash, entry := newRoutableEntry(t, raw, "198.51.100.72")
+	pool.addEntry(hash, entry)
+	pool.rebuildPlatformView(oldPlat)
+
+	router := newTestRouter(pool, nil)
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+	oldRoute, err := router.RouteRequest(oldPlat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("route on old platform: %v", err)
+	}
+
+	newPlat := platform.NewPlatform(oldPlat.ID, "New-Platform-Generation", nil, nil)
+	pool.addPlatform(newPlat)
+	pool.rebuildPlatformView(newPlat)
+
+	router.QuarantineRoute(oldRoute, platform.ResponseRuleScopeEgressIP, now.Add(time.Minute))
+	newRoute, err := router.RouteRequest(newPlat.Name, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("new platform route was cooled by an old response: %v", err)
+	}
+	if newRoute.selectedEntry != entry {
+		t.Fatalf("new platform route selected %p, want current entry %p", newRoute.selectedEntry, entry)
+	}
+	if router.responseCooldowns(newPlat.ID).IsCoolingForEntry(hash, entry, entry.GetEgressIP(), now) {
+		t.Fatal("late response from the replaced platform published a cooldown into the new platform generation")
 	}
 }
 

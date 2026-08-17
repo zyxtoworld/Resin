@@ -175,13 +175,13 @@ func (s *ControlPlaneService) validateEndpoint(endpoint model.Endpoint) *Service
 // runtime publish/remove. Shutdown must not observe an idle state database
 // while the same endpoint mutation can still change the live listener set.
 func (s *ControlPlaneService) withEndpointMutation(fn func() error) error {
-	return s.withEndpointMutationContext(context.Background(), func(context.Context) error {
+	return s.withEndpointMutationContext(context.Background(), func(context.Context, context.Context) error {
 		return fn()
 	})
 }
 
-func (s *ControlPlaneService) withEndpointMutationContext(ctx context.Context, fn func(context.Context) error) error {
-	err := s.Engine.WithStateWriteAdmissionContext(ctx, fn)
+func (s *ControlPlaneService) withEndpointMutationContext(ctx context.Context, fn func(context.Context, context.Context) error) error {
+	err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, fn)
 	if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
 		return internal("endpoint mutation", err)
 	}
@@ -234,8 +234,9 @@ func (s *ControlPlaneService) CreateEndpoint(req CreateEndpointRequest) (*Endpoi
 }
 
 // CreateEndpointContext creates an endpoint while honoring request
-// cancellation during persistence. Prepared runtime stages still obey their
-// prepare -> single DB write -> commit/abort ownership contract.
+// cancellation through validation and runtime preparation. Once a prepared
+// stage crosses BeginPersist, the shutdown-owned commit context carries the
+// single DB write and runtime publish to completion.
 func (s *ControlPlaneService) CreateEndpointContext(ctx context.Context, req CreateEndpointRequest) (*EndpointResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -246,11 +247,16 @@ func (s *ControlPlaneService) CreateEndpointContext(ctx context.Context, req Cre
 	if s == nil || s.Engine == nil {
 		return nil, internal("endpoint service is not initialized", nil)
 	}
-	s.endpointMu.Lock()
-	defer s.endpointMu.Unlock()
-
 	var response *EndpointResponse
-	err := s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
+	err := s.withEndpointMutationContext(ctx, func(writeCtx, commitCtx context.Context) error {
+		if s.beforeEndpointLockHook != nil {
+			s.beforeEndpointLockHook()
+		}
+		if err := s.endpointMu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer s.endpointMu.unlock()
+
 		allowProxy := boolOrDefault(req.AllowProxy, true)
 		now := time.Now().UnixNano()
 		endpoint := model.Endpoint{
@@ -279,18 +285,19 @@ func (s *ControlPlaneService) CreateEndpointContext(ctx context.Context, req Cre
 			if prepareErr != nil {
 				return conflict(fmt.Sprintf("listen on port %d: %v", endpoint.Port, prepareErr))
 			}
+			if err := writeCtx.Err(); err != nil {
+				runtimeStage.Abort()
+				return err
+			}
 			if !runtimeStage.BeginPersist() {
 				runtimeStage.Abort()
 				return internal("endpoint runtime unavailable", errors.New("endpoint stage canceled"))
 			}
-		}
-		if err := writeCtx.Err(); err != nil {
-			if runtimeStage != nil {
-				runtimeStage.Abort()
+			if s.afterEndpointBeginPersistHook != nil {
+				s.afterEndpointBeginPersistHook()
 			}
-			return err
 		}
-		if err := s.Engine.InsertEndpointContext(writeCtx, endpoint); err != nil {
+		if err := s.Engine.InsertEndpointContext(commitCtx, endpoint); err != nil {
 			if runtimeStage != nil {
 				runtimeStage.Abort()
 			}
@@ -317,8 +324,9 @@ func (s *ControlPlaneService) UpdateEndpoint(id string, patchJSON json.RawMessag
 }
 
 // UpdateEndpointContext updates an endpoint while honoring request
-// cancellation during persistence. A prepared runtime candidate is aborted
-// on every pre-commit failure and committed only after the DB write succeeds.
+// cancellation through validation and runtime preparation. A prepared runtime
+// candidate is aborted on every pre-commit failure and, after BeginPersist,
+// committed with the shutdown-owned context only after the DB write succeeds.
 func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id string, patchJSON json.RawMessage) (*EndpointResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -342,10 +350,16 @@ func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id stri
 		return nil, err
 	}
 
-	s.endpointMu.Lock()
-	defer s.endpointMu.Unlock()
 	var response *EndpointResponse
-	err := s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
+	err := s.withEndpointMutationContext(ctx, func(writeCtx, commitCtx context.Context) error {
+		if s.beforeEndpointLockHook != nil {
+			s.beforeEndpointLockHook()
+		}
+		if err := s.endpointMu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer s.endpointMu.unlock()
+
 		current, err := s.Engine.GetEndpointContext(writeCtx, id)
 		if errors.Is(err, state.ErrNotFound) {
 			return notFound("endpoint not found")
@@ -399,18 +413,19 @@ func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id stri
 			if prepareErr != nil {
 				return conflict(fmt.Sprintf("listen on port %d: %v", next.Port, prepareErr))
 			}
+			if err := writeCtx.Err(); err != nil {
+				runtimeStage.Abort()
+				return err
+			}
 			if !runtimeStage.BeginPersist() {
 				runtimeStage.Abort()
 				return internal("endpoint runtime unavailable", errors.New("endpoint stage canceled"))
 			}
-		}
-		if err := writeCtx.Err(); err != nil {
-			if runtimeStage != nil {
-				runtimeStage.Abort()
+			if s.afterEndpointBeginPersistHook != nil {
+				s.afterEndpointBeginPersistHook()
 			}
-			return err
 		}
-		if err := s.Engine.UpdateEndpointContext(writeCtx, next); err != nil {
+		if err := s.Engine.UpdateEndpointContext(commitCtx, next); err != nil {
 			if runtimeStage != nil {
 				runtimeStage.Abort()
 			}
@@ -442,7 +457,9 @@ func (s *ControlPlaneService) DeleteEndpoint(id string) error {
 }
 
 // DeleteEndpointContext deletes an endpoint while honoring request
-// cancellation during the state write admission and SQL delete.
+// cancellation before the irreversible delete boundary. Once admitted, the
+// shutdown-owned commit context keeps the DB delete and runtime removal in
+// one mutation.
 func (s *ControlPlaneService) DeleteEndpointContext(ctx context.Context, id string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -456,10 +473,19 @@ func (s *ControlPlaneService) DeleteEndpointContext(ctx context.Context, id stri
 	if s == nil || s.Engine == nil {
 		return internal("endpoint service is not initialized", nil)
 	}
-	s.endpointMu.Lock()
-	defer s.endpointMu.Unlock()
-	return s.withEndpointMutationContext(ctx, func(writeCtx context.Context) error {
-		if err := s.Engine.DeleteEndpointContext(writeCtx, id); err != nil {
+	return s.withEndpointMutationContext(ctx, func(writeCtx, commitCtx context.Context) error {
+		if s.beforeEndpointLockHook != nil {
+			s.beforeEndpointLockHook()
+		}
+		if err := s.endpointMu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer s.endpointMu.unlock()
+		if s.beforeEndpointDeletePersistHook != nil {
+			s.beforeEndpointDeletePersistHook()
+		}
+
+		if err := s.Engine.DeleteEndpointContext(commitCtx, id); err != nil {
 			if errors.Is(err, state.ErrNotFound) {
 				return notFound("endpoint not found")
 			}

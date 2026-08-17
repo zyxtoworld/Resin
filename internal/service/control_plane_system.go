@@ -83,6 +83,104 @@ func (m *cancellableMutex) TryLock() bool {
 	}
 }
 
+// cancellableRWMutex is the service read/write boundary used by endpoint
+// mutations. Readers remain parallel, writers have priority, and a waiting
+// writer can leave when its request or shutdown admission is canceled.
+type cancellableRWMutex struct {
+	once           sync.Once
+	mu             sync.Mutex
+	cond           *sync.Cond
+	readers        int
+	writer         bool
+	waitingWriters int
+}
+
+func (m *cancellableRWMutex) init() {
+	m.cond = sync.NewCond(&m.mu)
+}
+
+func (m *cancellableRWMutex) ensure() {
+	m.once.Do(m.init)
+}
+
+func (m *cancellableRWMutex) RLock() {
+	m.ensure()
+	m.mu.Lock()
+	for m.writer || m.waitingWriters > 0 {
+		m.cond.Wait()
+	}
+	m.readers++
+	m.mu.Unlock()
+}
+
+func (m *cancellableRWMutex) RUnlock() {
+	m.ensure()
+	m.mu.Lock()
+	if m.readers == 0 {
+		m.mu.Unlock()
+		panic("cancellableRWMutex: RUnlock of unlocked mutex")
+	}
+	m.readers--
+	if m.readers == 0 {
+		m.cond.Broadcast()
+	}
+	m.mu.Unlock()
+}
+
+func (m *cancellableRWMutex) lockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.ensure()
+	m.mu.Lock()
+	m.waitingWriters++
+	stopWake := context.AfterFunc(ctx, func() {
+		m.mu.Lock()
+		m.cond.Broadcast()
+		m.mu.Unlock()
+	})
+	for {
+		if !m.writer && m.readers == 0 {
+			m.waitingWriters--
+			m.writer = true
+			m.mu.Unlock()
+			stopWake()
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			m.waitingWriters--
+			m.cond.Broadcast()
+			m.mu.Unlock()
+			stopWake()
+			return err
+		}
+		m.cond.Wait()
+	}
+}
+
+func (m *cancellableRWMutex) unlock() {
+	m.ensure()
+	m.mu.Lock()
+	if !m.writer {
+		m.mu.Unlock()
+		panic("cancellableRWMutex: Unlock of unlocked mutex")
+	}
+	m.writer = false
+	m.cond.Broadcast()
+	m.mu.Unlock()
+}
+
+func (m *cancellableRWMutex) Lock() {
+	_ = m.lockContext(context.Background())
+}
+
+func (m *cancellableRWMutex) Unlock() {
+	m.unlock()
+}
+
 func (e *ServiceError) Error() string { return e.Message }
 func (e *ServiceError) Unwrap() error { return e.Err }
 
@@ -121,9 +219,9 @@ type ControlPlaneService struct {
 
 	configMu      cancellableMutex
 	configVersion int
-	endpointMu    sync.RWMutex
+	endpointMu    cancellableRWMutex
 	platformMu    cancellableMutex
-	ruleMu        sync.Mutex
+	ruleMu        cancellableMutex
 
 	// platformMutationHook is used by package tests to force a precise
 	// interleaving around the real platform mutation path.
@@ -158,6 +256,21 @@ type ControlPlaneService struct {
 	// ruleMutationHook is used by package tests to force a precise interleaving
 	// around the real account-rule mutation path.
 	ruleMutationHook func(ruleMutationStage)
+
+	// beforeEndpointLockHook is a package-test seam immediately before an
+	// endpoint mutation enters the service-owned read/write boundary.
+	// Production leaves it nil.
+	beforeEndpointLockHook func()
+
+	// afterEndpointBeginPersistHook is a package-test seam after an enabled
+	// endpoint stage has crossed its persistence boundary. Production leaves
+	// it nil.
+	afterEndpointBeginPersistHook func()
+
+	// beforeEndpointDeletePersistHook is a package-test seam after a delete
+	// owns the endpoint mutation lock and immediately before its SQL delete.
+	// Production leaves it nil.
+	beforeEndpointDeletePersistHook func()
 
 	// beforeLeaseServiceRouterReadHook is a package-test seam immediately before
 	// the atomic Router platform read.
@@ -195,6 +308,11 @@ type ControlPlaneService struct {
 	// persisted and before the runtime pool publish. Production leaves it nil.
 	afterPlatformPersistHook func()
 
+	// afterPlatformUnregisterHook is a package-test seam after a platform is
+	// removed from the runtime pool and before its Router state is removed.
+	// Production leaves it nil.
+	afterPlatformUnregisterHook func()
+
 	// afterRuntimeConfigPersistHook is a package-test seam after the system
 	// config row is persisted and before the runtime snapshot publish.
 	afterRuntimeConfigPersistHook func()
@@ -203,6 +321,11 @@ type ControlPlaneService struct {
 	// cancellable config mutation owner. Production leaves them nil.
 	beforeRuntimeConfigLockHook func()
 	afterRuntimeConfigLockHook  func()
+
+	// Runtime read seams are package-test coordination for request-bound
+	// generation admission. Production leaves them nil.
+	beforeRuntimeReadLockHook   func()
+	afterRuntimeReadAttemptHook func(error)
 }
 
 // withRuntimeRead keeps responses that combine subscription ManagedNodes with
@@ -222,18 +345,31 @@ func (s *ControlPlaneService) withRuntimeReadContext(ctx context.Context, fn fun
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if hook := s.beforeRuntimeReadLockHook; hook != nil {
+		hook()
+	}
 	if s != nil && s.Pool != nil {
-		return s.Pool.WithRuntimeReadContext(ctx, func() {
+		err := s.Pool.WithRuntimeReadContext(ctx, func() {
 			if hook := s.afterRuntimeReadLockHook; hook != nil {
 				hook()
 			}
 			fn()
 		})
+		if hook := s.afterRuntimeReadAttemptHook; hook != nil {
+			hook(err)
+		}
+		return err
 	}
 	if err := ctx.Err(); err != nil {
+		if hook := s.afterRuntimeReadAttemptHook; hook != nil {
+			hook(err)
+		}
 		return err
 	}
 	fn()
+	if hook := s.afterRuntimeReadAttemptHook; hook != nil {
+		hook(nil)
+	}
 	return nil
 }
 

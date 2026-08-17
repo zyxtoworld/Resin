@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -395,5 +396,103 @@ func TestHandleListNodes_EnabledFilter(t *testing.T) {
 	body = decodeJSONMap(t, rec)
 	if body["total"] != float64(1) {
 		t.Fatalf("enabled=false total: got %v, want 1", body["total"])
+	}
+}
+
+func TestHandleListNodes_HonorsCanceledRequestWhileRuntimeBatchWriterWaits(t *testing.T) {
+	_, cp, _ := newControlPlaneTestServer(t)
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseWriter) })
+	writerDone := make(chan struct{})
+	go func() {
+		cp.Pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not enter")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil).WithContext(requestCtx)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleListNodes(cp)(rec, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled list request remained blocked behind runtime mutation")
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatal("canceled list request unexpectedly returned a successful snapshot")
+	}
+
+	releaseOnce.Do(func() { close(releaseWriter) })
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not finish")
+	}
+}
+
+func TestHandleGetNode_HonorsCanceledRequestWhileRuntimeBatchWriterWaits(t *testing.T) {
+	_, cp, _ := newControlPlaneTestServer(t)
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseWriter) })
+	writerDone := make(chan struct{})
+	go func() {
+		cp.Pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not enter")
+	}
+
+	hash := node.HashFromRawOptions([]byte(`{"type":"ss","server":"1.1.1.1","port":443}`))
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/"+hash.Hex(), nil).WithContext(requestCtx)
+	req.SetPathValue("hash", hash.Hex())
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandleGetNode(cp)(rec, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled get-node request remained blocked behind runtime mutation")
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatal("canceled get-node request unexpectedly returned a successful snapshot")
+	}
+
+	releaseOnce.Do(func() { close(releaseWriter) })
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not finish")
 	}
 }

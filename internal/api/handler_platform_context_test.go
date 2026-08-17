@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -187,6 +188,73 @@ func TestRebuildPlatformHandlerStopsOnCanceledRuntimeBatchRead(t *testing.T) {
 		releaseMutation()
 		<-handlerDone
 		t.Fatal("canceled rebuild remained blocked on runtime batch read owner")
+	}
+
+	releaseMutation()
+	select {
+	case <-mutationDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not finish after release")
+	}
+}
+
+func TestPreviewFilterHandlerStopsOnCanceledRuntimeBatchRead(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &service.ControlPlaneService{Pool: pool}
+
+	mutationEntered := make(chan struct{})
+	allowMutation := make(chan struct{})
+	mutationDone := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseMutation := func() { releaseOnce.Do(func() { close(allowMutation) }) }
+	t.Cleanup(func() {
+		releaseMutation()
+		select {
+		case <-mutationDone:
+		case <-time.After(time.Second):
+			t.Error("runtime mutation owner did not finish during cleanup")
+		}
+	})
+
+	go func() {
+		pool.WithRuntimeMutation(func() {
+			close(mutationEntered)
+			<-allowMutation
+		})
+		close(mutationDone)
+	}()
+	select {
+	case <-mutationEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not acquire its write owner")
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/platforms/preview-filter",
+		bytes.NewBufferString(`{"platform_spec":{}}`),
+	).WithContext(requestCtx)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		HandlePreviewFilter(cp).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+
+	cancel()
+	select {
+	case <-handlerDone:
+		if rec.Code == http.StatusOK {
+			t.Fatalf("canceled preview-filter returned success")
+		}
+	case <-time.After(time.Second):
+		releaseMutation()
+		<-handlerDone
+		t.Fatal("canceled preview-filter remained blocked on runtime batch read owner")
 	}
 
 	releaseMutation()

@@ -317,6 +317,16 @@ func (e *StateEngine) WithStateWriteAdmissionContext(ctx context.Context, fn fun
 	})
 }
 
+// WithStateWriteAdmissionContextAndCommit keeps one strong-write admission
+// active while exposing a request-cancelable context for the lock/validation
+// phase and a shutdown-only context for the irreversible commit phase.
+func (e *StateEngine) WithStateWriteAdmissionContextAndCommit(ctx context.Context, fn func(context.Context, context.Context) error) error {
+	if e == nil || e.StateRepo == nil {
+		return ErrStateWriteAdmissionClosed
+	}
+	return e.StateRepo.withWriteContextAndCommit(ctx, fn)
+}
+
 // waitForStateWrites waits for the already-admitted strong mutation owner.
 // Shutdown closes state admission before calling this method so no new
 // mutation can pass the empty-set observation.

@@ -354,3 +354,198 @@ func TestAccountHeaderRuleMutationsSerializeSnapshotAndPublish(t *testing.T) {
 		t.Fatalf("runtime retained deleted second rule: prefix=%q headers=%v", prefix, headers)
 	}
 }
+
+func TestAccountHeaderRuleMutationContextCancellationWhileRuleMutexHeld(t *testing.T) {
+	root := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(root, "state"),
+		filepath.Join(root, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	runtime := proxy.NewAccountMatcherRuntime(nil)
+	cp := &ControlPlaneService{Engine: engine, MatcherRuntime: runtime}
+	firstSnapshot := make(chan struct{})
+	secondBeforeLock := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseFirst) }) })
+	var beforeLockCalls atomic.Int32
+	var snapshotCalls atomic.Int32
+	cp.ruleMutationHook = func(stage ruleMutationStage) {
+		switch stage {
+		case ruleMutationBeforeLock:
+			if beforeLockCalls.Add(1) == 2 {
+				close(secondBeforeLock)
+			}
+		case ruleMutationAfterSnapshot:
+			if snapshotCalls.Add(1) == 1 {
+				close(firstSnapshot)
+				<-releaseFirst
+			}
+		}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := cp.UpsertAccountHeaderRule("first.example.com", []string{"X-First"})
+		firstDone <- err
+	}()
+	select {
+	case <-firstSnapshot:
+	case <-time.After(time.Second):
+		t.Fatal("first rule mutation did not hold rule mutex at snapshot")
+	}
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := cp.UpsertAccountHeaderRuleContext(secondCtx, "second.example.com", []string{"X-Second"})
+		secondDone <- err
+	}()
+	select {
+	case <-secondBeforeLock:
+	case <-time.After(time.Second):
+		cancelSecond()
+		releaseOnce.Do(func() { close(releaseFirst) })
+		<-firstDone
+		t.Fatal("second rule mutation did not reach the lock boundary")
+	}
+	cancelSecond()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled rule mutation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		releaseOnce.Do(func() { close(releaseFirst) })
+		<-firstDone
+		t.Fatal("canceled rule mutation remained blocked by rule mutex")
+	}
+
+	releaseOnce.Do(func() { close(releaseFirst) })
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first rule mutation: %v", err)
+	}
+
+	rules, err := engine.ListAccountHeaderRules()
+	if err != nil {
+		t.Fatalf("ListAccountHeaderRules: %v", err)
+	}
+	if len(rules) != 1 || rules[0].URLPrefix != "first.example.com" {
+		t.Fatalf("canceled rule mutation changed persisted rules: %+v", rules)
+	}
+	if prefix, headers := runtime.MatchWithPrefix("first.example.com", "/"); prefix != "first.example.com" || len(headers) != 1 || headers[0] != "X-First" {
+		t.Fatalf("first rule was not published: prefix=%q headers=%v", prefix, headers)
+	}
+	if prefix, headers := runtime.MatchWithPrefix("second.example.com", "/"); prefix != "" || headers != nil {
+		t.Fatalf("canceled rule was published: prefix=%q headers=%v", prefix, headers)
+	}
+}
+
+func TestAccountHeaderRuleMutationCommitsAfterRequestCancellationOnceRuleLocked(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	engine, closer, err := state.PersistenceBootstrap(stateDir, filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	oldRule := model.AccountHeaderRule{
+		URLPrefix:   "old.example.com",
+		Headers:     []string{"X-Old"},
+		UpdatedAtNs: time.Now().UnixNano(),
+	}
+	if _, err := engine.UpsertAccountHeaderRuleWithCreated(oldRule); err != nil {
+		t.Fatalf("seed old rule: %v", err)
+	}
+
+	blocker, err := state.OpenDB(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	tx, err := blocker.Begin()
+	if err != nil {
+		_ = blocker.Close()
+		t.Fatalf("blocker Begin: %v", err)
+	}
+	if _, err := tx.Exec("UPDATE account_header_rules SET updated_at_ns = updated_at_ns WHERE url_prefix = ?", oldRule.URLPrefix); err != nil {
+		_ = tx.Rollback()
+		_ = blocker.Close()
+		t.Fatalf("hold account-header SQLite gate: %v", err)
+	}
+	releasedDB := false
+	releaseDB := func() {
+		if releasedDB {
+			return
+		}
+		releasedDB = true
+		_ = tx.Rollback()
+		_ = blocker.Close()
+	}
+	defer releaseDB()
+
+	runtime := proxy.NewAccountMatcherRuntime(proxy.BuildAccountMatcher([]model.AccountHeaderRule{oldRule}))
+	cp := &ControlPlaneService{Engine: engine, MatcherRuntime: runtime}
+	atSnapshot := make(chan struct{})
+	allowPersist := make(chan struct{})
+	var allowOnce sync.Once
+	t.Cleanup(func() { allowOnce.Do(func() { close(allowPersist) }) })
+	cp.ruleMutationHook = func(stage ruleMutationStage) {
+		if stage == ruleMutationAfterSnapshot {
+			close(atSnapshot)
+			<-allowPersist
+		}
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		response *RuleResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, _, err := cp.UpsertAccountHeaderRuleContext(requestCtx, "new.example.com", []string{"X-New"})
+		done <- result{response: response, err: err}
+	}()
+	select {
+	case <-atSnapshot:
+	case <-time.After(time.Second):
+		releaseDB()
+		allowOnce.Do(func() { close(allowPersist) })
+		t.Fatal("rule mutation did not reach the post-snapshot commit boundary")
+	}
+
+	cancel()
+	allowOnce.Do(func() { close(allowPersist) })
+	releaseDB()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("rule mutation was canceled after lock acquisition: %v", result.err)
+		}
+		if result.response == nil || result.response.URLPrefix != "new.example.com" {
+			t.Fatalf("committed rule response = %+v", result.response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rule mutation did not finish after SQLite gate release")
+	}
+
+	rules, err := engine.ListAccountHeaderRules()
+	if err != nil {
+		t.Fatalf("ListAccountHeaderRules: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("persisted rules after request cancellation = %+v, want two committed rules", rules)
+	}
+	if prefix, headers := runtime.MatchWithPrefix("new.example.com", "/"); prefix != "new.example.com" || len(headers) != 1 || headers[0] != "X-New" {
+		t.Fatalf("matcher did not publish committed rule: prefix=%q headers=%v", prefix, headers)
+	}
+}

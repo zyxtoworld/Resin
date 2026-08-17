@@ -1141,7 +1141,11 @@ func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleS
 	if r.stopped || r.pool == nil {
 		return
 	}
-	if _, ok := r.pool.GetPlatform(route.PlatformID); !ok {
+	if route.platform == nil {
+		return
+	}
+	currentPlatform, ok := r.pool.GetPlatform(route.PlatformID)
+	if !ok || currentPlatform != route.platform {
 		return
 	}
 	// A response can arrive after the node hash has been removed and rebuilt.
@@ -1538,12 +1542,15 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 	}
 }
 
-// RangeLeases iterates over all leases for a platform.
-// Returns false if the platform has no routing state.
+// RangeLeases iterates over all leases for a registered platform.
+// Returns false if the platform is not registered or has no routing state.
 func (r *Router) RangeLeases(platformID string, fn func(account string, lease Lease) bool) bool {
 	r.lifecycleMu.RLock()
 	defer r.lifecycleMu.RUnlock()
 	if r.stopped {
+		return false
+	}
+	if !r.platformExistsLocked(platformID) {
 		return false
 	}
 

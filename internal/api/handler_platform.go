@@ -210,7 +210,7 @@ func HandlePreviewFilter(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeInvalidArgument(w, "platform_id: must be a valid UUID")
 			return
 		}
-		nodes, err := cp.PreviewFilter(req)
+		nodes, err := cp.PreviewFilterContext(r.Context(), req)
 		if err != nil {
 			writeServiceError(w, err)
 			return

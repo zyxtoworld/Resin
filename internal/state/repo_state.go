@@ -58,6 +58,18 @@ func (r *StateRepo) withWrite(fn func(context.Context) error) error {
 // therefore cancel an HTTP mutation without weakening shutdown cancellation
 // for ordinary background callers.
 func (r *StateRepo) withWriteContext(parent context.Context, fn func(context.Context) error) error {
+	return r.withWriteContextAndCommit(parent, func(writeCtx, _ context.Context) error {
+		return fn(writeCtx)
+	})
+}
+
+// withWriteContextAndCommit admits one strong-persistence mutation and gives
+// the callback two contexts: writeCtx is request-cancelable admission context;
+// commitCtx is canceled only when the state-write admission is shut down.
+// Callers must use commitCtx after their mutation has crossed its own
+// serialization/validation boundary, so a disconnected HTTP client cannot
+// split a committed database row from its in-memory publish.
+func (r *StateRepo) withWriteContextAndCommit(parent context.Context, fn func(context.Context, context.Context) error) error {
 	if r == nil {
 		return ErrStateWriteAdmissionClosed
 	}
@@ -83,6 +95,7 @@ func (r *StateRepo) withWriteContext(parent context.Context, fn func(context.Con
 	}
 	ctx := r.writeCtx
 	r.writeMu.Unlock()
+	commitCtx := context.WithValue(ctx, contextSQLiteWriteKey{}, true)
 	mergedCtx, cancel := context.WithCancel(parent)
 	if interruptible {
 		mergedCtx = context.WithValue(mergedCtx, contextSQLiteWriteKey{}, true)
@@ -107,7 +120,7 @@ func (r *StateRepo) withWriteContext(parent context.Context, fn func(context.Con
 	}
 	retryUntil := time.Now().Add(time.Duration(DefaultSQLiteBusyTimeoutMs) * time.Millisecond)
 	for {
-		err := fn(mergedCtx)
+		err := fn(mergedCtx, commitCtx)
 		if err == nil || !interruptible || mergedCtx.Err() != nil || !isSQLiteBusyError(err) || !time.Now().Before(retryUntil) {
 			return err
 		}
@@ -902,17 +915,30 @@ func scanEndpoint(scan endpointScanner) (model.Endpoint, error) {
 // EnsureAccountHeaderRule inserts a rule by url_prefix only when it does not
 // already exist and reports whether the row was newly created.
 func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool, error) {
+	return r.EnsureAccountHeaderRuleContext(context.Background(), rule)
+}
+
+// EnsureAccountHeaderRuleContext is the request-aware form of
+// EnsureAccountHeaderRule. The repository mutex and SQLite write both honor
+// cancellation before any row is changed.
+func (r *StateRepo) EnsureAccountHeaderRuleContext(ctx context.Context, rule model.AccountHeaderRule) (bool, error) {
 	headersJSON, err := encodeStringSliceJSON(rule.Headers)
 	if err != nil {
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
 	var created bool
-	err = r.withWrite(func(ctx context.Context) error {
-		r.mu.Lock()
-		defer r.mu.Unlock()
+	err = r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
-		result, err := r.db.ExecContext(ctx, `
+		result, err := r.db.ExecContext(writeCtx, `
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
 		VALUES (?, ?, ?)
 		ON CONFLICT(url_prefix) DO NOTHING
@@ -930,23 +956,35 @@ func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool,
 // UpsertAccountHeaderRuleWithCreated inserts or updates a rule by url_prefix and
 // reports whether the row was newly created.
 func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderRule) (bool, error) {
+	return r.UpsertAccountHeaderRuleWithCreatedContext(context.Background(), rule)
+}
+
+// UpsertAccountHeaderRuleWithCreatedContext is the request-aware form of
+// UpsertAccountHeaderRuleWithCreated.
+func (r *StateRepo) UpsertAccountHeaderRuleWithCreatedContext(ctx context.Context, rule model.AccountHeaderRule) (bool, error) {
 	headersJSON, err := encodeStringSliceJSON(rule.Headers)
 	if err != nil {
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
 	var inserted bool
-	err = r.withWrite(func(ctx context.Context) error {
-		r.mu.Lock()
-		defer r.mu.Unlock()
+	err = r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
-		tx, err := r.db.BeginTx(ctx, nil)
+		tx, err := r.db.BeginTx(writeCtx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
 
-		insertRes, err := tx.ExecContext(ctx, `
+		insertRes, err := tx.ExecContext(writeCtx, `
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
 		VALUES (?, ?, ?)
 		ON CONFLICT(url_prefix) DO NOTHING
@@ -960,7 +998,7 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderR
 			inserted = true
 		} else {
 			// Existing row: apply update path.
-			if _, err := tx.ExecContext(ctx, `
+			if _, err := tx.ExecContext(writeCtx, `
 				UPDATE account_header_rules
 				SET headers_json = ?, updated_at_ns = ?
 				WHERE url_prefix = ?
@@ -976,11 +1014,23 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderR
 
 // DeleteAccountHeaderRule removes a rule by url_prefix.
 func (r *StateRepo) DeleteAccountHeaderRule(prefix string) error {
-	return r.withWrite(func(ctx context.Context) error {
-		r.mu.Lock()
-		defer r.mu.Unlock()
+	return r.DeleteAccountHeaderRuleContext(context.Background(), prefix)
+}
 
-		result, err := r.db.ExecContext(ctx, "DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
+// DeleteAccountHeaderRuleContext is the request-aware form of
+// DeleteAccountHeaderRule.
+func (r *StateRepo) DeleteAccountHeaderRuleContext(ctx context.Context, prefix string) error {
+	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
+		if hook := r.beforeWriteMutexHook; hook != nil {
+			hook()
+		}
+		unlock, err := r.lockWriteContext(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		result, err := r.db.ExecContext(writeCtx, "DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
 		if err != nil {
 			return err
 		}

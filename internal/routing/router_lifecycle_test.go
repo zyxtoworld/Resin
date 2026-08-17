@@ -999,6 +999,7 @@ func TestLateOlderQuarantineCannotEraseNewerEntryCooldown(t *testing.T) {
 		NodeHash:      hash,
 		EgressIP:      oldEntry.GetEgressIP(),
 		selectedEntry: oldEntry,
+		platform:      plat,
 	}
 	newEntry := newHealthyEntryForHash(t, hash, []byte(raw), "203.0.113.131")
 	newRoute := oldRoute
