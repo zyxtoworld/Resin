@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"syscall"
@@ -37,6 +38,38 @@ func TestSummarizeUpstreamError_Errno(t *testing.T) {
 	}
 	if detail.Errno != "ECONNREFUSED" {
 		t.Fatalf("errno: got %q, want %q", detail.Errno, "ECONNREFUSED")
+	}
+}
+
+func TestSummarizeUpstreamError_DoesNotPersistURLCredentials(t *testing.T) {
+	err := &url.Error{
+		Op:  "Get",
+		URL: "https://alice:target-password@example.com/sub/target-path?token=target-query",
+		Err: errors.New("connection refused"),
+	}
+	detail := summarizeUpstreamError(err)
+	if !strings.Contains(detail.Message, "connection refused") {
+		t.Fatalf("upstream error lost underlying cause: %q", detail.Message)
+	}
+	for _, secret := range []string{"alice", "target-password", "target-path", "target-query"} {
+		if strings.Contains(detail.Message, secret) {
+			t.Fatalf("upstream error exposed URL credential %q: %q", secret, detail.Message)
+		}
+	}
+}
+
+func TestSanitizeLoggedTargetURL_InvalidInputFailsClosed(t *testing.T) {
+	for _, raw := range []string{
+		"not a URL?token=invalid-query",
+		"://missing-scheme/invalid-path",
+	} {
+		got := sanitizeLoggedTargetURL(raw)
+		if got != "[redacted-url]" {
+			t.Fatalf("sanitizeLoggedTargetURL(%q) = %q, want redacted marker", raw, got)
+		}
+		if strings.Contains(got, "invalid-query") || strings.Contains(got, "invalid-path") {
+			t.Fatalf("invalid URL secret was retained: %q", got)
+		}
 	}
 }
 

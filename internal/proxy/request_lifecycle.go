@@ -151,8 +151,10 @@ func (l *requestLifecycle) setTarget(host, rawURL string) {
 }
 
 // sanitizeLoggedTargetURL keeps request-log diagnostics useful without
-// persisting credentials embedded in a proxy target URL. The URL is still
-// forwarded unchanged; this only affects the observability projection.
+// persisting credentials embedded in a proxy target URL. Only the origin is
+// retained; path, query, and fragment may contain subscription credentials or
+// other bearer material. The URL is still forwarded unchanged; this only
+// affects the observability projection.
 func sanitizeLoggedTargetURL(rawURL string) string {
 	if rawURL == "" {
 		return ""
@@ -161,8 +163,7 @@ func sanitizeLoggedTargetURL(rawURL string) string {
 	if err != nil || target.Scheme == "" || target.Host == "" {
 		return "[redacted-url]"
 	}
-	target.User = nil
-	return target.String()
+	return target.Scheme + "://" + target.Host
 }
 
 func (l *requestLifecycle) setReqHeadersCaptured(reqHeaders []byte, totalLen int, truncated bool) {

@@ -1335,7 +1335,7 @@ func TestForwardProxy_E2EHTTPSuccess(t *testing.T) {
 	}
 }
 
-func TestForwardProxy_RequestLogDoesNotExposeTargetURLUserinfo(t *testing.T) {
+func TestForwardProxy_RequestLogDoesNotExposeTargetURLCredentials(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	emitter := newMockEventEmitter()
 
@@ -1345,7 +1345,7 @@ func TestForwardProxy_RequestLogDoesNotExposeTargetURLUserinfo(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	target, err := url.Parse(upstream.URL + "/private?trace=1")
+	target, err := url.Parse(upstream.URL + "/sub/secret-target-path?token=secret-target-query")
 	if err != nil {
 		t.Fatalf("parse target: %v", err)
 	}
@@ -1368,8 +1368,14 @@ func TestForwardProxy_RequestLogDoesNotExposeTargetURLUserinfo(t *testing.T) {
 
 	select {
 	case logEv := <-emitter.logCh:
-		if strings.Contains(logEv.TargetURL, "alice") || strings.Contains(logEv.TargetURL, "secret-target-password") {
-			t.Fatalf("request log exposed target URL credentials: %q", logEv.TargetURL)
+		expectedOrigin := target.Scheme + "://" + target.Host
+		if logEv.TargetURL != expectedOrigin {
+			t.Fatalf("request log target URL: got %q, want origin %q", logEv.TargetURL, expectedOrigin)
+		}
+		for _, secret := range []string{"alice", "secret-target-password", "secret-target-path", "secret-target-query"} {
+			if strings.Contains(logEv.TargetURL, secret) {
+				t.Fatalf("request log exposed target URL credential %q: %q", secret, logEv.TargetURL)
+			}
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected forward log event")

@@ -118,7 +118,7 @@ func TestProxyRequestLogDatabaseContainsNoCredentialProjectionValues(t *testing.
 		Pool:       pool,
 		Events:     events,
 	})
-	target, err := url.Parse(upstream.URL + "/private?trace=1")
+	target, err := url.Parse(upstream.URL + "/sub/target-path?token=target-query")
 	if err != nil {
 		t.Fatalf("parse target: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestProxyRequestLogDatabaseContainsNoCredentialProjectionValues(t *testing.
 		Events:         events,
 	})
 	host := strings.TrimPrefix(upstream.URL, "http://")
-	reverseReq := httptest.NewRequest(http.MethodGet, "/tok/plat:acct/http/"+host+"/secure", nil)
+	reverseReq := httptest.NewRequest(http.MethodGet, "/tok/plat:acct/http/"+host+"/sub/reverse-target-path?reset=reverse-query", nil)
 	reverseReq.Header["aUtHoRiZaTiOn"] = []string{"Bearer request-secret"}
 	reverseReq.Header["cOoKiE"] = []string{"session=request-secret-1", "other=request-secret-2"}
 	reverseReq.Header.Set("X-Trace-Id", "keep-this-header")
@@ -161,8 +161,13 @@ func TestProxyRequestLogDatabaseContainsNoCredentialProjectionValues(t *testing.
 	}
 	foundOrdinaryHeader := false
 	for _, row := range rows {
-		if strings.Contains(row.TargetURL, "target-secret") {
-			t.Fatalf("request log target URL leaked credential: %q", row.TargetURL)
+		for _, secret := range []string{
+			"alice", "target-secret", "target-path", "target-query",
+			"reverse-target-path", "reverse-query",
+		} {
+			if strings.Contains(row.TargetURL, secret) {
+				t.Fatalf("request log target URL leaked credential %q: %q", secret, row.TargetURL)
+			}
 		}
 		payload, err := logRepo.GetPayloads(row.ID)
 		if err != nil {
@@ -172,7 +177,7 @@ func TestProxyRequestLogDatabaseContainsNoCredentialProjectionValues(t *testing.
 			continue
 		}
 		allPayload := string(payload.ReqHeaders) + string(payload.RespHeaders)
-		for _, secret := range []string{"request-secret", "upstream-secret", "target-secret"} {
+		for _, secret := range []string{"request-secret", "upstream-secret", "target-secret", "target-query", "reverse-query"} {
 			if strings.Contains(allPayload, secret) {
 				t.Fatalf("request log payload leaked %q: %q", secret, allPayload)
 			}

@@ -26,9 +26,18 @@ func summarizeUpstreamError(err error) upstreamErrorDetail {
 	if err == nil {
 		return upstreamErrorDetail{}
 	}
+	message := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Err == nil {
+			message = "upstream request failed"
+		} else {
+			message = urlErr.Err.Error()
+		}
+	}
 	detail := upstreamErrorDetail{
 		Errno:   extractErrnoCode(err),
-		Message: sanitizeUpstreamErrMsg(err.Error()),
+		Message: sanitizeUpstreamErrMsg(message),
 	}
 	detail.Kind = classifyUpstreamErrKind(err, detail.Errno)
 	return detail
