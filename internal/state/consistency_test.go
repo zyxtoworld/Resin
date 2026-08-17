@@ -193,3 +193,37 @@ func TestRepairConsistency_ValidRecordsSurvive(t *testing.T) {
 			len(nodes), len(sns), len(dyn), len(lat), len(leases))
 	}
 }
+
+func TestRepairConsistencyKeepsAttachAndTransactionOnOneConnection(t *testing.T) {
+	stateDir := t.TempDir()
+	cacheDir := t.TempDir()
+	stateDBPath := filepath.Join(stateDir, "state.db")
+	cacheDBPath := filepath.Join(cacheDir, "cache.db")
+
+	stateDB, err := OpenDB(stateDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateDB.Close()
+	if err := MigrateStateDB(stateDB); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDB, err := OpenDB(cacheDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cacheDB.Close()
+	if err := MigrateCacheDB(cacheDB); err != nil {
+		t.Fatal(err)
+	}
+
+	// ATTACH is connection-local. With no idle connections, the *sql.DB
+	// implementation closes the connection that ran ATTACH before the next
+	// Begin call, so RepairConsistency must explicitly retain one *sql.Conn.
+	cacheDB.SetMaxOpenConns(1)
+	cacheDB.SetMaxIdleConns(0)
+	if err := RepairConsistency(stateDBPath, cacheDB); err != nil {
+		t.Fatalf("RepairConsistency with a non-reusable DB connection: %v", err)
+	}
+}

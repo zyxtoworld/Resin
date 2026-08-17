@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -17,15 +18,31 @@ import (
 //  4. node_latency: remove entries whose node_hash is missing from nodes_static.
 //  5. leases: remove entries whose platform_id is missing from state.platforms
 //     OR whose node_hash is missing from nodes_static.
-func RepairConsistency(stateDBPath string, cacheDB *sql.DB) error {
+func RepairConsistency(stateDBPath string, cacheDB *sql.DB) (retErr error) {
+	if cacheDB == nil {
+		return fmt.Errorf("cache db is nil")
+	}
+	// ATTACH is connection-local. Keep one dedicated connection for the
+	// entire operation instead of allowing database/sql to run ATTACH and the
+	// following transaction on different pooled connections.
+	conn, err := cacheDB.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("acquire cache repair connection: %w", err)
+	}
+	defer conn.Close()
+
 	// ATTACH state.db so we can cross-query.
 	attachSQL := fmt.Sprintf("ATTACH DATABASE %q AS state_db", stateDBPath)
-	if _, err := cacheDB.Exec(attachSQL); err != nil {
+	if _, err := conn.ExecContext(context.Background(), attachSQL); err != nil {
 		return fmt.Errorf("attach state_db: %w", err)
 	}
-	defer cacheDB.Exec("DETACH DATABASE state_db")
+	defer func() {
+		if _, err := conn.ExecContext(context.Background(), "DETACH DATABASE state_db"); err != nil && retErr == nil {
+			retErr = fmt.Errorf("detach state_db: %w", err)
+		}
+	}()
 
-	tx, err := cacheDB.Begin()
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("begin repair tx: %w", err)
 	}
@@ -56,7 +73,7 @@ func RepairConsistency(stateDBPath string, cacheDB *sql.DB) error {
 	}
 
 	for i, s := range stmts {
-		if _, err := tx.Exec(s); err != nil {
+		if _, err := tx.ExecContext(context.Background(), s); err != nil {
 			return fmt.Errorf("repair step %d: %w", i+1, err)
 		}
 	}
