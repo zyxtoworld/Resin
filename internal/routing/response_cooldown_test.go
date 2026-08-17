@@ -203,6 +203,122 @@ func TestRouter_ResponseCooldownSkipsEgressIPAndRestoresAfterExpiry(t *testing.T
 	}
 }
 
+func TestRouter_ResponseCooldownIsScopedPerPlatformForSharedEgress(t *testing.T) {
+	pool := newRouterTestPool()
+	platformA := platform.NewPlatform("plat-cooldown-a", "Plat-Cooldown-A", nil, nil)
+	platformB := platform.NewPlatform("plat-cooldown-b", "Plat-Cooldown-B", nil, nil)
+	platformA.StickyTTLNs = int64(time.Hour)
+	platformB.StickyTTLNs = int64(time.Hour)
+	pool.addPlatform(platformA)
+	pool.addPlatform(platformB)
+
+	firstHash, firstEntry := newRoutableEntry(t, `{"id":"shared-egress-first"}`, "198.51.100.90")
+	secondHash, secondEntry := newRoutableEntry(t, `{"id":"shared-egress-second"}`, "198.51.100.91")
+	thirdHash, thirdEntry := newRoutableEntry(t, `{"id":"shared-egress-third"}`, "198.51.100.92")
+	pool.addEntry(firstHash, firstEntry)
+	pool.addEntry(secondHash, secondEntry)
+	pool.addEntry(thirdHash, thirdEntry)
+	pool.rebuildPlatformView(platformA)
+
+	router := newTestRouter(pool, nil)
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+	initial, err := router.RouteRequestForProxy(platformA.Name, "account-a", "https://example.com")
+	if err != nil {
+		t.Fatalf("initial platform A route: %v", err)
+	}
+	if initial.selectedEntry == nil || !initial.EgressIP.IsValid() {
+		t.Fatalf("initial route did not carry an exact egress: %+v", initial)
+	}
+
+	// Platform B deliberately exposes only the exact same entry/IP. If A's
+	// cooldown were global, this route would fail even though B is healthy.
+	platformB.FullRebuild(
+		func(fn func(node.Hash, *node.NodeEntry) bool) {
+			fn(initial.NodeHash, initial.selectedEntry)
+		},
+		func(_ string, _ node.Hash) (string, bool, []string, bool) { return "", true, nil, true },
+		func(_ netip.Addr) string { return "" },
+	)
+
+	until := now.Add(time.Minute)
+	router.QuarantineRoute(initial, platform.ResponseRuleScopeEgressIP, until)
+	if !router.responseCooldowns(platformA.ID).IsCoolingForEntry(initial.NodeHash, initial.selectedEntry, initial.EgressIP, now) {
+		t.Fatal("platform A did not record the shared-egress cooldown")
+	}
+	if router.responseCooldowns(platformB.ID).IsCoolingForEntry(initial.NodeHash, initial.selectedEntry, initial.EgressIP, now) {
+		t.Fatal("platform A cooldown leaked into platform B")
+	}
+
+	const concurrentBRequests = 16
+	bErrors := make(chan error, concurrentBRequests)
+	for i := 0; i < concurrentBRequests; i++ {
+		go func() {
+			got, routeErr := router.RouteRequestForProxy(platformB.Name, "account-b", "https://example.com")
+			if routeErr != nil {
+				bErrors <- routeErr
+				return
+			}
+			if got.NodeHash != initial.NodeHash || got.selectedEntry != initial.selectedEntry {
+				bErrors <- errors.New("platform B did not retain the shared exact egress")
+				return
+			}
+			bErrors <- nil
+		}()
+	}
+	for i := 0; i < concurrentBRequests; i++ {
+		if err := <-bErrors; err != nil {
+			t.Fatalf("concurrent platform B route: %v", err)
+		}
+	}
+
+	next, err := router.RouteRequestNext(initial, RouteRetryExclusions{
+		Entries:   []*node.NodeEntry{initial.selectedEntry},
+		EgressIPs: []netip.Addr{initial.EgressIP},
+	})
+	if err != nil {
+		t.Fatalf("platform A retry route: %v", err)
+	}
+	if next.NodeHash == initial.NodeHash || next.EgressIP == initial.EgressIP {
+		t.Fatalf("platform A retry reused the cooled egress: initial=%+v next=%+v", initial, next)
+	}
+	if !router.CommitRouteForAccount(next, "account-a") {
+		t.Fatal("platform A did not commit the accepted retry route")
+	}
+	sticky, err := router.RouteRequest(platformA.Name, "account-a", "https://example.com")
+	if err != nil {
+		t.Fatalf("platform A sticky route after retry: %v", err)
+	}
+	if sticky.NodeHash != next.NodeHash || sticky.selectedEntry != next.selectedEntry {
+		t.Fatalf("platform A sticky owner changed after retry: got=%+v want=%+v", sticky, next)
+	}
+
+	var otherEntries []*node.NodeEntry
+	var otherIPs []netip.Addr
+	for _, candidate := range initial.retrySnapshot.candidates {
+		if candidate.entry == initial.selectedEntry {
+			continue
+		}
+		otherEntries = append(otherEntries, candidate.entry)
+		otherIPs = append(otherIPs, candidate.ip)
+	}
+	if _, err := router.RouteRequestNext(initial, RouteRetryExclusions{Entries: otherEntries, EgressIPs: otherIPs}); !errors.Is(err, ErrNoAvailableNodes) {
+		t.Fatalf("cooled platform A egress was available before expiry: %v", err)
+	}
+	now = until
+	restored, err := router.RouteRequestNext(initial, RouteRetryExclusions{Entries: otherEntries, EgressIPs: otherIPs})
+	if err != nil {
+		t.Fatalf("platform A route after cooldown expiry: %v", err)
+	}
+	if restored.selectedEntry != initial.selectedEntry || restored.EgressIP != initial.EgressIP {
+		t.Fatalf("platform A did not restore the cooled egress: got=%+v want=%+v", restored, initial)
+	}
+	if router.responseCooldowns(platformB.ID).IsCoolingForEntry(initial.NodeHash, initial.selectedEntry, initial.EgressIP, now) {
+		t.Fatal("platform B retained a cooldown after platform A expiry")
+	}
+
+}
+
 func TestRouter_RouteRequestNextDoesNotCreateCooldown(t *testing.T) {
 	pool := newRouterTestPool()
 	plat := platform.NewPlatform("plat-retry-only", "Plat-Retry-Only", nil, nil)

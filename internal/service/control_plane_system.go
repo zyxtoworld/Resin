@@ -570,7 +570,7 @@ func (s *ControlPlaneService) PatchRuntimeConfigContext(ctx context.Context, pat
 	}
 
 	var published *config.RuntimeConfig
-	err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
+	err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
 		if err := writeCtx.Err(); err != nil {
 			return err
 		}
@@ -599,7 +599,7 @@ func (s *ControlPlaneService) PatchRuntimeConfigContext(ctx context.Context, pat
 
 		// 5. Persist.
 		newVersion := s.configVersion + 1
-		if err := s.Engine.SaveSystemConfigContext(writeCtx, newCfg, newVersion, time.Now().UnixNano()); err != nil {
+		if err := s.Engine.SaveSystemConfigContextAndCommit(writeCtx, newCfg, newVersion, time.Now().UnixNano()); err != nil {
 			return internal("persist config", err)
 		}
 		if hook := s.afterRuntimeConfigPersistHook; hook != nil {

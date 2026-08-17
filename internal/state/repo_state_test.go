@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,7 +14,34 @@ import (
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/model"
+	moderncsqlite "modernc.org/sqlite"
 )
+
+var cancelAfterMutation struct {
+	sync.Mutex
+	cancel context.CancelFunc
+}
+
+var registerCancelAfterMutation sync.Once
+
+func registerCancelAfterMutationFunction() {
+	registerCancelAfterMutation.Do(func() {
+		moderncsqlite.MustRegisterDeterministicScalarFunction(
+			"resin_test_cancel_after_mutation",
+			0,
+			func(_ *moderncsqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+				cancelAfterMutation.Lock()
+				cancel := cancelAfterMutation.cancel
+				cancelAfterMutation.cancel = nil
+				cancelAfterMutation.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+				return int64(1), nil
+			},
+		)
+	})
+}
 
 func TestStateRepoCloseWriteAdmissionCancelsInFlightMutation(t *testing.T) {
 	repo := newTestStateRepo(t)
@@ -805,6 +833,124 @@ func TestStateRepo_SystemConfig_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateRepo_SaveSystemConfigContextAndCommitSurvivesCancellationAfterMutation(t *testing.T) {
+	registerCancelAfterMutationFunction()
+	repo := newTestStateRepo(t)
+
+	initial := config.NewDefaultRuntimeConfig()
+	if err := repo.SaveSystemConfig(initial, 1, time.Now().UnixNano()); err != nil {
+		t.Fatalf("seed system config: %v", err)
+	}
+	if _, err := repo.db.Exec(`
+		CREATE TRIGGER cancel_after_system_config_update
+		AFTER UPDATE ON system_config
+		BEGIN
+			SELECT resin_test_cancel_after_mutation();
+		END;`); err != nil {
+		t.Fatalf("create cancellation trigger: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelAfterMutation.Lock()
+	cancelAfterMutation.cancel = cancel
+	cancelAfterMutation.Unlock()
+
+	updated := config.NewDefaultRuntimeConfig()
+	updated.RequestLogEnabled = true
+	if err := repo.SaveSystemConfigContextAndCommit(ctx, updated, 2, time.Now().UnixNano()); err != nil {
+		t.Fatalf("SaveSystemConfigContextAndCommit: %v", err)
+	}
+
+	got, version, err := repo.GetSystemConfig()
+	if err != nil {
+		t.Fatalf("read committed system config: %v", err)
+	}
+	if version != 2 || got == nil || !got.RequestLogEnabled {
+		t.Fatalf("committed config = version %d, %+v; want version 2 with request logging enabled", version, got)
+	}
+}
+
+func TestStateRepo_SubscriptionContextAndCommitSurvivesCancellationAfterMutation(t *testing.T) {
+	registerCancelAfterMutationFunction()
+	repo := newTestStateRepo(t)
+	base := model.Subscription{
+		ID:                        "sub-commit",
+		Name:                      "before",
+		SourceType:                "local",
+		Content:                   "{}",
+		UpdateIntervalNs:          int64(30 * time.Second),
+		EphemeralNodeEvictDelayNs: int64(time.Hour),
+		CreatedAtNs:               1,
+		UpdatedAtNs:               1,
+	}
+
+	installCancel := func(trigger string) {
+		t.Helper()
+		if _, err := repo.db.Exec(trigger); err != nil {
+			t.Fatalf("install subscription cancellation trigger: %v", err)
+		}
+	}
+	setCancel := func(cancel context.CancelFunc) {
+		cancelAfterMutation.Lock()
+		cancelAfterMutation.cancel = cancel
+		cancelAfterMutation.Unlock()
+	}
+
+	installCancel(`
+		CREATE TRIGGER cancel_after_subscription_insert
+		AFTER INSERT ON subscriptions
+		BEGIN
+			SELECT resin_test_cancel_after_mutation();
+		END;`)
+	ctx, cancel := context.WithCancel(context.Background())
+	setCancel(cancel)
+	if err := repo.UpsertSubscriptionContextAndCommit(ctx, base); err != nil {
+		cancel()
+		t.Fatalf("insert subscription: %v", err)
+	}
+	cancel()
+
+	updated := base
+	updated.Name = "after-update"
+	updated.UpdatedAtNs = 2
+	installCancel(`
+		CREATE TRIGGER cancel_after_subscription_update
+		AFTER UPDATE ON subscriptions
+		BEGIN
+			SELECT resin_test_cancel_after_mutation();
+		END;`)
+	ctx, cancel = context.WithCancel(context.Background())
+	setCancel(cancel)
+	if err := repo.UpsertSubscriptionContextAndCommit(ctx, updated); err != nil {
+		cancel()
+		t.Fatalf("update subscription: %v", err)
+	}
+	cancel()
+
+	installCancel(`
+		CREATE TRIGGER cancel_after_subscription_delete
+		AFTER DELETE ON subscriptions
+		BEGIN
+			SELECT resin_test_cancel_after_mutation();
+		END;`)
+	ctx, cancel = context.WithCancel(context.Background())
+	setCancel(cancel)
+	if err := repo.DeleteSubscriptionContextAndCommit(ctx, base.ID); err != nil {
+		cancel()
+		t.Fatalf("delete subscription: %v", err)
+	}
+	cancel()
+
+	rows, err := repo.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("list subscriptions after delete: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("subscription remained after committed delete: %+v", rows)
+	}
+}
+
 // --- platforms ---
 
 func TestStateRepo_Platforms_CRUD(t *testing.T) {
@@ -895,7 +1041,7 @@ func TestStateRepo_PlatformCommitContextSurvivesRequestCancellationAfterBegin(t 
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var enteredOnce sync.Once
-	repo.afterPlatformWriteBeginHook = func() {
+	repo.afterWriteBeginHook = func() {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
 	}
@@ -987,7 +1133,7 @@ func TestStateRepo_PlatformCommitContextSurvivesRequestCancellationForUpdateAndD
 			entered := make(chan struct{})
 			release := make(chan struct{})
 			var enteredOnce sync.Once
-			repo.afterPlatformWriteBeginHook = func() {
+			repo.afterWriteBeginHook = func() {
 				enteredOnce.Do(func() { close(entered) })
 				<-release
 			}

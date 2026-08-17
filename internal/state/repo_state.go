@@ -36,10 +36,9 @@ type StateRepo struct {
 	// the serialized repository write owner is acquired. Production leaves it
 	// nil.
 	beforeWriteMutexHook func()
-	// afterPlatformWriteBeginHook is package-private coordination after a
-	// platform write has acquired SQLite's IMMEDIATE transaction. Production
-	// leaves it nil.
-	afterPlatformWriteBeginHook func()
+	// afterWriteBeginHook is package-private coordination after a write has
+	// acquired SQLite's IMMEDIATE transaction. Production leaves it nil.
+	afterWriteBeginHook func()
 }
 
 // newStateRepo creates a StateRepo for the given state.db connection.
@@ -162,13 +161,12 @@ func (r *StateRepo) lockWriteContext(ctx context.Context) (func(), error) {
 	}, nil
 }
 
-// withPlatformCommitTx separates SQLite write-owner admission from the
-// irreversible platform transaction. parent is honored while the repository
-// mutex and BEGIN IMMEDIATE wait for the SQLite writer slot. Once BEGIN
-// IMMEDIATE succeeds, fn and COMMIT use the shutdown-owned commit context so
-// a client disconnect cannot leave the database row committed without the
-// matching runtime publication.
-func (r *StateRepo) withPlatformCommitTx(
+// withCommitTx separates SQLite write-owner admission from the irreversible
+// transaction. parent is honored while the repository mutex and BEGIN
+// IMMEDIATE wait for the SQLite writer slot. Once BEGIN IMMEDIATE succeeds, fn
+// and COMMIT use the shutdown-owned commit context so a client disconnect
+// cannot leave a database row committed without the matching runtime publish.
+func (r *StateRepo) withCommitTx(
 	parent context.Context,
 	fn func(context.Context, *sql.Conn) error,
 ) error {
@@ -216,7 +214,7 @@ func (r *StateRepo) withPlatformCommitTx(
 		if _, err := conn.ExecContext(writeCtx, "BEGIN IMMEDIATE"); err != nil {
 			return err
 		}
-		if hook := r.afterPlatformWriteBeginHook; hook != nil {
+		if hook := r.afterWriteBeginHook; hook != nil {
 			hook()
 		}
 
@@ -361,14 +359,35 @@ func (r *StateRepo) SaveSystemConfigContext(ctx context.Context, cfg *config.Run
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(writeCtx, `
+		_, err = r.db.ExecContext(writeCtx, systemConfigUpsertSQL,
+			string(data), version, updatedAtNs)
+		return err
+	})
+}
+
+const systemConfigUpsertSQL = `
 			INSERT INTO system_config (id, config_json, version, updated_at_ns)
 			VALUES (1, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				config_json   = excluded.config_json,
 				version       = excluded.version,
 				updated_at_ns = excluded.updated_at_ns
-		`, string(data), version, updatedAtNs)
+`
+
+// SaveSystemConfigContextAndCommit persists the runtime config after a
+// cancelable SQLite writer admission, then executes the statement and COMMIT
+// with the shutdown-owned context. Once the transaction begins, a client
+// disconnect cannot make the caller observe a failed write while the row was
+// already committed.
+func (r *StateRepo) SaveSystemConfigContextAndCommit(ctx context.Context, cfg *config.RuntimeConfig, version int, updatedAtNs int64) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal system_config: %w", err)
+	}
+
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(commitCtx, systemConfigUpsertSQL,
+			string(data), version, updatedAtNs)
 		return err
 	})
 }
@@ -504,7 +523,7 @@ func (r *StateRepo) UpsertPlatformContextAndCommit(ctx context.Context, p model.
 	if err != nil {
 		return err
 	}
-	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(commitCtx, platformUpsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
 		if err != nil {
 			if isSQLiteUniqueConstraint(err) {
@@ -555,7 +574,7 @@ func (r *StateRepo) InsertPlatformContextAndCommit(ctx context.Context, p model.
 	if err != nil {
 		return err
 	}
-	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(commitCtx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
 		if err != nil {
 			if isSQLitePlatformConflict(err) {
@@ -625,7 +644,7 @@ func (r *StateRepo) DeletePlatformContext(ctx context.Context, id string) error 
 // DeletePlatformContextAndCommit deletes a platform after a cancelable
 // SQLite writer admission, then commits with the shutdown-owned context.
 func (r *StateRepo) DeletePlatformContextAndCommit(ctx context.Context, id string) error {
-	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
 		result, err := conn.ExecContext(commitCtx, "DELETE FROM platforms WHERE id = ?", id)
 		if err != nil {
 			return err
@@ -749,6 +768,37 @@ func (r *StateRepo) ListPlatformsContext(ctx context.Context) ([]model.Platform,
 
 // --- subscriptions ---
 
+const subscriptionUpsertSQL = `
+		INSERT INTO subscriptions (id, name, source_type, url, content, update_interval_ns, enabled,
+		                           ephemeral, incremental_alive_nodes, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name               = excluded.name,
+			source_type        = excluded.source_type,
+			url                = excluded.url,
+			content            = excluded.content,
+			update_interval_ns = excluded.update_interval_ns,
+			enabled            = excluded.enabled,
+			ephemeral          = excluded.ephemeral,
+			incremental_alive_nodes = excluded.incremental_alive_nodes,
+			ephemeral_node_evict_delay_ns = excluded.ephemeral_node_evict_delay_ns,
+			updated_at_ns      = excluded.updated_at_ns
+`
+
+func normalizeSubscriptionPersistence(s model.Subscription) (model.Subscription, error) {
+	const minInterval = int64(30 * time.Second)
+	if s.UpdateIntervalNs < minInterval {
+		return model.Subscription{}, fmt.Errorf("update_interval_ns: must be >= %d (30s), got %d", minInterval, s.UpdateIntervalNs)
+	}
+	if s.SourceType == "" {
+		s.SourceType = "remote"
+	}
+	if s.SourceType != "remote" && s.SourceType != "local" {
+		return model.Subscription{}, fmt.Errorf("source_type: must be remote or local, got %q", s.SourceType)
+	}
+	return s, nil
+}
+
 // UpsertSubscription inserts or updates a subscription by ID.
 // On update, created_at_ns is preserved (not overwritten).
 func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
@@ -758,16 +808,9 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 // UpsertSubscriptionContext inserts or updates a subscription while honoring
 // the caller's cancellation during the write owner and SQLite operation.
 func (r *StateRepo) UpsertSubscriptionContext(ctx context.Context, s model.Subscription) error {
-	// Validate minimum update interval (30 seconds).
-	const minInterval = int64(30 * time.Second)
-	if s.UpdateIntervalNs < minInterval {
-		return fmt.Errorf("update_interval_ns: must be >= %d (30s), got %d", minInterval, s.UpdateIntervalNs)
-	}
-	if s.SourceType == "" {
-		s.SourceType = "remote"
-	}
-	if s.SourceType != "remote" && s.SourceType != "local" {
-		return fmt.Errorf("source_type: must be remote or local, got %q", s.SourceType)
+	var err error
+	if s, err = normalizeSubscriptionPersistence(s); err != nil {
+		return err
 	}
 
 	return r.withWriteContext(ctx, func(writeCtx context.Context) error {
@@ -780,22 +823,25 @@ func (r *StateRepo) UpsertSubscriptionContext(ctx context.Context, s model.Subsc
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(writeCtx, `
-			INSERT INTO subscriptions (id, name, source_type, url, content, update_interval_ns, enabled,
-			                           ephemeral, incremental_alive_nodes, ephemeral_node_evict_delay_ns, created_at_ns, updated_at_ns)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				name               = excluded.name,
-				source_type        = excluded.source_type,
-				url                = excluded.url,
-				content            = excluded.content,
-				update_interval_ns = excluded.update_interval_ns,
-				enabled            = excluded.enabled,
-				ephemeral          = excluded.ephemeral,
-				incremental_alive_nodes = excluded.incremental_alive_nodes,
-				ephemeral_node_evict_delay_ns = excluded.ephemeral_node_evict_delay_ns,
-				updated_at_ns      = excluded.updated_at_ns
-		`, s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
+		_, err = r.db.ExecContext(writeCtx, subscriptionUpsertSQL,
+			s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
+			s.Ephemeral, s.IncrementalAliveNodes, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
+		return err
+	})
+}
+
+// UpsertSubscriptionContextAndCommit persists a subscription after a
+// cancelable SQLite writer admission, then completes SQL and COMMIT with the
+// shutdown-owned context. Callers can safely publish the matching runtime
+// generation after this method returns.
+func (r *StateRepo) UpsertSubscriptionContextAndCommit(ctx context.Context, s model.Subscription) error {
+	var err error
+	if s, err = normalizeSubscriptionPersistence(s); err != nil {
+		return err
+	}
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(commitCtx, subscriptionUpsertSQL,
+			s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
 			s.Ephemeral, s.IncrementalAliveNodes, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
 		return err
 	})
@@ -820,6 +866,23 @@ func (r *StateRepo) DeleteSubscriptionContext(ctx context.Context, id string) er
 		defer unlock()
 
 		result, err := r.db.ExecContext(writeCtx, "DELETE FROM subscriptions WHERE id = ?", id)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// DeleteSubscriptionContextAndCommit deletes a subscription after a
+// cancelable SQLite writer admission, then completes the delete and COMMIT
+// with the shutdown-owned context.
+func (r *StateRepo) DeleteSubscriptionContextAndCommit(ctx context.Context, id string) error {
+	return r.withCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		result, err := conn.ExecContext(commitCtx, "DELETE FROM subscriptions WHERE id = ?", id)
 		if err != nil {
 			return err
 		}

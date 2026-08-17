@@ -828,6 +828,65 @@ func TestCreateSubscription_HoldsStateWriteAdmissionThroughRuntimePublish(t *tes
 	}
 }
 
+func TestSubscriptionMutationsPublishAfterRequestCancellationAtCommitBoundary(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		f := newSubscriptionPatchFixture(t, false)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.cp.afterSubscriptionPersistHook = cancel
+
+		name := "cancel-after-create-commit"
+		content := `{"outbounds":[]}`
+		response, err := f.cp.CreateSubscriptionContext(ctx, CreateSubscriptionRequest{
+			Name:       &name,
+			SourceType: func() *string { v := subscription.SourceTypeLocal; return &v }(),
+			Content:    &content,
+		})
+		if err != nil {
+			t.Fatalf("CreateSubscriptionContext: %v", err)
+		}
+		if response == nil || f.cp.SubMgr.Lookup(response.ID) == nil {
+			t.Fatalf("created subscription was not published: response=%+v", response)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		f := newSubscriptionPatchFixture(t, false)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.cp.afterSubscriptionPersistHook = cancel
+
+		response, err := f.cp.UpdateSubscriptionContext(ctx, f.sub.ID, []byte(`{"name":"cancel-after-update-commit"}`))
+		if err != nil {
+			t.Fatalf("UpdateSubscriptionContext: %v", err)
+		}
+		if response == nil || f.sub.Name() != "cancel-after-update-commit" {
+			t.Fatalf("updated subscription was not published: response=%+v name=%q", response, f.sub.Name())
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		f := newSubscriptionPatchFixture(t, false)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.cp.afterSubscriptionPersistHook = cancel
+
+		if err := f.cp.DeleteSubscriptionContext(ctx, f.sub.ID); err != nil {
+			t.Fatalf("DeleteSubscriptionContext: %v", err)
+		}
+		if f.cp.SubMgr.Lookup(f.sub.ID) != nil {
+			t.Fatal("deleted subscription remained published in runtime")
+		}
+		rows, err := f.engine.ListSubscriptions()
+		if err != nil {
+			t.Fatalf("ListSubscriptions: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("deleted subscription remained in state: %+v", rows)
+		}
+	})
+}
+
 func TestUpdateSubscription_AsyncRefreshIsJoinedBySchedulerStop(t *testing.T) {
 	f := newSubscriptionPatchFixture(t, true)
 	fetchStarted := make(chan struct{})

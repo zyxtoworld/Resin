@@ -229,7 +229,9 @@ func (s *ControlPlaneService) CreateSubscription(req CreateSubscriptionRequest) 
 }
 
 // CreateSubscriptionContext creates a subscription while honoring the
-// caller's cancellation during persistence admission.
+// caller's cancellation before the irreversible persistence transaction.
+// After that boundary, the shutdown-owned commit context carries the full
+// persistence-to-runtime publication through a client disconnect.
 func (s *ControlPlaneService) CreateSubscriptionContext(ctx context.Context, req CreateSubscriptionRequest) (*SubscriptionResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -333,8 +335,8 @@ func (s *ControlPlaneService) CreateSubscriptionContext(ctx context.Context, req
 		return nil, internal("subscription runtime unavailable", errors.New("subscription manager is nil"))
 	}
 	var sub *subscription.Subscription
-	if err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
-		if err := s.Engine.UpsertSubscriptionContext(writeCtx, ms); err != nil {
+	if err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
+		if err := s.Engine.UpsertSubscriptionContextAndCommit(writeCtx, ms); err != nil {
 			return internal("persist subscription", err)
 		}
 		if hook := s.afterSubscriptionPersistHook; hook != nil {
@@ -375,7 +377,9 @@ func (s *ControlPlaneService) UpdateSubscription(id string, patchJSON json.RawMe
 }
 
 // UpdateSubscriptionContext applies a subscription patch while honoring the
-// caller's cancellation during persistence admission and SQLite writes.
+// caller's cancellation before the irreversible persistence transaction.
+// After that boundary, the shutdown-owned commit context carries the full
+// persistence-to-runtime publication through a client disconnect.
 func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id string, patchJSON json.RawMessage) (*SubscriptionResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -413,7 +417,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 	)
 	s.runSubscriptionMutationHook(subscriptionMutationBeforeLock)
 	mutate := func() error {
-		return s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
+		return s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
 			sub.WithOpLock(func() {
 				// Delete can win after the initial lookup but before this operation gets
 				// the lock. Do not resurrect a deleted row or runtime object.
@@ -536,7 +540,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 					CreatedAtNs:               sub.CreatedAtNs,
 					UpdatedAtNs:               now,
 				}
-				if err := s.Engine.UpsertSubscriptionContext(writeCtx, ms); err != nil {
+				if err := s.Engine.UpsertSubscriptionContextAndCommit(writeCtx, ms); err != nil {
 					updateErr = internal("persist subscription", err)
 					return
 				}
@@ -609,7 +613,9 @@ func (s *ControlPlaneService) DeleteSubscription(id string) error {
 }
 
 // DeleteSubscriptionContext deletes a subscription while honoring the
-// caller's cancellation during persistence admission and SQLite writes.
+// caller's cancellation before the irreversible persistence transaction.
+// After that boundary, the shutdown-owned commit context carries the full
+// persistence-to-runtime publication through a client disconnect.
 func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -641,7 +647,7 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 	// if DB delete fails, do not mutate runtime subscription/node state. The
 	// state admission also spans the runtime callbacks, so shutdown cannot
 	// close dirty admission between the DB delete and node cleanup.
-	if err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
+	if err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
 		sub.WithOpLock(func() {
 			// Re-check under lock in case another goroutine removed it between
 			// the initial Lookup and lock acquisition.
@@ -656,13 +662,16 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 				return true
 			})
 
-			if err := s.Engine.DeleteSubscriptionContext(writeCtx, id); err != nil {
+			if err := s.Engine.DeleteSubscriptionContextAndCommit(writeCtx, id); err != nil {
 				if errors.Is(err, state.ErrNotFound) {
 					deleteErr = notFound("subscription not found")
 				} else {
 					deleteErr = internal("delete subscription", err)
 				}
 				return
+			}
+			if hook := s.afterSubscriptionPersistHook; hook != nil {
+				hook()
 			}
 
 			// Persist succeeded; now apply in-memory cleanup as one runtime
