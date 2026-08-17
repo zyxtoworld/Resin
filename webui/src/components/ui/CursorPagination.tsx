@@ -5,6 +5,7 @@ import { useI18n } from "../../i18n";
 type CursorPaginationProps = {
     pageIndex: number;
     hasMore: boolean;
+    totalItems?: number;
     pageSize: number;
     pageSizeOptions?: readonly number[];
     disabled?: boolean;
@@ -16,6 +17,7 @@ type CursorPaginationProps = {
 export function CursorPagination({
     pageIndex,
     hasMore,
+    totalItems,
     pageSize,
     pageSizeOptions = [20, 50, 100, 200],
     disabled = false,
@@ -31,6 +33,7 @@ export function CursorPagination({
                 {hasMore
                     ? t("第 {{page}} 页 · 有更多数据", { page: pageIndex + 1 })
                     : t("第 {{page}} 页 · 无更多数据", { page: pageIndex + 1 })}
+                {totalItems !== undefined ? t(" · 共 {{total}} 条", { total: totalItems }) : null}
             </p>
             <div className="nodes-pagination-controls">
                 <label className="nodes-page-size">

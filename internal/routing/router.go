@@ -1426,6 +1426,53 @@ func (r *Router) SnapshotIPLoadForPlatform(platformID string) (map[netip.Addr]in
 	return snapshot, true
 }
 
+// SnapshotResponseCooldownsForPlatform atomically checks platform lifetime and
+// returns its active, platform-scoped response cooldowns. A missing routing
+// state is a valid empty snapshot; the boolean is false only when the platform
+// is not registered or Router admission has stopped.
+func (r *Router) SnapshotResponseCooldownsForPlatform(platformID string, now time.Time) ([]ResponseCooldownSnapshot, bool) {
+	r.lifecycleMu.RLock()
+	if r.stopped {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	if !r.platformExistsLocked(platformID) {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil || state.ResponseCooldowns == nil {
+		r.lifecycleMu.RUnlock()
+		return []ResponseCooldownSnapshot{}, true
+	}
+	snapshot := state.ResponseCooldowns.Snapshot(now)
+	plat, ok := r.pool.GetPlatform(platformID)
+	if !ok || plat == nil {
+		r.lifecycleMu.RUnlock()
+		return nil, false
+	}
+	filtered := snapshot[:0]
+	for _, item := range snapshot {
+		if item.Scope != platform.ResponseRuleScopeNode {
+			filtered = append(filtered, item)
+			continue
+		}
+		current, currentOK := r.pool.GetEntry(item.NodeHash)
+		if !currentOK || current == nil {
+			continue
+		}
+		if item.Entry != nil && current != item.Entry {
+			continue
+		}
+		if !plat.ContainsViewEntry(item.NodeHash, current) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	r.lifecycleMu.RUnlock()
+	return filtered, true
+}
+
 // InheritLeaseForPlatform validates the parent and creates/replaces the child
 // inside one lifecycle read section. The platform check and the lease mutation
 // therefore cannot be split by platform removal.

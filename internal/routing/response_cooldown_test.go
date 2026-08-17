@@ -64,6 +64,74 @@ func TestResponseCooldowns_EgressCooldownSurvivesEntryRebuild(t *testing.T) {
 
 }
 
+func TestRouter_ResponseCooldownSnapshotOmitsRetiredNodeGeneration(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-cooldown-snapshot", "Cooldown Snapshot", nil, nil)
+	pool.addPlatform(plat)
+
+	raw := []byte(`{"type":"ss","server":"198.51.100.70","port":443}`)
+	hash, oldEntry := newRoutableEntry(t, string(raw), "198.51.100.70")
+	pool.addEntry(hash, oldEntry)
+	pool.rebuildPlatformView(plat)
+	router := newTestRouter(pool, nil)
+	now := time.Unix(5000, 0)
+	router.responseCooldowns(plat.ID).markForEntry(
+		platform.ResponseRuleScopeNode,
+		hash,
+		oldEntry,
+		oldEntry.GetEgressIP(),
+		now.Add(time.Minute),
+		now,
+	)
+
+	snapshot, ok := router.SnapshotResponseCooldownsForPlatform(plat.ID, now)
+	if !ok || len(snapshot) != 1 || snapshot[0].Entry != oldEntry {
+		t.Fatalf("active exact node cooldown snapshot = (%#v, %v), want old generation", snapshot, ok)
+	}
+
+	_, newEntry := newRoutableEntry(t, string(raw), "198.51.100.70")
+	if newEntry == oldEntry {
+		t.Fatal("test fixture reused the old node entry")
+	}
+	pool.addEntry(hash, newEntry)
+	pool.rebuildPlatformView(plat)
+
+	snapshot, ok = router.SnapshotResponseCooldownsForPlatform(plat.ID, now)
+	if !ok {
+		t.Fatal("platform disappeared while replacing node generation")
+	}
+	if len(snapshot) != 0 {
+		t.Fatalf("retired node cooldown was exposed for new generation: %#v", snapshot)
+	}
+
+	router.responseCooldowns(plat.ID).markForEntry(
+		platform.ResponseRuleScopeEgressIP,
+		hash,
+		newEntry,
+		newEntry.GetEgressIP(),
+		now.Add(time.Minute),
+		now,
+	)
+	snapshot, ok = router.SnapshotResponseCooldownsForPlatform(plat.ID, now)
+	if !ok || len(snapshot) != 1 || snapshot[0].Scope != platform.ResponseRuleScopeEgressIP {
+		t.Fatalf("stable egress cooldown snapshot = (%#v, %v), want one egress item", snapshot, ok)
+	}
+}
+
+func TestResponseCooldowns_SnapshotPrunesExpiredEntries(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	hash := node.HashFromRawOptions([]byte(`{"id":"snapshot-expiry"}`))
+	now := time.Unix(6000, 0)
+	cooldowns.markAt(platform.ResponseRuleScopeEgressIP, hash, netip.MustParseAddr("198.51.100.71"), now.Add(time.Minute), now)
+
+	if got := cooldowns.Snapshot(now); len(got) != 1 {
+		t.Fatalf("active snapshot length = %d, want 1", len(got))
+	}
+	if got := cooldowns.Snapshot(now.Add(time.Minute)); len(got) != 0 {
+		t.Fatalf("expired snapshot length = %d, want 0", len(got))
+	}
+}
+
 func TestResponseCooldowns_IsCoolingRemovesExpiredEntries(t *testing.T) {
 	cooldowns := NewResponseCooldowns()
 	hash := node.HashFromRawOptions([]byte(`{"id":"expired"}`))

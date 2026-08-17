@@ -191,3 +191,44 @@ func HandleIPLoad(cp *service.ControlPlaneService) http.HandlerFunc {
 		WritePage(w, http.StatusOK, entries, pg)
 	}
 }
+
+// HandlePlatformRouteState returns a bounded route-state observation taken
+// during runtime read admission; Router lease and cooldown data retain their
+// own lifecycle-lock semantics rather than forming one cross-store snapshot.
+func HandlePlatformRouteState(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		platformID, ok := requireUUIDPathParam(w, r, "id", "platform_id")
+		if !ok {
+			return
+		}
+		fuzzy, ok := parseStrictBoolQuery(w, r, "fuzzy")
+		if !ok {
+			return
+		}
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"account", "expiry", "last_accessed"}, "expiry", "asc")
+		if !ok {
+			return
+		}
+		if r.URL.Query().Get("offset") != "" {
+			writeInvalidArgument(w, "offset: not supported for route-state leases; use cursor")
+			return
+		}
+		limit, ok := parseRequestLogLimitQuery(w, r)
+		if !ok {
+			return
+		}
+		state, err := cp.GetPlatformRouteStateContext(r.Context(), platformID, service.PlatformRouteStateQuery{
+			LeaseAccount: r.URL.Query().Get("account"),
+			LeaseFuzzy:   fuzzy != nil && *fuzzy,
+			LeaseLimit:   limit,
+			LeaseCursor:  r.URL.Query().Get("cursor"),
+			LeaseSortBy:  sorting.SortBy,
+			LeaseOrder:   sorting.SortOrder,
+		})
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		WriteJSON(w, http.StatusOK, state)
+	}
+}

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { allocationPolicies, emptyAccountBehaviors, missActions } from "./constants";
 import { parseHeaderLines, parseLinesToList } from "./formParsers";
+import { parseResponseRulesText } from "./responseRulesModel";
 import type { Platform, PlatformCreateInput, PlatformResponseRule, PlatformUpdateInput } from "./types";
 
 const platformNameForbiddenChars = ".:|/\\@?#%~";
@@ -51,13 +52,9 @@ export const platformFormSchema = z.object({
     });
   }
 
-  try {
-    const parsed = JSON.parse(value.response_rules_text || "[]") as unknown;
-    if (!Array.isArray(parsed)) {
-      ctx.addIssue({ code: "custom", path: ["response_rules_text"], message: "响应规则必须是 JSON 数组" });
-    }
-  } catch {
-    ctx.addIssue({ code: "custom", path: ["response_rules_text"], message: "响应规则 JSON 格式无效" });
+  const parsed = parseResponseRulesText(value.response_rules_text);
+  if (!parsed.rules) {
+    ctx.addIssue({ code: "custom", path: ["response_rules_text"], message: parsed.error ?? "响应规则结构无效" });
   }
 });
 

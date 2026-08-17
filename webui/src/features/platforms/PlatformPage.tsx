@@ -33,6 +33,8 @@ import {
   toPlatformCreateInput,
   type PlatformFormValues,
 } from "./formModel";
+import { parseResponseRulesEditorText } from "./responseRulesModel";
+import { ResponseRulesEditor } from "./ResponseRulesEditor";
 import type { Platform } from "./types";
 
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
@@ -80,6 +82,8 @@ export function PlatformPage() {
     defaultValues: defaultPlatformFormValues,
   });
   const createEmptyAccountBehavior = createForm.watch("reverse_proxy_empty_account_behavior");
+  const createResponseRulesText = createForm.watch("response_rules_text");
+  const createResponseRules = parseResponseRulesEditorText(createResponseRulesText);
 
   const createMutation = useMutation({
     mutationFn: createPlatform,
@@ -288,22 +292,18 @@ export function PlatformPage() {
               </div>
 
               <div className="field-group" style={{ gridColumn: "1 / -1" }}>
-                <label className="field-label" htmlFor="create-response-rules">
-                  {t("上游响应规则（可选，JSON）")}
-                </label>
-                <Textarea
-                  id="create-response-rules"
-                  rows={8}
-                  invalid={Boolean(createForm.formState.errors.response_rules_text)}
-                  placeholder={t('[{"id":"quota-window","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown_then_retry_next","cooldown_scope":"egress_ip","fallback":"next_utc_midnight"}}]')}
-                  {...createForm.register("response_rules_text")}
+                <ResponseRulesEditor
+                  rules={createResponseRules}
+                  onChange={(rules) => createForm.setValue("response_rules_text", JSON.stringify(rules, null, 2), { shouldDirty: true, shouldValidate: true })}
+                  onValidationChange={(message) => {
+                    if (message) {
+                      createForm.setError("response_rules_text", { type: "manual", message });
+                    } else {
+                      createForm.clearErrors("response_rules_text");
+                    }
+                  }}
+                  error={createForm.formState.errors.response_rules_text?.message ? t(createForm.formState.errors.response_rules_text.message) : undefined}
                 />
-                {createForm.formState.errors.response_rules_text?.message ? (
-                  <p className="field-error">{t(createForm.formState.errors.response_rules_text.message)}</p>
-                ) : null}
-                <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-                  {t("规则按列表顺序 first-match-wins；支持状态码、header 和有界响应体匹配。动作可选 passthrough、retry_next、cooldown、cooldown_then_retry_next；冷却期限可按 Retry-After、指定 header、JSON Pointer 或响应体正则捕获组读取，格式需明确且有界；无可信期限时可使用 next_utc_midnight、fixed_duration 或 none。")}
-                </p>
               </div>
 
               <div className="field-group">

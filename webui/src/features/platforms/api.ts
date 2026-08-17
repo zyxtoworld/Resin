@@ -6,6 +6,7 @@ import type {
   PlatformResponseRule,
   PlatformCreateInput,
   PlatformLease,
+  PlatformRouteState,
   PlatformUpdateInput,
 } from "./types";
 
@@ -170,4 +171,25 @@ export async function clearAllPlatformLeases(id: string): Promise<void> {
   await apiRequest<void>(`${basePath}/${id}/leases`, {
     method: "DELETE",
   });
+}
+
+export type PlatformRouteStateInput = Omit<ListPlatformLeasesInput, "offset"> & {
+  cursor?: string;
+};
+
+export async function getPlatformRouteState(id: string, input: PlatformRouteStateInput = {}): Promise<PlatformRouteState> {
+  const query = new URLSearchParams({
+    limit: String(input.limit ?? 25),
+    sort_by: input.sort_by ?? "expiry",
+    sort_order: input.sort_order ?? "asc",
+  });
+  const account = input.account?.trim();
+  if (account) {
+    query.set("account", account);
+    query.set("fuzzy", String(input.fuzzy ?? true));
+  }
+  if (input.cursor) {
+    query.set("cursor", input.cursor);
+  }
+  return apiRequest<PlatformRouteState>(`${basePath}/${id}/route-state?${query.toString()}`);
 }

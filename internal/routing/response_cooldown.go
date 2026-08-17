@@ -3,6 +3,7 @@ package routing
 import (
 	"container/heap"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,6 +21,17 @@ type ResponseCooldowns struct {
 	byEgress     map[netip.Addr]time.Time
 	nodeExpiry   nodeCooldownExpiryHeap
 	egressExpiry egressCooldownExpiryHeap
+}
+
+// ResponseCooldownSnapshot is the read-only representation of one active
+// response cooldown. The owning Router supplies the platform boundary; this
+// type intentionally contains no persistence or mutation behavior.
+type ResponseCooldownSnapshot struct {
+	Scope    platform.ResponseRuleScope
+	NodeHash node.Hash
+	Entry    *node.NodeEntry
+	EgressIP netip.Addr
+	Until    time.Time
 }
 
 type nodeCooldownExpiry struct {
@@ -146,6 +158,52 @@ func (c *ResponseCooldowns) IsCooling(hash node.Hash, egressIP netip.Addr, now t
 // generation and therefore remain visible to every entry with the hash.
 func (c *ResponseCooldowns) IsCoolingForEntry(hash node.Hash, entry *node.NodeEntry, egressIP netip.Addr, now time.Time) bool {
 	return c.isCooling(hash, entry, egressIP, now, true)
+}
+
+// Snapshot returns active cooldowns and removes expired entries as part of the
+// same read. Callers should pass the timestamp of the surrounding runtime
+// snapshot so the returned remaining durations are generation-consistent.
+func (c *ResponseCooldowns) Snapshot(now time.Time) []ResponseCooldownSnapshot {
+	if c == nil {
+		return []ResponseCooldownSnapshot{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneExpiredLocked(now)
+
+	result := make([]ResponseCooldownSnapshot, 0, len(c.byNode)+len(c.byEgress))
+	for hash, until := range c.byNode {
+		if until.After(now) {
+			result = append(result, ResponseCooldownSnapshot{
+				Scope:    platform.ResponseRuleScopeNode,
+				NodeHash: hash,
+				Entry:    c.nodeEntry[hash],
+				Until:    until,
+			})
+		}
+	}
+	for ip, until := range c.byEgress {
+		if until.After(now) {
+			result = append(result, ResponseCooldownSnapshot{
+				Scope:    platform.ResponseRuleScopeEgressIP,
+				EgressIP: ip,
+				Until:    until,
+			})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Scope != result[j].Scope {
+			return result[i].Scope < result[j].Scope
+		}
+		if result[i].NodeHash != node.Zero || result[j].NodeHash != node.Zero {
+			return result[i].NodeHash.Hex() < result[j].NodeHash.Hex()
+		}
+		if result[i].EgressIP != result[j].EgressIP {
+			return result[i].EgressIP.String() < result[j].EgressIP.String()
+		}
+		return result[i].Until.Before(result[j].Until)
+	})
+	return result
 }
 
 func (c *ResponseCooldowns) isCooling(

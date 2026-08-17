@@ -96,6 +96,55 @@ export type PlatformLease = {
 export type PlatformLeaseSortBy = "account" | "expiry" | "last_accessed";
 export type SortOrder = "asc" | "desc";
 
+export type PlatformRouteNode = NodeSummary & {
+  status: "available" | "cooling" | "circuit_open" | "not_ready" | "disabled";
+  lease_count: number;
+};
+
+export type NodeSummary = {
+  node_hash: string;
+  created_at: string;
+  enabled: boolean;
+  display_tag?: string;
+  has_outbound: boolean;
+  last_error?: string;
+  circuit_open_since?: string | null;
+  failure_count: number;
+  egress_ip?: string;
+  region?: string;
+  last_egress_update?: string;
+  last_latency_probe_attempt?: string;
+  last_authority_latency_probe_attempt?: string;
+  reference_latency_ms?: number | null;
+  last_egress_update_attempt?: string;
+  tags: Array<{
+    subscription_id: string;
+    subscription_name: string;
+    tag: string;
+  }>;
+};
+
+export type PlatformCooldownSnapshot = {
+  scope: "egress_ip" | "route_entry";
+  node_hash?: string;
+  egress_ip?: string;
+  until: string;
+};
+
+export type PlatformRouteState = {
+  platform_id: string;
+  observed_at: string;
+  nodes: PlatformRouteNode[];
+  leases: {
+    items: PlatformLease[];
+    total: number;
+    limit: number;
+    has_more: boolean;
+    next_cursor?: string;
+  };
+  cooldowns: PlatformCooldownSnapshot[];
+};
+
 export type ListPlatformLeasesInput = {
   limit?: number;
   offset?: number;

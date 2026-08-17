@@ -727,7 +727,7 @@ export function RequestLogsPage() {
         },
       }),
     ],
-    [col, t]
+    [col, renderProxyTypeBadge, t]
   );
 
   return (
