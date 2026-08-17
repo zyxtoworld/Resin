@@ -174,14 +174,30 @@ func TestPickDefaultPlatformOutbound_DoesNotObserveInPlaceRebuildGap(t *testing.
 		t.Fatal("rebuild did not reach its filter evaluation")
 	}
 
-	pickDone := make(chan error, 1)
+	type pickResult struct {
+		hash  node.Hash
+		entry *node.NodeEntry
+		err   error
+	}
+	pickDone := make(chan pickResult, 1)
 	go func() {
-		_, _, err := pool.PickDefaultPlatformOutbound(context.Background())
-		pickDone <- err
+		hash, entry, err := pool.PickDefaultPlatformOutbound(context.Background())
+		pickDone <- pickResult{hash: hash, entry: entry, err: err}
 	}()
+	var earlyResult *pickResult
 	select {
-	case err := <-pickDone:
-		t.Fatalf("picker observed an in-place rebuild gap: %v", err)
+	case result := <-pickDone:
+		earlyResult = &result
+		if result.err != nil {
+			t.Fatalf("picker failed while rebuilding a complete old/new view: %v", result.err)
+		}
+		if result.hash != first && result.hash != second {
+			t.Fatalf("picker returned hash %s outside the published generations", result.hash.Hex())
+		}
+		current, ok := pool.GetEntry(result.hash)
+		if !ok || current != result.entry {
+			t.Fatal("picker returned an entry that is not the current exact generation")
+		}
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -191,13 +207,15 @@ func TestPickDefaultPlatformOutbound_DoesNotObserveInPlaceRebuildGap(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("rebuild did not complete")
 	}
-	select {
-	case err := <-pickDone:
-		if err != nil {
-			t.Fatalf("picker after rebuild: %v", err)
+	if earlyResult == nil {
+		select {
+		case result := <-pickDone:
+			if result.err != nil {
+				t.Fatalf("picker after rebuild: %v", result.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("picker did not finish after rebuild")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("picker did not finish after rebuild")
 	}
 }
 

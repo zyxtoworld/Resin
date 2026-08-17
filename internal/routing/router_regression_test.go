@@ -254,6 +254,155 @@ func TestRouteRequestKeepsPublishedViewDuringFullRebuild(t *testing.T) {
 	}
 }
 
+func TestRouteRequestDoesNotBlockOnUnpublishedFullRebuild(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("p-rebuild-availability", "RebuildAvailability", nil, nil)
+	pool.addPlatform(plat)
+	h, entry := newRoutableEntry(t, `{"type":"rebuild-availability"}`, "203.0.113.21")
+	pool.addEntry(h, entry)
+	pool.rebuildPlatformView(plat)
+	if got := plat.View().Size(); got != 1 {
+		t.Fatalf("setup view size = %d, want 1", got)
+	}
+
+	router := newTestRouter(pool, nil)
+	routeResolved := make(chan struct{})
+	router.afterPlatformResolveHook = func(*platform.Platform) {
+		close(routeResolved)
+	}
+
+	scanEntered := make(chan struct{})
+	releaseScan := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseScan) }) }
+	defer release()
+	rebuildDone := make(chan struct{})
+	go func() {
+		plat.FullRebuild(func(fn func(node.Hash, *node.NodeEntry) bool) {
+			close(scanEntered)
+			<-releaseScan
+			fn(h, entry)
+		}, func(_ string, _ node.Hash) (string, bool, []string, bool) {
+			return "", true, nil, true
+		}, func(_ netip.Addr) string { return "" })
+		close(rebuildDone)
+	}()
+
+	select {
+	case <-scanEntered:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not enter pool scan")
+	}
+
+	routeDone := make(chan error, 1)
+	go func() {
+		_, err := router.RouteRequest(plat.Name, "", "https://example.com")
+		routeDone <- err
+	}()
+	select {
+	case <-routeResolved:
+	case <-time.After(time.Second):
+		t.Fatal("route did not resolve the published platform")
+	}
+
+	select {
+	case err := <-routeDone:
+		if err != nil {
+			t.Fatalf("route failed while an unpublished rebuild was scanning: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		release()
+		<-rebuildDone
+		<-routeDone
+		t.Fatal("route blocked on the unpublished rebuild instead of using the old complete view")
+	}
+
+	release()
+	select {
+	case <-rebuildDone:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild did not finish after scan release")
+	}
+}
+
+func TestRouteRequestDoesNotBlockOnUnpublishedDirtyNotification(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("p-dirty-availability", "DirtyAvailability", nil, nil)
+	pool.addPlatform(plat)
+	h, entry := newRoutableEntry(t, `{"type":"dirty-availability"}`, "203.0.113.22")
+	pool.addEntry(h, entry)
+	pool.rebuildPlatformView(plat)
+	if got := plat.View().Size(); got != 1 {
+		t.Fatalf("setup view size = %d, want 1", got)
+	}
+	plat.RegionFilters = []string{"us"}
+
+	geoEntered := make(chan struct{})
+	allowGeo := make(chan struct{})
+	var geoOnce sync.Once
+	geoLookup := func(netip.Addr) string {
+		geoOnce.Do(func() { close(geoEntered) })
+		<-allowGeo
+		return "us"
+	}
+
+	notifyDone := make(chan struct{})
+	go func() {
+		plat.NotifyDirty(
+			h,
+			pool.GetEntry,
+			func(_ string, _ node.Hash) (string, bool, []string, bool) {
+				return "", true, nil, true
+			},
+			geoLookup,
+		)
+		close(notifyDone)
+	}()
+	select {
+	case <-geoEntered:
+	case <-time.After(time.Second):
+		close(allowGeo)
+		t.Fatal("dirty notification did not enter its filter evaluation")
+	}
+
+	router := newTestRouter(pool, nil)
+	routeResolved := make(chan struct{})
+	router.afterPlatformResolveHook = func(*platform.Platform) {
+		close(routeResolved)
+	}
+	routeDone := make(chan error, 1)
+	go func() {
+		_, err := router.RouteRequest(plat.Name, "", "https://example.com")
+		routeDone <- err
+	}()
+	select {
+	case <-routeResolved:
+	case <-time.After(time.Second):
+		close(allowGeo)
+		t.Fatal("route did not resolve the published platform")
+	}
+
+	select {
+	case err := <-routeDone:
+		if err != nil {
+			close(allowGeo)
+			t.Fatalf("route failed while an unpublished dirty notification was evaluating: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(allowGeo)
+		<-notifyDone
+		<-routeDone
+		t.Fatal("route blocked on the unpublished dirty notification instead of using the old complete view")
+	}
+
+	close(allowGeo)
+	select {
+	case <-notifyDone:
+	case <-time.After(time.Second):
+		t.Fatal("dirty notification did not finish after GeoIP release")
+	}
+}
+
 func TestRouteRequest_SameIPRotationPrefersTargetLatencySample(t *testing.T) {
 	pool := newRouterTestPool()
 	plat := platform.NewPlatform("plat-1", "Plat-1", nil, nil)

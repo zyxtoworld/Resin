@@ -205,8 +205,6 @@ func (p *Platform) FullRebuildContext(
 		return err
 	}
 	defer p.viewWriterMu.unlock()
-	p.viewMu.Lock()
-	defer p.viewMu.Unlock()
 
 	nextView := NewRoutableView()
 	nextEntries := make(map[node.Hash]*node.NodeEntry)
@@ -228,6 +226,11 @@ func (p *Platform) FullRebuildContext(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	p.viewMu.Lock()
+	defer p.viewMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p.viewEntries = nextEntries
 	p.view.Store(nextView)
 	return nil
@@ -245,6 +248,23 @@ func (p *Platform) NotifyDirty(
 		return
 	}
 	defer p.viewWriterMu.unlock()
+
+	entry, ok := getEntry(h)
+	if !ok {
+		p.viewMu.Lock()
+		defer p.viewMu.Unlock()
+		view := p.view.Load()
+		if view == nil {
+			view = NewRoutableView()
+			p.view.Store(view)
+		}
+		// Node was deleted from pool.
+		view.Remove(h)
+		delete(p.viewEntries, h)
+		return
+	}
+
+	routable := p.evaluateNode(entry, subLookup, geoLookup)
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
 	view := p.view.Load()
@@ -252,16 +272,7 @@ func (p *Platform) NotifyDirty(
 		view = NewRoutableView()
 		p.view.Store(view)
 	}
-
-	entry, ok := getEntry(h)
-	if !ok {
-		// Node was deleted from pool.
-		view.Remove(h)
-		delete(p.viewEntries, h)
-		return
-	}
-
-	if p.evaluateNode(entry, subLookup, geoLookup) {
+	if routable {
 		view.Add(h)
 		if p.viewEntries == nil {
 			p.viewEntries = make(map[node.Hash]*node.NodeEntry)
