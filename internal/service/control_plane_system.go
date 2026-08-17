@@ -448,6 +448,7 @@ type ruleMutationStage uint8
 
 const (
 	ruleMutationBeforeLock ruleMutationStage = iota
+	ruleMutationBeforeSnapshot
 	ruleMutationAfterSnapshot
 	ruleMutationAfterPersist
 )

@@ -447,6 +447,69 @@ func TestAccountHeaderRuleMutationContextCancellationWhileRuleMutexHeld(t *testi
 	}
 }
 
+func TestUpsertAccountHeaderRuleContextCancellationInterruptsSnapshotRead(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	engine, closer, err := state.PersistenceBootstrap(stateDir, filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	blocker, err := state.OpenDB(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("OpenDB blocker: %v", err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		_, _ = blocker.Exec("ROLLBACK")
+		_ = blocker.Close()
+	}
+	t.Cleanup(release)
+	if _, err := blocker.Exec("BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("BEGIN EXCLUSIVE: %v", err)
+	}
+
+	cp := &ControlPlaneService{
+		Engine:         engine,
+		MatcherRuntime: proxy.NewAccountMatcherRuntime(nil),
+	}
+	snapshotStarted := make(chan struct{})
+	cp.ruleMutationHook = func(stage ruleMutationStage) {
+		if stage == ruleMutationBeforeSnapshot {
+			close(snapshotStarted)
+		}
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cp.UpsertAccountHeaderRuleContext(requestCtx, "snapshot-cancel.example.com", []string{"X-Snapshot"})
+		done <- err
+	}()
+	select {
+	case <-snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("rule mutation did not acquire ruleMu before snapshot read")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("snapshot read cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("canceled rule mutation remained blocked in the snapshot read")
+	}
+}
+
 func TestAccountHeaderRuleMutationCommitsAfterRequestCancellationOnceRuleLocked(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")

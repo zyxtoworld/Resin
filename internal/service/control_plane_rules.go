@@ -141,8 +141,9 @@ func (s *ControlPlaneService) UpsertAccountHeaderRuleContext(ctx context.Context
 			return err
 		}
 		defer s.ruleMu.unlock()
+		s.runRuleMutationHook(ruleMutationBeforeSnapshot)
 
-		rules, err := s.Engine.ListAccountHeaderRules()
+		rules, err := s.Engine.ListAccountHeaderRulesContext(writeCtx)
 		if err != nil {
 			return internal("load rules", err)
 		}
@@ -208,8 +209,9 @@ func (s *ControlPlaneService) DeleteAccountHeaderRuleContext(ctx context.Context
 			return err
 		}
 		defer s.ruleMu.unlock()
+		s.runRuleMutationHook(ruleMutationBeforeSnapshot)
 
-		rules, err := s.Engine.ListAccountHeaderRules()
+		rules, err := s.Engine.ListAccountHeaderRulesContext(writeCtx)
 		if err != nil {
 			return internal("load rules", err)
 		}
