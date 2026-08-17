@@ -70,6 +70,9 @@ type GlobalNodePool struct {
 	// Package-private test seam called immediately before a captured platform
 	// receives a dirty notification. Production leaves it nil.
 	beforePlatformNotifyHook func(*platform.Platform)
+	// Package-private test seam called before a dirty notification waits for the
+	// platform publication owner. Production leaves this nil.
+	beforePlatformNotifyLockHook func()
 	// Package-private test seam called after a node DeleteOp has been published
 	// by nodes.Compute, but before RemoveNodeFromSub runs external cleanup.
 	// Production leaves it nil. The exact entry must already reject new
@@ -580,9 +583,30 @@ func (m *platformMutation) RegisterPlatform(plat *platform.Platform) error {
 			return ErrInvalidPlatform
 		}
 
+		p.platMu.RLock()
+		if _, exists := p.platformByID[plat.ID]; exists {
+			p.platMu.RUnlock()
+			return ErrPlatformAlreadyRegistered
+		}
+		if plat.Name != "" {
+			if _, exists := p.platformByName[plat.Name]; exists {
+				p.platMu.RUnlock()
+				return ErrPlatformNameConflict
+			}
+		}
+		p.platMu.RUnlock()
+
+		// Build the complete view before publishing the platform into either
+		// index. The platform mutation owner prevents another map writer from
+		// overtaking this candidate, while readers continue to see the existing
+		// platform indexes during the slow scan.
+		p.RebuildPlatform(plat)
+
 		p.platMu.Lock()
 		defer p.platMu.Unlock()
-
+		// Recheck after the candidate build. The owner normally makes this
+		// redundant, but keeping the publication boundary self-contained makes
+		// the invariant explicit and protects future callers.
 		if _, exists := p.platformByID[plat.ID]; exists {
 			return ErrPlatformAlreadyRegistered
 		}
@@ -591,10 +615,6 @@ func (m *platformMutation) RegisterPlatform(plat *platform.Platform) error {
 				return ErrPlatformNameConflict
 			}
 		}
-		// Build the complete view while platMu is held, before publishing the
-		// platform into either index. Node notifications that race registration
-		// therefore cannot be lost between a caller-side rebuild and publication.
-		p.RebuildPlatform(plat)
 		p.platformByID[plat.ID] = plat
 		if plat.Name != "" {
 			p.platformByName[plat.Name] = plat
@@ -653,22 +673,39 @@ func (m *platformMutation) ReplacePlatform(next *platform.Platform) error {
 			return ErrPlatformNotRegistered
 		}
 
+		p.platMu.RLock()
+		current, ok := p.platformByID[next.ID]
+		if !ok {
+			p.platMu.RUnlock()
+			return ErrPlatformNotRegistered
+		}
+
+		if next.Name != "" {
+			if existingByName, exists := p.platformByName[next.Name]; exists && existingByName != current {
+				p.platMu.RUnlock()
+				return ErrPlatformNameConflict
+			}
+		}
+		p.platMu.RUnlock()
+
+		// Construct the complete replacement view while the old platform stays
+		// published. Route readers therefore continue using the old complete
+		// generation instead of waiting for slow GeoIP/health evaluation.
+		p.RebuildPlatform(next)
+		if hook := p.afterPlatformRebuildHook; hook != nil {
+			hook()
+		}
+
 		if hook := p.beforePlatformReplaceLockHook; hook != nil {
 			hook()
 		}
 		p.platMu.Lock()
 		defer p.platMu.Unlock()
 
-		p.RebuildPlatform(next)
-		if hook := p.afterPlatformRebuildHook; hook != nil {
-			hook()
-		}
-
-		current, ok := p.platformByID[next.ID]
+		current, ok = p.platformByID[next.ID]
 		if !ok {
 			return ErrPlatformNotRegistered
 		}
-
 		if next.Name != "" {
 			if existingByName, exists := p.platformByName[next.Name]; exists && existingByName != current {
 				return ErrPlatformNameConflict
@@ -696,8 +733,10 @@ func (m *platformMutation) ReplacePlatform(next *platform.Platform) error {
 
 // ReplacePlatform atomically replaces an existing platform object by ID.
 // It follows a copy-on-write update path: the caller builds a new Platform
-// instance, and this method serializes rebuilding its view with node dirty
-// snapshots and the map-pointer swap under platMu.
+// instance, and the platform mutation owner serializes candidate rebuilds with
+// dirty notifications. The platMu critical section is limited to the final
+// map-pointer swap, so route readers keep seeing the old complete generation
+// while the candidate is built.
 func (p *GlobalNodePool) ReplacePlatform(next *platform.Platform) error {
 	return p.WithPlatformMutationContext(context.Background(), func(m PlatformMutation) error {
 		return m.ReplacePlatform(next)
@@ -952,6 +991,18 @@ func (p *GlobalNodePool) MakeHealthyAndEnabledEvaluator() func(entry *node.NodeE
 
 // notifyAllPlatformsDirty tells every registered platform to re-evaluate a node.
 func (p *GlobalNodePool) notifyAllPlatformsDirty(hash node.Hash) {
+	// Platform replacement builds its candidate outside platMu so route readers
+	// stay available. Keep dirty notification in the platform publication owner
+	// while it snapshots and rebuilds, otherwise it can finish against the old
+	// generation just before the replacement publishes and lose the update.
+	if hook := p.beforePlatformNotifyLockHook; hook != nil {
+		hook()
+	}
+	if err := p.platformBatchMu.readLockContext(context.Background()); err != nil {
+		return
+	}
+	defer p.platformBatchMu.readUnlock()
+
 	for {
 		platforms, generation := p.platformSnapshotWithGeneration()
 		if len(platforms) == 0 {

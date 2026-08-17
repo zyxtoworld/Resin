@@ -1289,15 +1289,20 @@ func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T
 
 	rebuildReached := make(chan struct{})
 	releaseRebuild := make(chan struct{})
+	notifyAttempted := make(chan struct{})
 	snapshotReached := make(chan struct{})
+	var notifyAttemptOnce sync.Once
 	var snapshotOnce sync.Once
 
 	// Every initialization operation is complete before either seam is
-	// installed. The notification is allowed to reach the snapshot boundary,
+	// installed. The notification is allowed to reach the publication owner,
 	// but is not awaited before replacement is released: the fixed path waits
-	// on platMu there by design.
+	// there by design.
 	pool.beforePlatformSnapshotLockHook = func() {
 		snapshotOnce.Do(func() { close(snapshotReached) })
+	}
+	pool.beforePlatformNotifyLockHook = func() {
+		notifyAttemptOnce.Do(func() { close(notifyAttempted) })
 	}
 	pool.afterPlatformRebuildHook = func() {
 		close(rebuildReached)
@@ -1305,6 +1310,7 @@ func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T
 	}
 	defer func() {
 		pool.beforePlatformSnapshotLockHook = nil
+		pool.beforePlatformNotifyLockHook = nil
 		pool.afterPlatformRebuildHook = nil
 		select {
 		case <-releaseRebuild:
@@ -1339,13 +1345,14 @@ func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T
 	}()
 
 	select {
-	case <-snapshotReached:
+	case <-notifyAttempted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("node notification did not reach platformSnapshot")
+		t.Fatal("node notification did not reach platform publication owner")
 	}
 
 	// Do not wait for NotifyNodeDirty before releasing replacement: the fixed
-	// implementation intentionally blocks its snapshot RLock until publish.
+	// implementation intentionally blocks its publication read owner until
+	// publish.
 	close(releaseRebuild)
 
 	select {
@@ -1360,6 +1367,11 @@ func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T
 	case <-notifyDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("node notification did not complete")
+	}
+	select {
+	case <-snapshotReached:
+	default:
+		t.Fatal("node notification completed without reaching platform snapshot")
 	}
 
 	got, ok := pool.GetPlatform("p-replace-race")
@@ -1421,12 +1433,17 @@ func TestPool_ReplacePlatform_DoesNotLoseNotificationCapturedBeforePublish(t *te
 	}
 	notifyReached := make(chan struct{})
 	releaseNotify := make(chan struct{})
+	replaceQueued := make(chan struct{})
+	var replaceQueuedOnce sync.Once
 	pool.beforePlatformNotifyHook = func(plat *platform.Platform) {
 		if plat != oldPlat {
 			return
 		}
 		close(notifyReached)
 		<-releaseNotify
+	}
+	pool.platformBatchMu.afterWriterQueued = func() {
+		replaceQueuedOnce.Do(func() { close(replaceQueued) })
 	}
 	rebuildReached := make(chan struct{})
 	releaseRebuild := make(chan struct{})
@@ -1438,6 +1455,7 @@ func TestPool_ReplacePlatform_DoesNotLoseNotificationCapturedBeforePublish(t *te
 		pool.beforePlatformSnapshotLockHook = nil
 		pool.afterPlatformSnapshotHook = nil
 		pool.beforePlatformNotifyHook = nil
+		pool.platformBatchMu.afterWriterQueued = nil
 		pool.afterPlatformRebuildHook = nil
 		select {
 		case <-releaseSnapshot:
@@ -1478,29 +1496,45 @@ func TestPool_ReplacePlatform_DoesNotLoseNotificationCapturedBeforePublish(t *te
 		t.Fatal("notification did not capture platform snapshot")
 	}
 	close(releaseCopied)
+	select {
+	case <-notifyReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification did not reach the old platform")
+	}
 
 	replaceDone := make(chan error, 1)
 	go func() {
 		replaceDone <- pool.ReplacePlatform(nextPlat)
 	}()
 	select {
-	case <-rebuildReached:
+	case <-replaceQueued:
 	case <-time.After(2 * time.Second):
-		t.Fatal("replacement did not reach rebuild/publish boundary")
+		t.Fatal("replacement writer did not queue behind the notification owner")
 	}
 	select {
-	case <-notifyReached:
-	case <-time.After(2 * time.Second):
-		t.Fatal("captured notification did not reach old platform")
+	case <-rebuildReached:
+		t.Fatal("replacement rebuilt while the notification owner was still active")
+	default:
 	}
-
-	// The node becomes routable only after the replacement rebuild took its
-	// snapshot. The in-flight notification is still blocked before updating the
-	// old platform.
+	// The node becomes routable while the notification owner is active and the
+	// replacement writer is queued. Once the owner is released, the candidate
+	// rebuild must observe this complete state before it is published.
 	outbound := testutil.NewNoopOutbound()
 	entry.Outbound.Store(&outbound)
 	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
 	entry.CircuitOpenSince.Store(0)
+	close(releaseNotify)
+	select {
+	case <-notifyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("captured notification did not finish")
+	}
+	select {
+	case <-rebuildReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not reach rebuild/publish boundary")
+	}
+
 	close(releaseRebuild)
 
 	select {
@@ -1510,16 +1544,6 @@ func TestPool_ReplacePlatform_DoesNotLoseNotificationCapturedBeforePublish(t *te
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("replacement did not complete")
-	}
-	if nextPlat.View().Contains(h) {
-		t.Fatal("next platform unexpectedly included node before notification completed")
-	}
-
-	close(releaseNotify)
-	select {
-	case <-notifyDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("captured notification did not finish")
 	}
 	if !nextPlat.View().Contains(h) {
 		t.Fatal("published replacement lost a notification captured before publish")
