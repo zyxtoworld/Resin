@@ -2,6 +2,7 @@ package routing
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -73,6 +74,49 @@ func TestRouter_SnapshotLeasePageFiltersWithStableCursor(t *testing.T) {
 	}
 	if _, ok, err := router.SnapshotLeasePageForPlatform(plat.ID, LeasePageQuery{Limit: maxLeasePageLimit + 1}); err != ErrLeasePageTooWide || ok {
 		t.Fatalf("wide page = ok=%v err=%v, want bounded error", ok, err)
+	}
+}
+
+func TestRouter_SnapshotLeasePageRejectsCursorFromAnotherPlatform(t *testing.T) {
+	pool := newRouterTestPool()
+	first := platform.NewPlatform("lease-page-cursor-a", "Lease Page Cursor A", nil, nil)
+	second := platform.NewPlatform("lease-page-cursor-b", "Lease Page Cursor B", nil, nil)
+	pool.addPlatform(first)
+	pool.addPlatform(second)
+	router := newTestRouter(pool, nil)
+	now := time.Now().UnixNano()
+	hash := node.HashFromRawOptions([]byte(`{"id":"lease-page-cursor-node"}`)).Hex()
+	for _, platformID := range []string{first.ID, second.ID} {
+		for _, account := range []string{"alpha", "beta"} {
+			if err := router.UpsertLease(model.Lease{
+				PlatformID:     platformID,
+				Account:        account,
+				NodeHash:       hash,
+				EgressIP:       "198.51.100.120",
+				CreatedAtNs:    now,
+				ExpiryNs:       now + int64(time.Hour),
+				LastAccessedNs: now,
+			}); err != nil {
+				t.Fatalf("seed %s/%s: %v", platformID, account, err)
+			}
+		}
+	}
+
+	page, ok, err := router.SnapshotLeasePageForPlatform(first.ID, LeasePageQuery{
+		Limit:  1,
+		SortBy: "account",
+	})
+	if err != nil || !ok || page.NextCursor == "" {
+		t.Fatalf("first platform page = %#v ok=%v err=%v, want a cursor", page, ok, err)
+	}
+
+	_, ok, err = router.SnapshotLeasePageForPlatform(second.ID, LeasePageQuery{
+		Limit:  1,
+		SortBy: "account",
+		Cursor: page.NextCursor,
+	})
+	if ok || !errors.Is(err, ErrLeaseCursorInvalid) {
+		t.Fatalf("cross-platform cursor accepted: ok=%v err=%v", ok, err)
 	}
 }
 

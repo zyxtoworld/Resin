@@ -277,16 +277,30 @@ type IPLoadEntry struct {
 
 // GetIPLoad returns IP load stats for a platform.
 func (s *ControlPlaneService) GetIPLoad(platformID string) ([]IPLoadEntry, error) {
-	snapshot, exists := s.Router.SnapshotIPLoadForPlatform(platformID)
-	if !exists {
-		return nil, notFound("platform not found")
+	return s.GetIPLoadContext(context.Background(), platformID)
+}
+
+// GetIPLoadContext observes IP load only after admitting the caller into one
+// complete runtime generation. A canceled request must not read while a
+// subscription/runtime mutation is publishing its corresponding generation.
+func (s *ControlPlaneService) GetIPLoadContext(ctx context.Context, platformID string) ([]IPLoadEntry, error) {
+	var result []IPLoadEntry
+	var readErr error
+	if err := s.withRuntimeReadContext(ctx, func() {
+		snapshot, exists := s.Router.SnapshotIPLoadForPlatform(platformID)
+		if !exists {
+			readErr = notFound("platform not found")
+			return
+		}
+		result = make([]IPLoadEntry, 0, len(snapshot))
+		for ip, count := range snapshot {
+			result = append(result, IPLoadEntry{
+				EgressIP:   ip.String(),
+				LeaseCount: count,
+			})
+		}
+	}); err != nil {
+		return nil, err
 	}
-	result := make([]IPLoadEntry, 0, len(snapshot))
-	for ip, count := range snapshot {
-		result = append(result, IPLoadEntry{
-			EgressIP:   ip.String(),
-			LeaseCount: count,
-		})
-	}
-	return result, nil
+	return result, readErr
 }

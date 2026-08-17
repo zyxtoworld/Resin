@@ -23,6 +23,7 @@ import { useI18n } from "../../i18n";
 import { formatApiErrorMessage } from "../../lib/error-message";
 import { createEndpoint, deleteEndpoint, listEndpoints, updateEndpoint } from "./api";
 import type { Endpoint, EndpointInput } from "./types";
+import { clampPage, itemsForRender } from "../subscriptions/paginationModel";
 
 type EndpointFormState = {
   port: string;
@@ -338,10 +339,19 @@ export function EndpointsPage() {
     placeholderData: (previousData) => previousData,
     refetchInterval: 15_000,
   });
-  const endpoints = endpointsQuery.data?.items ?? EMPTY_ENDPOINTS;
+  const endpoints = itemsForRender(endpointsQuery.data?.items ?? EMPTY_ENDPOINTS, endpointsQuery.isPlaceholderData);
   const totalEndpoints = endpointsQuery.data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalEndpoints / pageSize));
-  const currentPage = Math.min(page, totalPages - 1);
+  const currentPage = clampPage(page, totalEndpoints, pageSize);
+
+  useEffect(() => {
+    if (endpointsQuery.isFetching || page === currentPage) {
+      return;
+    }
+    // The server total is authoritative after a delete refresh.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reconcile an invalid server page before rendering it
+    setPage(currentPage);
+  }, [currentPage, endpointsQuery.isFetching, page]);
 
   const invalidateEndpoints = async () => {
     await queryClient.invalidateQueries({ queryKey: ["endpoints"] });
@@ -507,7 +517,7 @@ export function EndpointsPage() {
       </Card>
 
       <Card className="platform-cards-container">
-        {endpointsQuery.isLoading ? <p className="muted">{t("正在加载接入点...")}</p> : null}
+        {endpointsQuery.isLoading || endpointsQuery.isPlaceholderData ? <p className="muted">{t("正在加载接入点...")}</p> : null}
 
         {endpointsQuery.isError ? (
           <div className="callout callout-error">
@@ -516,7 +526,7 @@ export function EndpointsPage() {
           </div>
         ) : null}
 
-        {!endpointsQuery.isLoading && !endpointsQuery.isError && endpoints.length === 0 ? (
+        {!endpointsQuery.isLoading && !endpointsQuery.isPlaceholderData && !endpointsQuery.isError && endpoints.length === 0 ? (
           <div className="empty-box">
             <Sparkles size={16} />
             <p>{t("暂无接入点")}</p>

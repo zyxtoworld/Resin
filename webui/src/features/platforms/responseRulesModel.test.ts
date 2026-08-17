@@ -15,6 +15,7 @@ import {
 } from "./responseRulesModel.ts";
 import type { PlatformResponseRule } from "./types.ts";
 import { shouldResetLeaseCursorOnError } from "./routeStatePagination.ts";
+import { clampPage, dataForRender, itemsForRender } from "../subscriptions/paginationModel.ts";
 
 const assert = {
   equal(actual: unknown, expected: unknown, message?: string) {
@@ -41,6 +42,11 @@ const assert = {
 assert.equal(shouldResetLeaseCursorOnError(400, "stale-cursor"), true, "stale cursor should reset to page one");
 assert.equal(shouldResetLeaseCursorOnError(400, ""), false, "first page 400 should not loop-reset");
 assert.equal(shouldResetLeaseCursorOnError(500, "stale-cursor"), false, "server errors should remain visible");
+assert.equal(clampPage(2, 21, 20), 1, "a page should clamp after the last row is deleted");
+assert.equal(clampPage(0, 0, 20), 0, "an empty list should keep page zero");
+assert.deepEqual(itemsForRender(["old-page-row"], true), [], "placeholder rows must not render under a new page");
+assert.equal(dataForRender({ marker: "old-route-state" }, true), undefined, "placeholder route state must not render old nodes/cooldowns");
+assert.equal(dataForRender({ id: "old-platform" }, true), undefined, "placeholder platform detail must not enable the old platform");
 
 const validRule: PlatformResponseRule = {
   id: "first",
@@ -85,6 +91,12 @@ for (const input of [
 }
 
 assert.equal(parseResponseRulesEditorText("[null, {}, {\"id\":3,\"enabled\":true,\"match\":{},\"action\":{}}]").length, 0);
+assert.equal(parseResponseRulesEditorText(JSON.stringify([{
+  id: "nested-malformed",
+  enabled: true,
+  match: { status_codes: null, status_range: { min: 400, max: 499 }, headers: [null], body: 3 },
+  action: { type: "cooldown", expiry_sources: [null] },
+}])).length, 0, "nested malformed rule must not reach the visual editor");
 assert.equal(parseResponseRulesEditorText(JSON.stringify([{
   ...validRule,
   action: { type: "cooldown", cooldown_scope: "egress_ip", fallback: "fixed_duration", fixed_duration: "" },

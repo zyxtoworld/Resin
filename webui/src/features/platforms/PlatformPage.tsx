@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Info, Plus, RefreshCw, Search, Sparkles, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router-dom";
 import { Badge } from "../../components/ui/Badge";
@@ -36,6 +36,7 @@ import {
 import { parseResponseRulesEditorText } from "./responseRulesModel";
 import { ResponseRulesEditor } from "./ResponseRulesEditor";
 import type { Platform } from "./types";
+import { clampPage, itemsForRender } from "../subscriptions/paginationModel";
 
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 const EMPTY_PLATFORMS: Platform[] = [];
@@ -71,11 +72,19 @@ export function PlatformPage() {
     placeholderData: (prev) => prev,
   });
 
-  const platforms = platformsQuery.data?.items ?? EMPTY_PLATFORMS;
+  const platforms = itemsForRender(platformsQuery.data?.items ?? EMPTY_PLATFORMS, platformsQuery.isPlaceholderData);
 
   const totalPlatforms = platformsQuery.data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalPlatforms / pageSize));
-  const currentPage = Math.min(page, totalPages - 1);
+  const currentPage = clampPage(page, totalPlatforms, pageSize);
+
+  useEffect(() => {
+    if (platformsQuery.isFetching || page === currentPage) {
+      return;
+    }
+    // The server total is authoritative after a delete/filter refresh.
+    setPage(currentPage);
+  }, [currentPage, page, platformsQuery.isFetching]);
 
   const createForm = useForm<PlatformFormValues>({
     resolver: zodResolver(platformFormSchema),
@@ -161,7 +170,7 @@ export function PlatformPage() {
       </Card>
 
       <Card className="platform-cards-container">
-        {platformsQuery.isLoading ? <p className="muted">{t("正在加载平台数据...")}</p> : null}
+        {platformsQuery.isLoading || platformsQuery.isPlaceholderData ? <p className="muted">{t("正在加载平台数据...")}</p> : null}
 
         {platformsQuery.isError ? (
           <div className="callout callout-error">
@@ -170,7 +179,7 @@ export function PlatformPage() {
           </div>
         ) : null}
 
-        {!platformsQuery.isLoading && !platforms.length ? (
+        {!platformsQuery.isLoading && !platformsQuery.isPlaceholderData && !platformsQuery.isError && !platforms.length ? (
           <div className="empty-box">
             <Sparkles size={16} />
             <p>{t("没有匹配的平台")}</p>

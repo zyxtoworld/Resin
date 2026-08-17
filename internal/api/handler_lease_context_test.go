@@ -19,6 +19,20 @@ import (
 	"github.com/Resinat/Resin/internal/topology"
 )
 
+func TestListLeasesSortUsesStableAccountTieBreaker(t *testing.T) {
+	for _, order := range []string{"asc", "desc"} {
+		items := []service.LeaseResponse{
+			{Account: "b", Expiry: "same"},
+			{Account: "a", Expiry: "same"},
+		}
+		sorting := Sorting{SortBy: "expiry", SortOrder: order}
+		sortLeaseResponses(items, sorting)
+		if items[0].Account != "a" || items[1].Account != "b" {
+			t.Fatalf("sort order %s retained unstable input order for equal expiry: %+v", order, items)
+		}
+	}
+}
+
 type blockingLeaseReadFixture struct {
 	cp         *service.ControlPlaneService
 	platformID string
@@ -185,6 +199,39 @@ func TestGetLeaseHandlerStopsOnCanceledRequestDuringRuntimeMutation(t *testing.T
 	}
 	if !returnedBeforeRelease {
 		t.Fatal("canceled lease get handler remained blocked by runtime mutation")
+	}
+}
+
+func TestIPLoadHandlerStopsOnCanceledRequestDuringRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/platforms/"+fixture.platformID+"/ip-load", nil).WithContext(requestCtx)
+	req.SetPathValue("id", fixture.platformID)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleIPLoad(fixture.cp).ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	returnedBeforeRelease := false
+	select {
+	case <-done:
+		returnedBeforeRelease = true
+	case <-time.After(time.Second):
+	}
+	fixture.finish(t)
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("canceled ip-load handler did not finish after runtime mutation release")
+	}
+	if !returnedBeforeRelease {
+		t.Fatal("canceled ip-load handler remained blocked by runtime mutation")
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("canceled ip-load request was reported successful: status=%d", rec.Code)
 	}
 }
 

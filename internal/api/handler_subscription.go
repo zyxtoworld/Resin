@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/Resinat/Resin/internal/service"
@@ -42,6 +43,21 @@ func subscriptionSortKey(sortBy string, s service.SubscriptionResponse) string {
 	}
 }
 
+func sortSubscriptionResponses(subs []service.SubscriptionResponse, sorting Sorting) {
+	slices.SortStableFunc(subs, func(a, b service.SubscriptionResponse) int {
+		comparison := strings.Compare(subscriptionSortKey(sorting.SortBy, a), subscriptionSortKey(sorting.SortBy, b))
+		if sorting.SortOrder == "desc" {
+			comparison = -comparison
+		}
+		if comparison != 0 {
+			return comparison
+		}
+		// The manager's concurrent map does not promise iteration order. Keep
+		// offset pagination deterministic when the requested field ties.
+		return strings.Compare(a.ID, b.ID)
+	})
+}
+
 // HandleListSubscriptions returns a handler for GET /api/v1/subscriptions.
 func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -66,9 +82,7 @@ func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		SortSlice(subs, sorting, func(s service.SubscriptionResponse) string {
-			return subscriptionSortKey(sorting.SortBy, s)
-		})
+		sortSubscriptionResponses(subs, sorting)
 
 		pg, ok := parsePaginationOrWriteInvalid(w, r)
 		if !ok {

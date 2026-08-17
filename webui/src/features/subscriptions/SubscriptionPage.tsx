@@ -28,6 +28,7 @@ import {
   refreshSubscription,
   updateSubscription,
 } from "./api";
+import { clampSubscriptionPage, subscriptionItemsForRender } from "./paginationModel";
 import type { Subscription } from "./types";
 
 type EnabledFilter = "all" | "enabled" | "disabled";
@@ -167,17 +168,28 @@ export function SubscriptionPage() {
   });
 
   const subscriptions = subscriptionsQuery.data?.items ?? EMPTY_SUBSCRIPTIONS;
+  const visibleSubscriptions = subscriptionItemsForRender(subscriptions, subscriptionsQuery.isPlaceholderData);
   const totalSubscriptions = subscriptionsQuery.data?.total ?? 0;
 
   const totalPages = Math.max(1, Math.ceil(totalSubscriptions / pageSize));
-  const currentPage = Math.min(page, totalPages - 1);
+  const currentPage = clampSubscriptionPage(page, totalSubscriptions, pageSize);
+
+  useEffect(() => {
+    if (subscriptionsQuery.isFetching || page === currentPage) {
+      return;
+    }
+    // A delete/filter change can make the requested offset invalid. Reconcile
+    // the local page after the authoritative total arrives, then let the query
+    // fetch the page that is actually displayed.
+    setPage(currentPage);
+  }, [currentPage, page, subscriptionsQuery.isFetching]);
 
   const selectedSubscription = useMemo(() => {
     if (!selectedSubscriptionId) {
       return null;
     }
-    return subscriptions.find((item) => item.id === selectedSubscriptionId) ?? null;
-  }, [selectedSubscriptionId, subscriptions]);
+    return visibleSubscriptions.find((item) => item.id === selectedSubscriptionId) ?? null;
+  }, [selectedSubscriptionId, visibleSubscriptions]);
 
   const drawerVisible = drawerOpen && Boolean(selectedSubscription);
 
@@ -709,7 +721,7 @@ export function SubscriptionPage() {
       </Card>
 
       <Card className="platform-cards-container subscriptions-table-card">
-        {subscriptionsQuery.isLoading ? <p className="muted">{t("正在加载订阅数据...")}</p> : null}
+        {subscriptionsQuery.isLoading || subscriptionsQuery.isPlaceholderData ? <p className="muted">{t("正在加载订阅数据...")}</p> : null}
 
         {subscriptionsQuery.isError ? (
           <div className="callout callout-error">
@@ -718,16 +730,16 @@ export function SubscriptionPage() {
           </div>
         ) : null}
 
-        {!subscriptionsQuery.isLoading && !subscriptions.length ? (
+        {!subscriptionsQuery.isLoading && !subscriptionsQuery.isPlaceholderData && !subscriptionsQuery.isError && !visibleSubscriptions.length ? (
           <div className="empty-box">
             <Sparkles size={16} />
             <p>{t("没有匹配的订阅")}</p>
           </div>
         ) : null}
 
-        {subscriptions.length ? (
+        {visibleSubscriptions.length ? (
           <DataTable
-            data={subscriptions}
+            data={visibleSubscriptions}
             columns={subColumns}
             onRowClick={openDrawer}
             getRowId={(s) => s.id}

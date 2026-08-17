@@ -16,6 +16,20 @@ import (
 	"github.com/Resinat/Resin/internal/topology"
 )
 
+func TestListSubscriptionsSortUsesStableIDTieBreaker(t *testing.T) {
+	for _, order := range []string{"asc", "desc"} {
+		items := []service.SubscriptionResponse{
+			{ID: "b", Name: "same", CreatedAt: "same"},
+			{ID: "a", Name: "same", CreatedAt: "same"},
+		}
+		sorting := Sorting{SortBy: "name", SortOrder: order}
+		sortSubscriptionResponses(items, sorting)
+		if items[0].ID != "a" || items[1].ID != "b" {
+			t.Fatalf("sort order %s retained unstable input order for equal keys: %+v", order, items)
+		}
+	}
+}
+
 type blockingSubscriptionDeleteFixture struct {
 	cp         *service.ControlPlaneService
 	id         string

@@ -20,6 +20,7 @@ import { useI18n } from "../../i18n";
 import { ApiError } from "../../lib/api-client";
 import { formatApiErrorMessage } from "../../lib/error-message";
 import { formatDateTime, formatGoDuration, formatRelativeTime } from "../../lib/time";
+import { dataForRender } from "../subscriptions/paginationModel";
 import {
   clearAllPlatformLeases,
   deletePlatform,
@@ -96,7 +97,7 @@ export function PlatformDetailPage() {
     placeholderData: (previous) => previous,
   });
 
-  const platform = platformQuery.data ?? null;
+  const platform = dataForRender(platformQuery.data, platformQuery.isPlaceholderData) ?? null;
   const leaseCursor = leaseCursorStack[leasePage] ?? "";
 
   const routeStateQuery = useQuery({
@@ -119,6 +120,7 @@ export function PlatformDetailPage() {
     placeholderData: (previous) => previous,
   });
   const routeState = routeStateQuery.data;
+  const visibleRouteState = dataForRender(routeState, routeStateQuery.isPlaceholderData);
   const leasesPage = routeState?.leases ?? {
     items: [],
     total: 0,
@@ -128,7 +130,7 @@ export function PlatformDetailPage() {
   const leases = leasesPage.items;
   const isLeasePageTransitioning = routeStateQuery.isFetching && routeStateQuery.isPlaceholderData;
   const visibleLeases = isLeasePageTransitioning ? [] : leases;
-  const routeNodes = routeState?.nodes ?? [];
+  const routeNodes = visibleRouteState?.nodes ?? [];
   const visibleRouteNodes = nodeStatusFilter === "all" ? routeNodes : routeNodes.filter((node) => node.status === nodeStatusFilter);
 
   const editForm = useForm<PlatformFormValues>({
@@ -660,6 +662,7 @@ export function PlatformDetailPage() {
 
                   <div className="field-group" style={{ gridColumn: "1 / -1" }}>
                     <ResponseRulesEditor
+                      key={`${platform.id}:${platform.updated_at}`}
                       rules={detailResponseRules}
                       onChange={(rules) => editForm.setValue("response_rules_text", JSON.stringify(rules, null, 2), { shouldDirty: true, shouldValidate: true })}
                       onValidationChange={(message) => {
@@ -795,13 +798,13 @@ export function PlatformDetailPage() {
                   </div>
                   {routeStateQuery.isLoading ? <p className="muted">{t("正在加载路由状态...")}</p> : null}
                   {routeStateQuery.isError ? <div className="callout callout-error"><AlertTriangle size={14} /><span>{formatApiErrorMessage(routeStateQuery.error, t)}</span></div> : null}
-                  {routeState ? (
+                  {visibleRouteState ? (
                     <>
-                      <p className="muted platform-route-state-observed">{t("快照时间：{{time}}", { time: formatDateTime(routeState.observed_at) })}</p>
+                      <p className="muted platform-route-state-observed">{t("快照时间：{{time}}", { time: formatDateTime(visibleRouteState.observed_at) })}</p>
                       {visibleRouteNodes.length ? <DataTable data={visibleRouteNodes} columns={routeNodeColumns} getRowId={(item) => item.node_hash} className="data-table-route-nodes" wrapClassName="platform-route-node-table-wrap" /> : <div className="empty-box"><Sparkles size={16} /><p>{t("当前筛选没有节点")}</p></div>}
                       <div className="platform-cooldown-list">
                         <div className="platform-drawer-section-head"><h4>{t("响应冷却")}</h4><p>{t("冷却是平台内存态，读取时会清理已到期项目，不会持久化。")}</p></div>
-                        {routeState.cooldowns.length ? routeState.cooldowns.map((cooldown) => <div className="platform-cooldown-item" key={`${cooldown.scope}-${cooldown.node_hash ?? cooldown.egress_ip ?? "unbound"}`}><Badge variant="warning">{cooldown.scope === "egress_ip" ? t("出口 IP") : t("当前路由节点")}</Badge><span>{cooldown.node_hash || cooldown.egress_ip || t("未绑定当前节点")}</span><span>{t("恢复：{{time}}", { time: formatDateTime(cooldown.until) })}</span></div>) : <p className="muted">{t("当前没有活跃冷却")}</p>}
+                        {visibleRouteState.cooldowns.length ? visibleRouteState.cooldowns.map((cooldown) => <div className="platform-cooldown-item" key={`${cooldown.scope}-${cooldown.node_hash ?? cooldown.egress_ip ?? "unbound"}`}><Badge variant="warning">{cooldown.scope === "egress_ip" ? t("出口 IP") : t("当前路由节点")}</Badge><span>{cooldown.node_hash || cooldown.egress_ip || t("未绑定当前节点")}</span><span>{t("恢复：{{time}}", { time: formatDateTime(cooldown.until) })}</span></div>) : <p className="muted">{t("当前没有活跃冷却")}</p>}
                       </div>
                     </>
                   ) : null}

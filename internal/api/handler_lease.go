@@ -28,6 +28,20 @@ func leaseSortKey(sortBy string, l service.LeaseResponse) string {
 	}
 }
 
+func sortLeaseResponses(leases []service.LeaseResponse, sorting Sorting) {
+	slices.SortStableFunc(leases, func(a, b service.LeaseResponse) int {
+		comparison := strings.Compare(leaseSortKey(sorting.SortBy, a), leaseSortKey(sorting.SortBy, b))
+		if sorting.SortOrder == "desc" {
+			comparison = -comparison
+		}
+		if comparison != 0 {
+			return comparison
+		}
+		// Accounts are the lease identity; use them as a deterministic page tie-breaker.
+		return strings.Compare(a.Account, b.Account)
+	})
+}
+
 func compareIPLoadEntries(sortBy string, a, b service.IPLoadEntry) int {
 	switch sortBy {
 	case "egress_ip":
@@ -96,9 +110,7 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		SortSlice(leases, sorting, func(l service.LeaseResponse) string {
-			return leaseSortKey(sorting.SortBy, l)
-		})
+		sortLeaseResponses(leases, sorting)
 
 		pg, ok := parsePaginationOrWriteInvalid(w, r)
 		if !ok {
@@ -172,7 +184,7 @@ func HandleIPLoad(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
-		entries, err := cp.GetIPLoad(platformID)
+		entries, err := cp.GetIPLoadContext(r.Context(), platformID)
 		if err != nil {
 			writeServiceError(w, err)
 			return

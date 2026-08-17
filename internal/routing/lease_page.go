@@ -35,15 +35,18 @@ func newLeaseCursorSecret() []byte {
 
 // LeasePageQuery describes a bounded cursor query performed while the Router
 // lifecycle read owner is held. The cursor is exclusive and binds the
-// requested filter, sort, and page size; changing any of them requires a new
-// empty cursor rather than silently reusing an incompatible position.
+// requested platform, filter, sort, and page size; changing any of them
+// requires a new empty cursor rather than silently reusing an incompatible
+// position. platformID is filled by SnapshotLeasePageForPlatform and is not
+// caller-controlled.
 type LeasePageQuery struct {
-	Account string
-	Fuzzy   bool
-	Limit   int
-	SortBy  string
-	Desc    bool
-	Cursor  string
+	platformID string
+	Account    string
+	Fuzzy      bool
+	Limit      int
+	SortBy     string
+	Desc       bool
+	Cursor     string
 }
 
 type LeasePageItem struct {
@@ -61,6 +64,7 @@ type LeasePage struct {
 
 type leasePageCursor struct {
 	Version        int    `json:"version"`
+	PlatformID     string `json:"platform_id"`
 	SortBy         string `json:"sort_by"`
 	Desc           bool   `json:"desc"`
 	FilterAccount  string `json:"filter_account"`
@@ -145,6 +149,7 @@ func compareLeasePageItems(left, right LeasePageItem, query LeasePageQuery) int 
 func encodeLeasePageCursor(item LeasePageItem, query LeasePageQuery) string {
 	cursor := leasePageCursor{
 		Version:        1,
+		PlatformID:     query.platformID,
 		SortBy:         normalizeLeaseSort(query.SortBy),
 		Desc:           query.Desc,
 		FilterAccount:  strings.TrimSpace(query.Account),
@@ -200,6 +205,7 @@ func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, err
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF ||
 		cursor.Version != 1 ||
+		cursor.PlatformID != query.platformID ||
 		cursor.SortBy != normalizeLeaseSort(query.SortBy) || cursor.Desc != query.Desc ||
 		cursor.FilterAccount != strings.TrimSpace(query.Account) || cursor.Fuzzy != query.Fuzzy ||
 		cursor.Limit != query.Limit || cursor.LastAccount == "" || cursor.NodeHash == "" {
@@ -242,6 +248,7 @@ func leaseMatchesQuery(account string, query LeasePageQuery) bool {
 // service/API. Concurrent changes have best-effort cursor semantics: the
 // cursor is a stable exclusive sort position for the observed generation.
 func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePageQuery) (LeasePage, bool, error) {
+	query.platformID = platformID
 	limit := query.Limit
 	if limit <= 0 {
 		limit = 50

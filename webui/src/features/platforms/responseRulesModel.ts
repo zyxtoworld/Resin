@@ -196,12 +196,95 @@ function isEditorRule(value: unknown): value is PlatformResponseRule {
     return false;
   }
   const candidate = value as Record<string, unknown>;
-  return typeof candidate.id === "string"
-    && typeof candidate.enabled === "boolean"
-    && candidate.match !== null
-    && typeof candidate.match === "object"
-    && candidate.action !== null
-    && typeof candidate.action === "object";
+  if (typeof candidate.id !== "string" || typeof candidate.enabled !== "boolean") {
+    return false;
+  }
+  if (!isEditorMatch(candidate.match) || !isEditorAction(candidate.action)) {
+    return false;
+  }
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isOneOf<T extends string>(value: unknown, values: readonly T[]): value is T {
+  return typeof value === "string" && values.includes(value as T);
+}
+
+const editorHeaderOps = ["exists", "absent", "regex", "not_regex", "contains", "not_contains"] as const;
+const editorBodyOps = ["regex", "not_regex", "contains", "not_contains"] as const;
+const editorExpiryTypes = ["retry_after", "header", "json_pointer", "body_regex"] as const;
+const editorExpiryFormats = ["rfc3339_utc", "unix_seconds", "unix_millis", "delta_seconds"] as const;
+const editorActionTypes = ["passthrough", "retry_next", "cooldown", "cooldown_then_retry_next"] as const;
+const editorCooldownScopes = ["egress_ip", "route_entry"] as const;
+const editorFallbacks = ["next_utc_midnight", "fixed_duration", "none"] as const;
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isEditorHeader(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.name !== "string" || !isOneOf(value.op, editorHeaderOps)) {
+    return false;
+  }
+  return isOptionalString(value.value);
+}
+
+function isEditorBody(value: unknown): boolean {
+  return isRecord(value)
+    && isOneOf(value.op, editorBodyOps)
+    && typeof value.value === "string";
+}
+
+function isEditorRange(value: unknown): boolean {
+  return isRecord(value) && typeof value.min === "number" && typeof value.max === "number";
+}
+
+function isEditorMatch(value: unknown): value is PlatformResponseRule["match"] {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.status_codes !== undefined && (!Array.isArray(value.status_codes) || !value.status_codes.every((item) => typeof item === "number"))) {
+    return false;
+  }
+  if (value.status_range !== undefined && (!Array.isArray(value.status_range) || !value.status_range.every(isEditorRange))) {
+    return false;
+  }
+  if (value.headers !== undefined && (!Array.isArray(value.headers) || !value.headers.every(isEditorHeader))) {
+    return false;
+  }
+  return value.body === undefined || isEditorBody(value.body);
+}
+
+function isEditorExpirySource(value: unknown): boolean {
+  if (!isRecord(value) || !isOneOf(value.type, editorExpiryTypes)) {
+    return false;
+  }
+  if (!isOptionalString(value.header) || !isOptionalString(value.json_pointer) || !isOptionalString(value.regex)) {
+    return false;
+  }
+  if (value.capture !== undefined && typeof value.capture !== "number") {
+    return false;
+  }
+  return value.format === undefined || isOneOf(value.format, editorExpiryFormats);
+}
+
+function isEditorAction(value: unknown): value is PlatformResponseRule["action"] {
+  if (!isRecord(value) || !isOneOf(value.type, editorActionTypes)) {
+    return false;
+  }
+  if (value.cooldown_scope !== undefined && !isOneOf(value.cooldown_scope, editorCooldownScopes)) {
+    return false;
+  }
+  if (value.expiry_sources !== undefined && (!Array.isArray(value.expiry_sources) || !value.expiry_sources.every(isEditorExpirySource))) {
+    return false;
+  }
+  if (value.fallback !== undefined && !isOneOf(value.fallback, editorFallbacks)) {
+    return false;
+  }
+  return isOptionalString(value.fixed_duration);
 }
 
 /**

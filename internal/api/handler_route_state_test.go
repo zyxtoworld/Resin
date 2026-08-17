@@ -57,6 +57,11 @@ func TestPlatformRouteStateHandlerReturnsBoundedGenerationSnapshot(t *testing.T)
 	if _, present := body["remaining_seconds"]; present {
 		t.Fatal("route state exposes stale remaining_seconds")
 	}
+	otherPlatformID := mustCreatePlatform(t, srv, "route-state-api-other")
+	crossPlatformRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+otherPlatformID+"/route-state?limit=1&cursor="+url.QueryEscape(nextCursor), nil, true)
+	if crossPlatformRec.Code != http.StatusBadRequest {
+		t.Fatalf("cross-platform cursor status: got %d, body=%s", crossPlatformRec.Code, crossPlatformRec.Body.String())
+	}
 	cooldowns, ok := body["cooldowns"].([]any)
 	if !ok {
 		t.Fatalf("route state cooldowns shape: %#v", body["cooldowns"])

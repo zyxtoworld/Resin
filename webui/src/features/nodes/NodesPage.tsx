@@ -22,6 +22,7 @@ import { getNode, listNodes, probeEgress, probeLatency } from "./api";
 import type { NodeSummary } from "./types";
 import { getAllRegions, getRegionName } from "./regions";
 import type { NodeListFilters, NodeSortBy, SortOrder } from "./types";
+import { clampPage, itemsForRender } from "../subscriptions/paginationModel";
 
 type NodeStatusFilter = "all" | "healthy" | "circuit_open" | "error" | "disabled";
 type NodeDisplayStatus = "healthy" | "circuit_open" | "pending_test" | "error" | "disabled";
@@ -332,15 +333,26 @@ export function NodesPage() {
     unique_healthy_egress_ips: 0,
   };
   const nodes = nodesPage.items;
+  const visibleNodes = itemsForRender(nodes, nodesQuery.isPlaceholderData);
 
   const totalPages = Math.max(1, Math.ceil(nodesPage.total / pageSize));
+  const currentPage = clampPage(page, nodesPage.total, pageSize);
+
+  useEffect(() => {
+    if (nodesQuery.isFetching || page === currentPage) {
+      return;
+    }
+    // The server total is authoritative after a filter/delete refresh.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reconcile an invalid server page before rendering it
+    setPage(currentPage);
+  }, [currentPage, nodesQuery.isFetching, page]);
 
   const selectedNode = useMemo(() => {
     if (!selectedNodeHash) {
       return null;
     }
-    return nodes.find((item) => item.node_hash === selectedNodeHash) ?? null;
-  }, [nodes, selectedNodeHash]);
+    return visibleNodes.find((item) => item.node_hash === selectedNodeHash) ?? null;
+  }, [selectedNodeHash, visibleNodes]);
 
   const selectedHash = selectedNode?.node_hash || "";
 
@@ -804,7 +816,7 @@ export function NodesPage() {
       </Card>
 
       <Card className="nodes-table-card platform-cards-container subscriptions-table-card">
-        {nodesQuery.isLoading ? <p className="muted">{t("正在加载节点数据...")}</p> : null}
+        {nodesQuery.isLoading || nodesQuery.isPlaceholderData ? <p className="muted">{t("正在加载节点数据...")}</p> : null}
 
         {nodesQuery.isError ? (
           <div className="callout callout-error">
@@ -813,16 +825,16 @@ export function NodesPage() {
           </div>
         ) : null}
 
-        {!nodesQuery.isLoading && !nodes.length ? (
+        {!nodesQuery.isLoading && !nodesQuery.isPlaceholderData && !nodesQuery.isError && !visibleNodes.length ? (
           <div className="empty-box">
             <Sparkles size={16} />
             <p>{t("没有匹配的节点")}</p>
           </div>
         ) : null}
 
-        {nodes.length ? (
+        {visibleNodes.length ? (
           <DataTable
-            data={nodes}
+            data={visibleNodes}
             columns={nodeColumns}
             onRowClick={(node) => openDrawer(node.node_hash)}
             getRowId={(node) => node.node_hash}
@@ -830,7 +842,7 @@ export function NodesPage() {
         ) : null}
 
         <OffsetPagination
-          page={page}
+          page={currentPage}
           totalPages={totalPages}
           totalItems={nodesPage.total}
           pageSize={pageSize}
