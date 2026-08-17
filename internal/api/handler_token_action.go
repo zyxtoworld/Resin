@@ -38,7 +38,7 @@ func NewTokenActionHandler(proxyToken string, cp *service.ControlPlaneService, a
 			return
 		}
 
-		if err := cp.InheritLeaseByPlatformName(platformName, req.ParentAccount, req.NewAccount); err != nil {
+		if err := cp.InheritLeaseByPlatformNameContext(r.Context(), platformName, req.ParentAccount, req.NewAccount); err != nil {
 			writeServiceError(w, err)
 			return
 		}

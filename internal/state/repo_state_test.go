@@ -890,6 +890,127 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	}
 }
 
+func TestStateRepo_PlatformCommitContextSurvivesRequestCancellationAfterBegin(t *testing.T) {
+	repo := newTestStateRepo(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	repo.afterPlatformWriteBeginHook = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+
+	p := model.Platform{
+		ID:                     "platform-commit-boundary",
+		Name:                   "PlatformCommitBoundary",
+		StickyTTLNs:            int64(time.Hour),
+		RegexFilters:           []string{},
+		RegionFilters:          []string{},
+		ReverseProxyMissAction: "TREAT_AS_EMPTY",
+		AllocationPolicy:       "BALANCED",
+		UpdatedAtNs:            time.Now().UnixNano(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- repo.InsertPlatformContextAndCommit(ctx, p) }()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("platform write did not acquire SQLite IMMEDIATE transaction")
+	}
+	cancel()
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("platform write canceled after BEGIN IMMEDIATE: %v", err)
+	}
+	got, err := repo.GetPlatform(p.ID)
+	if err != nil {
+		t.Fatalf("GetPlatform after committed cancellation: %v", err)
+	}
+	if got.Name != p.Name || got.StickyTTLNs != p.StickyTTLNs {
+		t.Fatalf("committed platform = %+v, want %+v", got, p)
+	}
+}
+
+func TestStateRepo_PlatformCommitContextSurvivesRequestCancellationForUpdateAndDelete(t *testing.T) {
+	base := model.Platform{
+		ID:                     "platform-commit-update-delete",
+		Name:                   "PlatformCommitUpdateDelete",
+		StickyTTLNs:            int64(time.Hour),
+		RegexFilters:           []string{},
+		RegionFilters:          []string{},
+		ReverseProxyMissAction: "TREAT_AS_EMPTY",
+		AllocationPolicy:       "BALANCED",
+		UpdatedAtNs:            time.Now().UnixNano(),
+	}
+	tests := []struct {
+		name   string
+		mutate func(context.Context, *StateRepo, model.Platform) error
+		check  func(*testing.T, *StateRepo, model.Platform)
+	}{
+		{
+			name: "update",
+			mutate: func(ctx context.Context, repo *StateRepo, p model.Platform) error {
+				p.StickyTTLNs = int64(2 * time.Hour)
+				return repo.UpsertPlatformContextAndCommit(ctx, p)
+			},
+			check: func(t *testing.T, repo *StateRepo, p model.Platform) {
+				got, err := repo.GetPlatform(p.ID)
+				if err != nil {
+					t.Fatalf("GetPlatform: %v", err)
+				}
+				if got.StickyTTLNs != int64(2*time.Hour) {
+					t.Fatalf("updated sticky TTL = %d, want %d", got.StickyTTLNs, 2*time.Hour)
+				}
+			},
+		},
+		{
+			name: "delete",
+			mutate: func(ctx context.Context, repo *StateRepo, p model.Platform) error {
+				return repo.DeletePlatformContextAndCommit(ctx, p.ID)
+			},
+			check: func(t *testing.T, repo *StateRepo, p model.Platform) {
+				if _, err := repo.GetPlatform(p.ID); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("GetPlatform after delete = %v, want ErrNotFound", err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newTestStateRepo(t)
+			if err := repo.UpsertPlatform(base); err != nil {
+				t.Fatalf("seed platform: %v", err)
+			}
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var enteredOnce sync.Once
+			repo.afterPlatformWriteBeginHook = func() {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- tc.mutate(ctx, repo, base) }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				close(release)
+				t.Fatal("platform mutation did not acquire SQLite IMMEDIATE transaction")
+			}
+			cancel()
+			close(release)
+			if err := <-result; err != nil {
+				t.Fatalf("%s canceled after BEGIN IMMEDIATE: %v", tc.name, err)
+			}
+			tc.check(t, repo, base)
+		})
+	}
+}
+
 func TestStateRepo_InsertPlatformRejectsDuplicateIDWithoutOverwrite(t *testing.T) {
 	repo := newTestStateRepo(t)
 	original := model.Platform{

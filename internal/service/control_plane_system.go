@@ -310,6 +310,11 @@ type ControlPlaneService struct {
 	// is handed to Router. Production leaves it nil.
 	beforeLeaseInheritanceRouterCallHook func()
 
+	// beforeLeaseMutationAdmissionHook is a package-test seam immediately
+	// before a lease deletion enters state-write admission. Production leaves
+	// it nil.
+	beforeLeaseMutationAdmissionHook func()
+
 	// beforePlatformRebuildHook is a package-test seam immediately before the
 	// platform view rebuild. Production leaves it nil.
 	beforePlatformRebuildHook func()
@@ -341,6 +346,12 @@ type ControlPlaneService struct {
 	// afterPlatformPersistHook is a package-test seam after the platform row is
 	// persisted and before the runtime pool publish. Production leaves it nil.
 	afterPlatformPersistHook func()
+
+	// beforePlatformRuntimeAdmissionHook marks the point at which a platform
+	// mutation is about to acquire the pool's exclusive publication owner.
+	// In production this is nil; tests use it to distinguish pre-DB admission
+	// cancellation from the post-persist commit boundary.
+	beforePlatformRuntimeAdmissionHook func()
 
 	// afterPlatformUnregisterHook is a package-test seam after a platform is
 	// removed from the runtime pool and before its Router state is removed.

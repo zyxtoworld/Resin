@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,44 @@ func TestTokenActionInheritLease_Success(t *testing.T) {
 	}
 	if child.ExpiryNs != parent.ExpiryNs {
 		t.Fatalf("child expiry_ns: got %d, want %d", child.ExpiryNs, parent.ExpiryNs)
+	}
+}
+
+func TestTokenActionInheritLease_DoesNotMutateAfterRequestCancellation(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformName := "token-lease-canceled"
+	platformID := mustCreatePlatform(t, srv, platformName)
+	nowNs := time.Now().UnixNano()
+	parent := model.Lease{
+		PlatformID:     platformID,
+		Account:        "cancel-parent",
+		NodeHash:       node.HashFromRawOptions([]byte(`{"id":"cancel-parent-node"}`)).Hex(),
+		EgressIP:       "203.0.113.11",
+		CreatedAtNs:    nowNs - int64(time.Minute),
+		ExpiryNs:       nowNs + int64(time.Hour),
+		LastAccessedNs: nowNs,
+	}
+	if err := cp.Router.UpsertLease(parent); err != nil {
+		t.Fatalf("seed parent lease: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	body := bytes.NewBufferString(`{"parent_account":"cancel-parent","new_account":"cancel-child"}`)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/tok/api/v1/"+platformName+"/actions/inherit-lease",
+		body,
+	).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewTokenActionHandler("tok", cp, 1<<20).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("canceled request was reported successful: body=%s", rec.Body.String())
+	}
+	if child := cp.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: "cancel-child"}); child != nil {
+		t.Fatalf("canceled request created child lease: %#v", child)
 	}
 }
 

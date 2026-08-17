@@ -27,14 +27,22 @@ type LeaseResponse struct {
 	LastAccessed string `json:"last_accessed"`
 }
 
-// withLeaseMutation keeps the state-write admission open through a control
-// plane lease mutation and its synchronous Router lease event. Test-only
-// services without persistence keep the existing in-memory behavior.
-func (s *ControlPlaneService) withLeaseMutation(fn func() error) error {
-	if s.Engine == nil {
-		return fn()
+// withLeaseMutationContext keeps the state-write admission open through a
+// control-plane lease mutation and its synchronous Router lease event.
+// Test-only services without persistence keep the existing in-memory behavior.
+func (s *ControlPlaneService) withLeaseMutationContext(ctx context.Context, fn func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if err := s.Engine.WithStateWriteAdmission(fn); err != nil {
+	if s.Engine == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn(context.Background())
+	}
+	if err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(_, commitCtx context.Context) error {
+		return fn(commitCtx)
+	}); err != nil {
 		if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
 			return internal("lease mutation", err)
 		}
@@ -150,10 +158,27 @@ func (s *ControlPlaneService) InheritLeaseByPlatformName(platformName, parentAcc
 	return s.inheritLeaseByPlatformNameAt(platformName, parentAccount, newAccount, time.Now())
 }
 
+// InheritLeaseByPlatformNameContext is the request-aware form of
+// InheritLeaseByPlatformName.
+func (s *ControlPlaneService) InheritLeaseByPlatformNameContext(ctx context.Context, platformName, parentAccount, newAccount string) error {
+	return s.inheritLeaseByPlatformNameContextAt(ctx, platformName, parentAccount, newAccount, time.Now())
+}
+
 func (s *ControlPlaneService) inheritLeaseByPlatformNameAt(
 	platformName, parentAccount, newAccount string,
 	now time.Time,
 ) error {
+	return s.inheritLeaseByPlatformNameContextAt(context.Background(), platformName, parentAccount, newAccount, now)
+}
+
+func (s *ControlPlaneService) inheritLeaseByPlatformNameContextAt(
+	ctx context.Context,
+	platformName, parentAccount, newAccount string,
+	now time.Time,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	platformName = strings.TrimSpace(platformName)
 	if platformName == "" {
 		return invalidArg("platform: must be non-empty")
@@ -170,8 +195,10 @@ func (s *ControlPlaneService) inheritLeaseByPlatformNameAt(
 		return invalidArg("new_account: must differ from parent_account")
 	}
 
-	s.platformMu.Lock()
-	defer s.platformMu.Unlock()
+	if err := s.platformMu.lockContext(ctx); err != nil {
+		return err
+	}
+	defer s.platformMu.unlock()
 
 	plat, ok := s.Pool.GetPlatformByName(platformName)
 	if !ok || plat == nil {
@@ -182,7 +209,7 @@ func (s *ControlPlaneService) inheritLeaseByPlatformNameAt(
 		hook()
 	}
 
-	if err := s.withLeaseMutation(func() error {
+	if err := s.withLeaseMutationContext(ctx, func(context.Context) error {
 		if err := s.Router.InheritLeaseForPlatformExact(plat, parentAccount, newAccount, now); err != nil {
 			switch {
 			case errors.Is(err, routing.ErrPlatformNotFound):
@@ -203,7 +230,17 @@ func (s *ControlPlaneService) inheritLeaseByPlatformNameAt(
 
 // DeleteLease removes a single lease.
 func (s *ControlPlaneService) DeleteLease(platformID, account string) error {
-	return s.withLeaseMutation(func() error {
+	return s.DeleteLeaseContext(context.Background(), platformID, account)
+}
+
+// DeleteLeaseContext removes one lease while honoring cancellation before the
+// state-write mutation is admitted. Once admitted, the existing commit owner
+// keeps the Router mutation and synchronous lease event together.
+func (s *ControlPlaneService) DeleteLeaseContext(ctx context.Context, platformID, account string) error {
+	if hook := s.beforeLeaseMutationAdmissionHook; hook != nil {
+		hook()
+	}
+	return s.withLeaseMutationContext(ctx, func(context.Context) error {
 		deleted, exists := s.Router.DeleteLeaseForPlatform(platformID, account)
 		if !exists {
 			return notFound("platform not found")
@@ -217,7 +254,13 @@ func (s *ControlPlaneService) DeleteLease(platformID, account string) error {
 
 // DeleteAllLeases removes all leases for a platform.
 func (s *ControlPlaneService) DeleteAllLeases(platformID string) error {
-	return s.withLeaseMutation(func() error {
+	return s.DeleteAllLeasesContext(context.Background(), platformID)
+}
+
+// DeleteAllLeasesContext removes all leases for a platform while honoring
+// cancellation before the state-write mutation is admitted.
+func (s *ControlPlaneService) DeleteAllLeasesContext(ctx context.Context, platformID string) error {
+	return s.withLeaseMutationContext(ctx, func(context.Context) error {
 		_, exists := s.Router.DeleteAllLeasesForPlatform(platformID)
 		if !exists {
 			return notFound("platform not found")

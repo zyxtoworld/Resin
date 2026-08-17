@@ -141,7 +141,7 @@ func HandleDeleteLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeServiceError(w, err)
 			return
 		}
-		if err := cp.DeleteLease(platformID, account); err != nil {
+		if err := cp.DeleteLeaseContext(r.Context(), platformID, account); err != nil {
 			writeServiceError(w, err)
 			return
 		}
@@ -156,7 +156,7 @@ func HandleDeleteAllLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if err := cp.DeleteAllLeases(platformID); err != nil {
+		if err := cp.DeleteAllLeasesContext(r.Context(), platformID); err != nil {
 			writeServiceError(w, err)
 			return
 		}

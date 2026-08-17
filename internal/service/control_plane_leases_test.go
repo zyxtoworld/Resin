@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/netip"
@@ -255,6 +256,98 @@ func TestInheritLeaseByPlatformName_Success(t *testing.T) {
 	}
 	if child.LastAccessedNs != parent.LastAccessedNs {
 		t.Fatalf("child last_accessed_ns: got %d, want %d", child.LastAccessedNs, parent.LastAccessedNs)
+	}
+}
+
+func TestInheritLeaseByPlatformNameContext_CancelAfterPlatformResolutionDoesNotMutate(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	now := time.Now().UnixNano()
+	seedLease(t, cp, model.Lease{
+		PlatformID:     plat.ID,
+		Account:        "cancel-parent",
+		NodeHash:       node.HashFromRawOptions([]byte(`{"id":"cancel-parent-node"}`)).Hex(),
+		EgressIP:       "203.0.113.12",
+		CreatedAtNs:    now - int64(time.Minute),
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cp.beforeLeaseInheritanceRouterCallHook = func() {
+		close(entered)
+		<-release
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- cp.InheritLeaseByPlatformNameContext(ctx, plat.Name, "cancel-parent", "cancel-child")
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("inherit lease did not reach the post-resolution barrier")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("inherit lease error: got %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("inherit lease did not finish after barrier release")
+	}
+	if child := cp.Router.ReadLease(model.LeaseKey{PlatformID: plat.ID, Account: "cancel-child"}); child != nil {
+		t.Fatalf("canceled inherit created child lease: %#v", child)
+	}
+}
+
+func TestDeleteLeaseContext_CancelBeforeCommitAdmissionDoesNotMutate(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	now := time.Now().UnixNano()
+	seedLease(t, cp, model.Lease{
+		PlatformID:     plat.ID,
+		Account:        "delete-cancel-account",
+		NodeHash:       node.HashFromRawOptions([]byte(`{"id":"delete-cancel-node"}`)).Hex(),
+		EgressIP:       "203.0.113.13",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cp.beforeLeaseMutationAdmissionHook = func() {
+		close(entered)
+		<-release
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- cp.DeleteLeaseContext(ctx, plat.ID, "delete-cancel-account")
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("delete lease did not reach the admission boundary")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("delete lease error: got %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delete lease did not finish after admission barrier release")
+	}
+	if lease := cp.Router.ReadLease(model.LeaseKey{PlatformID: plat.ID, Account: "delete-cancel-account"}); lease == nil {
+		t.Fatal("canceled delete lease mutation removed the lease")
 	}
 }
 

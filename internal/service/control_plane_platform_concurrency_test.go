@@ -97,6 +97,185 @@ func TestPlatformMutationHoldsStateWriteAdmissionThroughRuntimePublish(t *testin
 	}
 }
 
+func TestUpdatePlatformContextCancellationDoesNotWaitForBusyPoolWriter(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+	name := "busy-pool-writer-platform"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("seed CreatePlatform: %v", err)
+	}
+
+	ownerEntered := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	ownerDone := make(chan error, 1)
+	go func() {
+		ownerDone <- pool.WithPlatformMutationContext(context.Background(), func(topology.PlatformMutation) error {
+			close(ownerEntered)
+			<-releaseOwner
+			return nil
+		})
+	}()
+	select {
+	case <-ownerEntered:
+	case <-time.After(time.Second):
+		close(releaseOwner)
+		t.Fatal("platform mutation owner did not become busy")
+	}
+
+	admissionAttempted := make(chan struct{})
+	releaseAdmissionHook := make(chan struct{})
+	var admissionOnce sync.Once
+	cp.beforePlatformRuntimeAdmissionHook = func() {
+		admissionOnce.Do(func() { close(admissionAttempted) })
+		<-releaseAdmissionHook
+	}
+	persisted := make(chan struct{})
+	var persistOnce sync.Once
+	cp.afterPlatformPersistHook = func() {
+		persistOnce.Do(func() { close(persisted) })
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := cp.UpdatePlatformContext(requestCtx, created.ID, []byte(`{"sticky_ttl":"2h"}`))
+		updateDone <- updateErr
+	}()
+	select {
+	case <-admissionAttempted:
+	case <-time.After(time.Second):
+		close(releaseAdmissionHook)
+		close(releaseOwner)
+		t.Fatal("UpdatePlatformContext did not attempt platform mutation admission")
+	}
+
+	cancel()
+	close(releaseAdmissionHook)
+	select {
+	case updateErr := <-updateDone:
+		if !errors.Is(updateErr, context.Canceled) {
+			t.Fatalf("UpdatePlatformContext error = %v, want context.Canceled", updateErr)
+		}
+	case <-time.After(time.Second):
+		close(releaseOwner)
+		if err := <-ownerDone; err != nil {
+			t.Fatalf("platform mutation owner after release: %v", err)
+		}
+		t.Fatal("canceled UpdatePlatformContext waited for the busy platform mutation owner")
+	}
+
+	select {
+	case <-persisted:
+		t.Fatal("canceled UpdatePlatformContext crossed the DB persistence boundary")
+	default:
+	}
+
+	close(releaseOwner)
+	if err := <-ownerDone; err != nil {
+		t.Fatalf("platform mutation owner: %v", err)
+	}
+	updated, err := engine.GetPlatform(created.ID)
+	if err != nil {
+		t.Fatalf("GetPlatform after canceled update: %v", err)
+	}
+	if updated.StickyTTLNs != int64(time.Hour) {
+		t.Fatalf("canceled update changed persisted sticky_ttl to %d", updated.StickyTTLNs)
+	}
+}
+
+func TestCreatePlatformContextCancellationAfterPersistCompletesRuntimePublish(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	cp := &ControlPlaneService{
+		Engine: engine,
+		Pool:   pool,
+		EnvCfg: &config.EnvConfig{
+			DefaultPlatformStickyTTL:                        time.Hour,
+			DefaultPlatformReverseProxyMissAction:           string(platform.ReverseProxyMissActionTreatAsEmpty),
+			DefaultPlatformReverseProxyEmptyAccountBehavior: string(platform.ReverseProxyEmptyAccountBehaviorRandom),
+			DefaultPlatformAllocationPolicy:                 string(platform.AllocationPolicyBalanced),
+		},
+	}
+
+	persisted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	var persistOnce sync.Once
+	cp.afterPlatformPersistHook = func() {
+		persistOnce.Do(func() { close(persisted) })
+		<-releasePersist
+	}
+
+	name := "post-persist-cancel-platform"
+	requestCtx, cancel := context.WithCancel(context.Background())
+	createDone := make(chan error, 1)
+	go func() {
+		_, createErr := cp.CreatePlatformContext(requestCtx, CreatePlatformRequest{Name: &name})
+		createDone <- createErr
+	}()
+	select {
+	case <-persisted:
+	case <-time.After(time.Second):
+		close(releasePersist)
+		t.Fatal("CreatePlatformContext did not reach the post-persist boundary")
+	}
+
+	cancel()
+	close(releasePersist)
+	select {
+	case createErr := <-createDone:
+		if createErr != nil {
+			t.Fatalf("CreatePlatformContext after post-persist cancellation: %v", createErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-persist platform mutation did not finish after releasing the commit hook")
+	}
+	if _, ok := pool.GetPlatformByName(name); !ok {
+		t.Fatal("post-persist cancellation left the platform absent from the runtime pool")
+	}
+	platforms, err := engine.ListPlatforms()
+	if err != nil {
+		t.Fatalf("ListPlatforms: %v", err)
+	}
+	if len(platforms) != 1 || platforms[0].Name != name {
+		t.Fatalf("persisted platforms after post-persist cancellation = %+v", platforms)
+	}
+}
+
 func TestUpdatePlatformContext_WithLiveRequestContextReturnsSuccess(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(
@@ -911,7 +1090,7 @@ func TestCreatePlatform_RuntimeOrphanNameConflictDoesNotCommitOrOverwriteRuntime
 	}
 }
 
-func TestCreatePlatform_RuntimePublishFailureRollsBackPersistedRow(t *testing.T) {
+func TestCreatePlatform_OwnerClosesPostPersistConflictWindow(t *testing.T) {
 	engine, closer, err := state.PersistenceBootstrap(t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("PersistenceBootstrap: %v", err)
@@ -952,24 +1131,39 @@ func TestCreatePlatform_RuntimePublishFailureRollsBackPersistedRow(t *testing.T)
 	}
 
 	lateRuntime := platform.NewPlatform("late-runtime-platform", name, nil, nil)
-	if err := pool.RegisterPlatform(lateRuntime); err != nil {
-		t.Fatalf("late runtime registration: %v", err)
+	lateStarted := make(chan struct{})
+	lateProceed := make(chan struct{})
+	lateDone := make(chan error, 1)
+	go func() {
+		close(lateStarted)
+		<-lateProceed
+		lateDone <- pool.RegisterPlatform(lateRuntime)
+	}()
+	<-lateStarted
+	close(lateProceed)
+	select {
+	case err := <-lateDone:
+		t.Fatalf("late runtime registration completed before Create released its owner: %v", err)
+	default:
 	}
 	close(allowPublish)
 
-	if err := <-createDone; err == nil {
-		t.Fatal("CreatePlatform unexpectedly succeeded after runtime publish conflict")
+	if err := <-createDone; err != nil {
+		t.Fatalf("CreatePlatform: %v", err)
+	}
+	if err := <-lateDone; !errors.Is(err, topology.ErrPlatformNameConflict) {
+		t.Fatalf("late runtime registration error = %v, want ErrPlatformNameConflict", err)
 	}
 	platforms, err := engine.ListPlatforms()
 	if err != nil {
 		t.Fatalf("ListPlatforms: %v", err)
 	}
-	if len(platforms) != 0 {
-		t.Fatalf("runtime publish failure left %d persisted platform rows: %+v", len(platforms), platforms)
+	if len(platforms) != 1 || platforms[0].Name != name {
+		t.Fatalf("persisted platforms after serialized registration = %+v", platforms)
 	}
 	got, ok := pool.GetPlatformByName(name)
-	if !ok || got != lateRuntime {
-		t.Fatalf("late runtime mapping changed: got=%p want=%p", got, lateRuntime)
+	if !ok || got == lateRuntime || got.Name != name {
+		t.Fatalf("late runtime registration changed mapping: got=%p", got)
 	}
 }
 

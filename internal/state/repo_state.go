@@ -36,6 +36,10 @@ type StateRepo struct {
 	// the serialized repository write owner is acquired. Production leaves it
 	// nil.
 	beforeWriteMutexHook func()
+	// afterPlatformWriteBeginHook is package-private coordination after a
+	// platform write has acquired SQLite's IMMEDIATE transaction. Production
+	// leaves it nil.
+	afterPlatformWriteBeginHook func()
 }
 
 // newStateRepo creates a StateRepo for the given state.db connection.
@@ -156,6 +160,77 @@ func (r *StateRepo) lockWriteContext(ctx context.Context) (func(), error) {
 		_, _ = r.db.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
 		r.mu.Unlock()
 	}, nil
+}
+
+// withPlatformCommitTx separates SQLite write-owner admission from the
+// irreversible platform transaction. parent is honored while the repository
+// mutex and BEGIN IMMEDIATE wait for the SQLite writer slot. Once BEGIN
+// IMMEDIATE succeeds, fn and COMMIT use the shutdown-owned commit context so
+// a client disconnect cannot leave the database row committed without the
+// matching runtime publication.
+func (r *StateRepo) withPlatformCommitTx(
+	parent context.Context,
+	fn func(context.Context, *sql.Conn) error,
+) error {
+	if r == nil {
+		return ErrStateWriteAdmissionClosed
+	}
+	return r.withWriteContextAndCommit(parent, func(writeCtx, commitCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
+		if err := r.mu.lockContext(writeCtx); err != nil {
+			return err
+		}
+		defer r.mu.Unlock()
+
+		conn, err := r.db.Conn(writeCtx)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+			_ = conn.Close()
+		}()
+
+		busyTimeoutMs, err := SQLiteBusyTimeoutMs(writeCtx)
+		if err != nil {
+			return err
+		}
+		if isContextSQLiteWrite(writeCtx) && busyTimeoutMs > contextSQLiteBusyTimeoutMs {
+			busyTimeoutMs = contextSQLiteBusyTimeoutMs
+		}
+		if _, err := conn.ExecContext(writeCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+			return err
+		}
+		rollback := true
+		defer func() {
+			if rollback {
+				// BEGIN IMMEDIATE is raw SQL rather than database/sql.Tx. If
+				// its context-aware call returns after acquiring the writer,
+				// the connection still needs an explicit rollback before it
+				// can return to the pool.
+				_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			}
+		}()
+		if _, err := conn.ExecContext(writeCtx, "BEGIN IMMEDIATE"); err != nil {
+			return err
+		}
+		if hook := r.afterPlatformWriteBeginHook; hook != nil {
+			hook()
+		}
+
+		if fn != nil {
+			if err := fn(commitCtx, conn); err != nil {
+				return err
+			}
+		}
+		if _, err := conn.ExecContext(commitCtx, "COMMIT"); err != nil {
+			return err
+		}
+		rollback = false
+		return nil
+	})
 }
 
 // CloseStateWriteAdmissionAndWait rejects new strong writes, cancels writes
@@ -422,6 +497,25 @@ func (r *StateRepo) UpsertPlatformContext(ctx context.Context, p model.Platform)
 	})
 }
 
+// UpsertPlatformContextAndCommit persists a platform after a cancelable
+// SQLite writer admission, then commits with the shutdown-owned context.
+func (r *StateRepo) UpsertPlatformContextAndCommit(ctx context.Context, p model.Platform) error {
+	p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON, err := preparePlatformPersistence(p)
+	if err != nil {
+		return err
+	}
+	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(commitCtx, platformUpsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		if err != nil {
+			if isSQLiteUniqueConstraint(err) {
+				return fmt.Errorf("%w: platform name already exists", ErrConflict)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
 // InsertPlatform persists a new platform and rejects both duplicate IDs and
 // duplicate names. Create paths must use this strict operation; UpsertPlatform
 // is reserved for updates and bootstrap reconciliation.
@@ -444,6 +538,25 @@ func (r *StateRepo) InsertPlatformContext(ctx context.Context, p model.Platform)
 		defer unlock()
 
 		_, err = r.db.ExecContext(ctx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		if err != nil {
+			if isSQLitePlatformConflict(err) {
+				return fmt.Errorf("%w: platform ID or name already exists", ErrConflict)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// InsertPlatformContextAndCommit persists a platform after a cancelable
+// SQLite writer admission, then commits with the shutdown-owned context.
+func (r *StateRepo) InsertPlatformContextAndCommit(ctx context.Context, p model.Platform) error {
+	p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON, err := preparePlatformPersistence(p)
+	if err != nil {
+		return err
+	}
+	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(commitCtx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
 		if err != nil {
 			if isSQLitePlatformConflict(err) {
 				return fmt.Errorf("%w: platform ID or name already exists", ErrConflict)
@@ -498,6 +611,22 @@ func (r *StateRepo) DeletePlatformContext(ctx context.Context, id string) error 
 		defer unlock()
 
 		result, err := r.db.ExecContext(ctx, "DELETE FROM platforms WHERE id = ?", id)
+		if err != nil {
+			return err
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// DeletePlatformContextAndCommit deletes a platform after a cancelable
+// SQLite writer admission, then commits with the shutdown-owned context.
+func (r *StateRepo) DeletePlatformContextAndCommit(ctx context.Context, id string) error {
+	return r.withPlatformCommitTx(ctx, func(commitCtx context.Context, conn *sql.Conn) error {
+		result, err := conn.ExecContext(commitCtx, "DELETE FROM platforms WHERE id = ?", id)
 		if err != nil {
 			return err
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/state"
+	"github.com/Resinat/Resin/internal/topology"
 )
 
 // ------------------------------------------------------------------
@@ -346,72 +347,88 @@ func (s *ControlPlaneService) compileAndInsertPlatform(id string, cfg platformCo
 }
 
 func (s *ControlPlaneService) compileAndUpsertPlatformContext(ctx context.Context, id string, cfg platformConfig) (model.Platform, *platform.Platform, *ServiceError) {
-	return s.compileAndPersistPlatform(ctx, id, cfg, s.Engine.UpsertPlatformContext)
+	return s.compileAndPersistPlatform(ctx, id, cfg, s.Engine.UpsertPlatformContextAndCommit)
 }
 
 func (s *ControlPlaneService) compileAndInsertPlatformContext(ctx context.Context, id string, cfg platformConfig) (model.Platform, *platform.Platform, *ServiceError) {
-	return s.compileAndPersistPlatform(ctx, id, cfg, s.Engine.InsertPlatformContext)
+	return s.compileAndPersistPlatform(ctx, id, cfg, s.Engine.InsertPlatformContextAndCommit)
 }
 
-// validateRuntimePlatformReplacement checks every failure that
-// Pool.ReplacePlatform can report before the strong-persist write. Platform
-// mutations are serialized by platformMu, so the service-owned runtime map
-// cannot change between this check and the publish below.
-func (s *ControlPlaneService) validateRuntimePlatformReplacement(id, name string) *ServiceError {
-	if s.Pool == nil {
-		return internal("platform runtime unavailable", errors.New("platform pool is nil"))
+// validateRuntimePlatformReplacement checks every failure that a runtime
+// replacement can report while the caller already owns the pool publication
+// capability. Keeping the check inside that capability closes the preflight→
+// DB→publish TOCTOU window.
+func validateRuntimePlatformReplacement(mutation topology.PlatformMutation, id, name string) *ServiceError {
+	if mutation == nil {
+		return internal("platform runtime unavailable", errors.New("platform mutation owner is nil"))
 	}
-	if _, ok := s.Pool.GetPlatform(id); !ok {
-		return internal("platform runtime unavailable", errors.New("platform is not registered in the runtime pool"))
-	}
-	if existing, ok := s.Pool.GetPlatformByName(name); ok && existing != nil && existing.ID != id {
+	switch err := mutation.ValidatePlatformReplacement(id, name); {
+	case err == nil:
+		return nil
+	case errors.Is(err, topology.ErrPlatformNameConflict):
 		return conflict("platform name already exists")
+	case errors.Is(err, topology.ErrPlatformNotRegistered):
+		return internal("platform runtime unavailable", errors.New("platform is not registered in the runtime pool"))
+	default:
+		return internal("platform runtime unavailable", err)
 	}
-	return nil
 }
 
 // validateRuntimePlatformRegistration checks every failure that a new
-// runtime registration can report before the strong-persist write. The caller
-// must hold platformMu so the service mutation and this runtime preflight are
-// one serialized transaction from the control plane's point of view.
-func (s *ControlPlaneService) validateRuntimePlatformRegistration(id, name string) *ServiceError {
-	if s.Pool == nil {
-		return internal("platform runtime unavailable", errors.New("platform pool is nil"))
+// runtime registration can report while the caller owns the same pool
+// publication capability that will perform the registration.
+func validateRuntimePlatformRegistration(mutation topology.PlatformMutation, id, name string) *ServiceError {
+	if mutation == nil {
+		return internal("platform runtime unavailable", errors.New("platform mutation owner is nil"))
 	}
-	if _, ok := s.Pool.GetPlatform(id); ok {
+	switch err := mutation.ValidatePlatformRegistration(id, name); {
+	case err == nil:
+		return nil
+	case errors.Is(err, topology.ErrPlatformAlreadyRegistered):
 		return conflict("platform runtime already exists")
-	}
-	if existing, ok := s.Pool.GetPlatformByName(name); ok && existing != nil {
+	case errors.Is(err, topology.ErrPlatformNameConflict):
 		return conflict("platform name already exists")
+	default:
+		return internal("platform runtime unavailable", err)
 	}
-	return nil
 }
 
-// withPlatformMutationAdmission keeps the strong-persist admission alive
-// through the corresponding runtime publish. Shutdown must not observe an
-// apparently idle state database while the same control-plane mutation can
-// still register or replace its platform in the pool.
-func (s *ControlPlaneService) withPlatformMutationAdmission(fn func() *ServiceError) *ServiceError {
-	return s.withPlatformMutationAdmissionContext(context.Background(), func(context.Context) *ServiceError {
+// withPlatformMutationAdmission keeps the pool publication owner and strong
+// state-write admission together. Request cancellation can abandon the pool
+// owner before any DB write; once both owners are admitted, commitCtx carries
+// the complete DB→pool publication transaction past client disconnects.
+func (s *ControlPlaneService) withPlatformMutationAdmission(fn func(topology.PlatformMutation) *ServiceError) *ServiceError {
+	return s.withPlatformMutationAdmissionContext(context.Background(), func(_, _ context.Context, mutation topology.PlatformMutation) *ServiceError {
 		if fn == nil {
 			return nil
 		}
-		return fn()
+		return fn(mutation)
 	})
 }
 
-func (s *ControlPlaneService) withPlatformMutationAdmissionContext(ctx context.Context, fn func(context.Context) *ServiceError) *ServiceError {
+func (s *ControlPlaneService) withPlatformMutationAdmissionContext(
+	ctx context.Context,
+	fn func(context.Context, context.Context, topology.PlatformMutation) *ServiceError,
+) *ServiceError {
 	if s == nil || s.Engine == nil {
 		return internal("platform persistence unavailable", errors.New("state engine is nil"))
 	}
-	err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
-		if fn == nil {
+	if s.Pool == nil {
+		return internal("platform runtime unavailable", errors.New("platform pool is nil"))
+	}
+	if hook := s.beforePlatformRuntimeAdmissionHook; hook != nil {
+		hook()
+	}
+	err := s.Pool.WithPlatformMutationContext(ctx, func(mutation topology.PlatformMutation) error {
+		return s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, commitCtx context.Context) error {
+			if fn == nil {
+				return nil
+			}
+			if serviceErr := fn(writeCtx, commitCtx, mutation); serviceErr != nil {
+				return serviceErr
+			}
 			return nil
-		}
-		if serviceErr := fn(writeCtx); serviceErr != nil {
-			return serviceErr
-		}
-		return nil
+		})
 	})
 	if err == nil {
 		return nil
@@ -601,12 +618,12 @@ func (s *ControlPlaneService) CreatePlatformContext(ctx context.Context, req Cre
 	}
 
 	id := uuid.New().String()
-	if err := s.validateRuntimePlatformRegistration(id, cfg.Name); err != nil {
-		return nil, err
-	}
 	var mp model.Platform
 	var plat *platform.Platform
-	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx context.Context) *ServiceError {
+	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx, _ context.Context, mutation topology.PlatformMutation) *ServiceError {
+		if err := validateRuntimePlatformRegistration(mutation, id, cfg.Name); err != nil {
+			return err
+		}
 		var err *ServiceError
 		mp, plat, err = s.compileAndInsertPlatformContext(writeCtx, id, cfg)
 		if err != nil {
@@ -615,7 +632,7 @@ func (s *ControlPlaneService) CreatePlatformContext(ctx context.Context, req Cre
 
 		// Register in topology pool; registration rebuilds and publishes the
 		// view under the pool's platform mutation lock.
-		if err := s.Pool.RegisterPlatform(plat); err != nil {
+		if err := mutation.RegisterPlatform(plat); err != nil {
 			// The database write has already committed. Rollback must not be
 			// canceled with the request, or a runtime publish failure could
 			// leave a persisted platform with no runtime owner.
@@ -751,13 +768,12 @@ func (s *ControlPlaneService) UpdatePlatformContext(ctx context.Context, id stri
 	if err := validatePlatformConfig(&cfg, regionFiltersPatched); err != nil {
 		return nil, err
 	}
-	if err := s.validateRuntimePlatformReplacement(id, cfg.Name); err != nil {
-		return nil, err
-	}
-
 	var mp model.Platform
 	var plat *platform.Platform
-	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx context.Context) *ServiceError {
+	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx, _ context.Context, mutation topology.PlatformMutation) *ServiceError {
+		if err := validateRuntimePlatformReplacement(mutation, id, cfg.Name); err != nil {
+			return err
+		}
 		var err *ServiceError
 		mp, plat, err = s.compileAndUpsertPlatformContext(writeCtx, id, cfg)
 		if err != nil {
@@ -765,7 +781,7 @@ func (s *ControlPlaneService) UpdatePlatformContext(ctx context.Context, id stri
 		}
 
 		// Replace in topology pool.
-		if err := s.Pool.ReplacePlatform(plat); err != nil {
+		if err := mutation.ReplacePlatform(plat); err != nil {
 			return internal("replace platform in pool", err)
 		}
 		return nil
@@ -804,34 +820,45 @@ func (s *ControlPlaneService) DeletePlatformContext(ctx context.Context, id stri
 	if id == platform.DefaultPlatformID {
 		return conflict("cannot delete Default platform")
 	}
-	if _, ok := s.Pool.GetPlatform(id); !ok {
-		if _, err := s.getPlatformNameContext(ctx, id); err != nil {
-			if errors.Is(err, state.ErrNotFound) {
-				return notFound("platform not found")
-			}
-			return internal("get platform", err)
-		}
-		return internal(
-			"platform runtime unavailable",
-			errors.New("platform is not registered in the runtime pool"),
-		)
+	if hook := s.beforePlatformRuntimeAdmissionHook; hook != nil {
+		hook()
 	}
-
-	if err := s.Engine.WithStateWriteAdmissionContext(ctx, func(writeCtx context.Context) error {
-		if err := s.Engine.DeletePlatformContext(writeCtx, id); err != nil {
-			if errors.Is(err, state.ErrNotFound) {
-				return notFound("platform not found")
+	err := s.Pool.WithPlatformMutationContext(ctx, func(mutation topology.PlatformMutation) error {
+		if err := mutation.ValidatePlatformReplacement(id, ""); err != nil {
+			if errors.Is(err, topology.ErrPlatformNotRegistered) {
+				if _, nameErr := s.getPlatformNameContext(ctx, id); nameErr != nil {
+					if errors.Is(nameErr, state.ErrNotFound) {
+						return notFound("platform not found")
+					}
+					return internal("get platform", nameErr)
+				}
+				return internal(
+					"platform runtime unavailable",
+					errors.New("platform is not registered in the runtime pool"),
+				)
 			}
-			return internal("delete platform", err)
+			return internal("platform runtime unavailable", err)
 		}
-		s.Pool.UnregisterPlatform(id)
-		if s.afterPlatformUnregisterHook != nil {
-			s.afterPlatformUnregisterHook()
-		}
-		s.Router.RemovePlatformState(id)
-		s.Router.WaitForLeaseEvents()
-		return nil
-	}); err != nil {
+
+		return s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
+			if err := s.Engine.DeletePlatformContextAndCommit(writeCtx, id); err != nil {
+				if errors.Is(err, state.ErrNotFound) {
+					return notFound("platform not found")
+				}
+				return internal("delete platform", err)
+			}
+			if err := mutation.UnregisterPlatform(id); err != nil {
+				return internal("unregister platform in pool", err)
+			}
+			if s.afterPlatformUnregisterHook != nil {
+				s.afterPlatformUnregisterHook()
+			}
+			s.Router.RemovePlatformState(id)
+			s.Router.WaitForLeaseEvents()
+			return nil
+		})
+	})
+	if err != nil {
 		if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
 			return internal("delete platform", err)
 		}
@@ -865,19 +892,19 @@ func (s *ControlPlaneService) ResetPlatformToDefaultContext(ctx context.Context,
 	if err := platform.ValidatePlatformName(cfg.Name); err != nil {
 		return nil, invalidArg("name: " + err.Error())
 	}
-	if err := s.validateRuntimePlatformReplacement(id, cfg.Name); err != nil {
-		return nil, err
-	}
 	var mp model.Platform
 	var plat *platform.Platform
-	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx context.Context) *ServiceError {
+	if svcErr := s.withPlatformMutationAdmissionContext(ctx, func(writeCtx, _ context.Context, mutation topology.PlatformMutation) *ServiceError {
+		if err := validateRuntimePlatformReplacement(mutation, id, cfg.Name); err != nil {
+			return err
+		}
 		var err *ServiceError
 		mp, plat, err = s.compileAndUpsertPlatformContext(writeCtx, id, cfg)
 		if err != nil {
 			return err
 		}
 
-		if err := s.Pool.ReplacePlatform(plat); err != nil {
+		if err := mutation.ReplacePlatform(plat); err != nil {
 			return internal("replace platform in pool", err)
 		}
 		return nil
@@ -907,7 +934,12 @@ func (s *ControlPlaneService) RebuildPlatformViewContext(ctx context.Context, id
 			rebuildErr = notFound("platform not found")
 			return
 		}
-		if !s.Pool.RebuildPlatformIfCurrent(id, plat) {
+		rebuilt, err := s.Pool.RebuildPlatformIfCurrentContext(ctx, id, plat)
+		if err != nil {
+			rebuildErr = err
+			return
+		}
+		if !rebuilt {
 			rebuildErr = notFound("platform not found")
 		}
 	}); err != nil {

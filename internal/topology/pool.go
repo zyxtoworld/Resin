@@ -39,10 +39,15 @@ type GlobalNodePool struct {
 	nodeLifecycleMu sync.Mutex
 
 	// Platform references for dirty-notify.
-	platMu         sync.RWMutex
-	platformByID   map[string]*platform.Platform // id -> platform
-	platformByName map[string]*platform.Platform // name -> platform
-	platformGen    uint64                        // protected by platMu; changes invalidate notify snapshots
+	// platformBatchMu is the cancellation-aware admission owner for platform
+	// map writers and context-aware rebuild readers. The ordinary platMu still
+	// protects the indexes; this owner makes a rebuild cancelable before it
+	// waits behind a long platform replacement rebuild.
+	platformBatchMu runtimeBatchGate
+	platMu          sync.RWMutex
+	platformByID    map[string]*platform.Platform // id -> platform
+	platformByName  map[string]*platform.Platform // name -> platform
+	platformGen     uint64                        // protected by platMu; changes invalidate notify snapshots
 	// defaultPlatform is published only after a complete Default platform
 	// object has been registered/replaced. Its view is immutable to readers;
 	// later replacements publish a different pointer after rebuilding it.
@@ -77,6 +82,9 @@ type GlobalNodePool struct {
 	// Package-private test seam immediately before an out-of-band node runtime
 	// preparation callback. Production leaves it nil.
 	beforeNodeAddedRuntimeHook func(node.Hash, *node.NodeEntry)
+	// Package-private test seam immediately before a context-aware platform
+	// rebuild attempts the platform read lock. Production leaves it nil.
+	beforePlatformReadLockHook func()
 
 	// Subscription lookup — injected by SubscriptionManager.
 	subLookup func(subID string) *subscription.Subscription
@@ -117,6 +125,23 @@ type PersistenceAdmission interface {
 	MarkNodeLatencyDelete(nodeHash, domain string) bool
 	MarkSubscriptionNode(subID, nodeHash string) bool
 	MarkSubscriptionNodeDelete(subID, nodeHash string) bool
+}
+
+// PlatformMutation is the exclusive platform publication capability supplied
+// by WithPlatformMutationContext. Its methods may only be used inside that
+// callback; the capability keeps the pool writer owner across the state
+// persistence and runtime publication halves of one control-plane mutation.
+type PlatformMutation interface {
+	ValidatePlatformRegistration(string, string) error
+	ValidatePlatformReplacement(string, string) error
+	RegisterPlatform(*platform.Platform) error
+	ReplacePlatform(*platform.Platform) error
+	UnregisterPlatform(string) error
+}
+
+type platformMutation struct {
+	mu   sync.Mutex
+	pool *GlobalNodePool
 }
 
 // PoolConfig configures the GlobalNodePool.
@@ -481,60 +506,192 @@ func (p *GlobalNodePool) LoadNodeFromBootstrap(entry *node.NodeEntry) {
 	p.nodes.Store(entry.Hash, entry)
 }
 
+// WithPlatformMutationContext admits one exclusive platform publication
+// owner. The callback must keep all state persistence and runtime publication
+// for the same control-plane mutation inside this owner. Cancellation is
+// observed while waiting for the owner; once admitted, the callback runs to
+// completion under its caller-owned commit context.
+func (p *GlobalNodePool) WithPlatformMutationContext(ctx context.Context, fn func(PlatformMutation) error) error {
+	if p == nil || fn == nil {
+		return nil
+	}
+	if err := p.platformBatchMu.writeLockContext(ctx); err != nil {
+		return err
+	}
+	defer p.platformBatchMu.writeUnlock()
+	owner := &platformMutation{pool: p}
+	defer func() {
+		owner.mu.Lock()
+		owner.pool = nil
+		owner.mu.Unlock()
+	}()
+	return fn(owner)
+}
+
+var ErrPlatformMutationDone = errors.New("platform mutation owner is done")
+
+func (m *platformMutation) withPool(fn func(*GlobalNodePool) error) error {
+	if m == nil {
+		return ErrPlatformMutationDone
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pool == nil {
+		return ErrPlatformMutationDone
+	}
+	return fn(m.pool)
+}
+
+func (m *platformMutation) ValidatePlatformRegistration(id, name string) error {
+	return m.withPool(func(p *GlobalNodePool) error {
+		p.platMu.RLock()
+		defer p.platMu.RUnlock()
+		if _, exists := p.platformByID[id]; exists {
+			return ErrPlatformAlreadyRegistered
+		}
+		if name != "" {
+			if _, exists := p.platformByName[name]; exists {
+				return ErrPlatformNameConflict
+			}
+		}
+		return nil
+	})
+}
+
+func (m *platformMutation) ValidatePlatformReplacement(id, name string) error {
+	return m.withPool(func(p *GlobalNodePool) error {
+		p.platMu.RLock()
+		defer p.platMu.RUnlock()
+		if _, exists := p.platformByID[id]; !exists {
+			return ErrPlatformNotRegistered
+		}
+		if name != "" {
+			if existing, exists := p.platformByName[name]; exists && existing != nil && existing.ID != id {
+				return ErrPlatformNameConflict
+			}
+		}
+		return nil
+	})
+}
+
+func (m *platformMutation) RegisterPlatform(plat *platform.Platform) error {
+	return m.withPool(func(p *GlobalNodePool) error {
+		if plat == nil || plat.ID == "" {
+			return ErrInvalidPlatform
+		}
+
+		p.platMu.Lock()
+		defer p.platMu.Unlock()
+
+		if _, exists := p.platformByID[plat.ID]; exists {
+			return ErrPlatformAlreadyRegistered
+		}
+		if plat.Name != "" {
+			if _, exists := p.platformByName[plat.Name]; exists {
+				return ErrPlatformNameConflict
+			}
+		}
+		// Build the complete view while platMu is held, before publishing the
+		// platform into either index. Node notifications that race registration
+		// therefore cannot be lost between a caller-side rebuild and publication.
+		p.RebuildPlatform(plat)
+		p.platformByID[plat.ID] = plat
+		if plat.Name != "" {
+			p.platformByName[plat.Name] = plat
+		}
+		if plat.ID == platform.DefaultPlatformID {
+			p.defaultPlatform.Store(plat)
+		}
+		p.platformGen++
+		return nil
+	})
+}
+
 // RegisterPlatform adds a platform to receive dirty notifications.
 //
 // Registration is strict: it never replaces an existing ID and never
 // overwrites an existing name index. Callers must handle the returned error.
 func (p *GlobalNodePool) RegisterPlatform(plat *platform.Platform) error {
-	if plat == nil || plat.ID == "" {
-		return ErrInvalidPlatform
-	}
+	return p.WithPlatformMutationContext(context.Background(), func(m PlatformMutation) error {
+		return m.RegisterPlatform(plat)
+	})
+}
 
-	p.platMu.Lock()
-	defer p.platMu.Unlock()
-
-	if _, exists := p.platformByID[plat.ID]; exists {
-		return ErrPlatformAlreadyRegistered
-	}
-	if plat.Name != "" {
-		if _, exists := p.platformByName[plat.Name]; exists {
-			return ErrPlatformNameConflict
+func (m *platformMutation) UnregisterPlatform(id string) error {
+	return m.withPool(func(p *GlobalNodePool) error {
+		if id == platform.DefaultPlatformID {
+			return nil
 		}
-	}
-	// Build the complete view while platMu is held, before publishing the
-	// platform into either index. Node notifications that race registration
-	// therefore cannot be lost between a caller-side rebuild and publication.
-	p.RebuildPlatform(plat)
-	p.platformByID[plat.ID] = plat
-	if plat.Name != "" {
-		p.platformByName[plat.Name] = plat
-	}
-	if plat.ID == platform.DefaultPlatformID {
-		p.defaultPlatform.Store(plat)
-	}
-	p.platformGen++
-	return nil
+		p.platMu.Lock()
+		defer p.platMu.Unlock()
+		plat, ok := p.platformByID[id]
+		if !ok {
+			return nil
+		}
+		delete(p.platformByID, id)
+		if plat.Name != "" {
+			// Only delete when name still points at this platform.
+			if current, ok := p.platformByName[plat.Name]; ok && current == plat {
+				delete(p.platformByName, plat.Name)
+			}
+		}
+		p.platformGen++
+		return nil
+	})
 }
 
 // UnregisterPlatform removes a platform from dirty notifications.
 func (p *GlobalNodePool) UnregisterPlatform(id string) {
-	if id == platform.DefaultPlatformID {
-		return
-	}
-	p.platMu.Lock()
-	defer p.platMu.Unlock()
-	plat, ok := p.platformByID[id]
-	if !ok {
-		return
-	}
-	delete(p.platformByID, id)
-	if plat.Name != "" {
-		// Only delete when name still points at this platform.
-		if current, ok := p.platformByName[plat.Name]; ok && current == plat {
-			delete(p.platformByName, plat.Name)
+	_ = p.WithPlatformMutationContext(context.Background(), func(m PlatformMutation) error {
+		return m.UnregisterPlatform(id)
+	})
+}
+
+func (m *platformMutation) ReplacePlatform(next *platform.Platform) error {
+	return m.withPool(func(p *GlobalNodePool) error {
+		if next == nil || next.ID == "" {
+			return ErrPlatformNotRegistered
 		}
-	}
-	p.platformGen++
+
+		if hook := p.beforePlatformReplaceLockHook; hook != nil {
+			hook()
+		}
+		p.platMu.Lock()
+		defer p.platMu.Unlock()
+
+		p.RebuildPlatform(next)
+		if hook := p.afterPlatformRebuildHook; hook != nil {
+			hook()
+		}
+
+		current, ok := p.platformByID[next.ID]
+		if !ok {
+			return ErrPlatformNotRegistered
+		}
+
+		if next.Name != "" {
+			if existingByName, exists := p.platformByName[next.Name]; exists && existingByName != current {
+				return ErrPlatformNameConflict
+			}
+		}
+
+		p.platformByID[next.ID] = next
+
+		if current.Name != "" {
+			if mapped, exists := p.platformByName[current.Name]; exists && mapped == current {
+				delete(p.platformByName, current.Name)
+			}
+		}
+		if next.Name != "" {
+			p.platformByName[next.Name] = next
+		}
+		if next.ID == platform.DefaultPlatformID {
+			p.defaultPlatform.Store(next)
+		}
+		p.platformGen++
+
+		return nil
+	})
 }
 
 // ReplacePlatform atomically replaces an existing platform object by ID.
@@ -542,48 +699,9 @@ func (p *GlobalNodePool) UnregisterPlatform(id string) {
 // instance, and this method serializes rebuilding its view with node dirty
 // snapshots and the map-pointer swap under platMu.
 func (p *GlobalNodePool) ReplacePlatform(next *platform.Platform) error {
-	if next == nil || next.ID == "" {
-		return ErrPlatformNotRegistered
-	}
-
-	if hook := p.beforePlatformReplaceLockHook; hook != nil {
-		hook()
-	}
-	p.platMu.Lock()
-	defer p.platMu.Unlock()
-
-	p.RebuildPlatform(next)
-	if hook := p.afterPlatformRebuildHook; hook != nil {
-		hook()
-	}
-
-	current, ok := p.platformByID[next.ID]
-	if !ok {
-		return ErrPlatformNotRegistered
-	}
-
-	if next.Name != "" {
-		if existingByName, exists := p.platformByName[next.Name]; exists && existingByName != current {
-			return ErrPlatformNameConflict
-		}
-	}
-
-	p.platformByID[next.ID] = next
-
-	if current.Name != "" {
-		if mapped, exists := p.platformByName[current.Name]; exists && mapped == current {
-			delete(p.platformByName, current.Name)
-		}
-	}
-	if next.Name != "" {
-		p.platformByName[next.Name] = next
-	}
-	if next.ID == platform.DefaultPlatformID {
-		p.defaultPlatform.Store(next)
-	}
-	p.platformGen++
-
-	return nil
+	return p.WithPlatformMutationContext(context.Background(), func(m PlatformMutation) error {
+		return m.ReplacePlatform(next)
+	})
 }
 
 // GetPlatform retrieves a platform by ID.
@@ -915,11 +1033,15 @@ func (p *GlobalNodePool) RebuildAllPlatforms() {
 
 // RebuildPlatform triggers a full rebuild on a specific platform.
 func (p *GlobalNodePool) RebuildPlatform(plat *platform.Platform) {
+	_ = p.rebuildPlatformContext(context.Background(), plat)
+}
+
+func (p *GlobalNodePool) rebuildPlatformContext(ctx context.Context, plat *platform.Platform) error {
 	subLookup := p.MakeSubLookup()
 	poolRange := func(fn func(node.Hash, *node.NodeEntry) bool) {
 		p.nodes.Range(fn)
 	}
-	plat.FullRebuild(poolRange, subLookup, p.geoLookup)
+	return plat.FullRebuildContext(ctx, poolRange, subLookup, p.geoLookup)
 }
 
 // RebuildPlatformIfCurrent rebuilds the platform only while its exact object
@@ -927,18 +1049,49 @@ func (p *GlobalNodePool) RebuildPlatform(plat *platform.Platform) {
 // concurrent unregister or replacement either happens before this operation
 // or after it; a stale caller cannot rebuild a retired platform object.
 func (p *GlobalNodePool) RebuildPlatformIfCurrent(id string, expected *platform.Platform) bool {
+	ok, err := p.RebuildPlatformIfCurrentContext(context.Background(), id, expected)
+	return ok && err == nil
+}
+
+// RebuildPlatformIfCurrentContext keeps the exact platform identity check and
+// makes candidate construction cancellation-aware. The caller still owns the
+// runtime generation read boundary; a canceled build never publishes a new
+// routable view.
+func (p *GlobalNodePool) RebuildPlatformIfCurrentContext(
+	ctx context.Context,
+	id string,
+	expected *platform.Platform,
+) (bool, error) {
 	if p == nil || expected == nil {
-		return false
+		return false, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if hook := p.beforePlatformReadLockHook; hook != nil {
+		hook()
+	}
+	if err := p.platformBatchMu.readLockContext(ctx); err != nil {
+		return false, err
+	}
+	defer p.platformBatchMu.readUnlock()
 	p.platMu.RLock()
 	defer p.platMu.RUnlock()
 
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	current, ok := p.platformByID[id]
 	if !ok || current != expected {
-		return false
+		return false, nil
 	}
-	p.RebuildPlatform(expected)
-	return true
+	if err := p.rebuildPlatformContext(ctx, expected); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // --- Health Management ---

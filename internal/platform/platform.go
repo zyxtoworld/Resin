@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"net/netip"
 	"regexp"
 	"sync"
@@ -48,6 +49,14 @@ type Platform struct {
 	view        atomic.Pointer[RoutableView]
 	viewEntries map[node.Hash]*node.NodeEntry
 	viewMu      sync.RWMutex
+	// viewWriterMu is the cancellation-aware admission owner for the two
+	// operations that publish the view. It prevents a canceled full rebuild
+	// from waiting indefinitely behind a dirty notification that is doing a
+	// slow GeoIP lookup while holding viewMu.
+	viewWriterMu contextMutex
+	// Package-private test seam immediately before a context-aware full
+	// rebuild waits for the view writer admission. Production leaves it nil.
+	beforeViewWriterLockHook func()
 }
 
 // RoutableViewEntry pairs a view hash with the exact NodeEntry that satisfied
@@ -168,20 +177,60 @@ func (p *Platform) FullRebuild(
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
 ) {
+	_ = p.FullRebuildContext(context.Background(), poolRange, subLookup, geoLookup)
+}
+
+// FullRebuildContext builds a complete candidate and publishes it only when
+// ctx is still live. A node evaluation or GeoIP lookup already in progress is
+// not forcibly interrupted; cancellation is checked before each evaluation
+// and again immediately before publication, so a canceled request cannot
+// publish a partially accepted generation.
+func (p *Platform) FullRebuildContext(
+	ctx context.Context,
+	poolRange PoolRangeFunc,
+	subLookup node.SubLookupFunc,
+	geoLookup GeoLookupFunc,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if hook := p.beforeViewWriterLockHook; hook != nil {
+		hook()
+	}
+	if err := p.viewWriterMu.lockContext(ctx); err != nil {
+		return err
+	}
+	defer p.viewWriterMu.unlock()
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
 
 	nextView := NewRoutableView()
 	nextEntries := make(map[node.Hash]*node.NodeEntry)
+	var buildErr error
 	poolRange(func(h node.Hash, entry *node.NodeEntry) bool {
+		if err := ctx.Err(); err != nil {
+			buildErr = err
+			return false
+		}
 		if p.evaluateNode(entry, subLookup, geoLookup) {
 			nextView.Add(h)
 			nextEntries[h] = entry
 		}
 		return true
 	})
+	if buildErr != nil {
+		return buildErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p.viewEntries = nextEntries
 	p.view.Store(nextView)
+	return nil
 }
 
 // NotifyDirty re-evaluates a single node and adds/removes it from the view.
@@ -192,6 +241,10 @@ func (p *Platform) NotifyDirty(
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
 ) {
+	if err := p.viewWriterMu.lockContext(context.Background()); err != nil {
+		return
+	}
+	defer p.viewWriterMu.unlock()
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
 	view := p.view.Load()

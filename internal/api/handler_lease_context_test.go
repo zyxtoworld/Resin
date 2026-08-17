@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
@@ -184,5 +185,42 @@ func TestGetLeaseHandlerStopsOnCanceledRequestDuringRuntimeMutation(t *testing.T
 	}
 	if !returnedBeforeRelease {
 		t.Fatal("canceled lease get handler remained blocked by runtime mutation")
+	}
+}
+
+func TestDeleteLeaseHandler_DoesNotMutateCanceledRequest(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "delete-lease-cancel")
+	now := time.Now().UnixNano()
+	lease := model.Lease{
+		PlatformID:     platformID,
+		Account:        "delete-cancel-account",
+		NodeHash:       node.HashFromRawOptions([]byte(`{"type":"delete-cancel-node"}`)).Hex(),
+		EgressIP:       "203.0.113.21",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	}
+	if err := cp.Router.UpsertLease(lease); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/api/v1/platforms/"+platformID+"/leases/"+lease.Account,
+		nil,
+	).WithContext(requestCtx)
+	req.SetPathValue("id", platformID)
+	req.SetPathValue("account", lease.Account)
+	rec := httptest.NewRecorder()
+	HandleDeleteLease(cp).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNoContent {
+		t.Fatalf("canceled delete request was reported successful: status=%d", rec.Code)
+	}
+	if got := cp.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: lease.Account}); got == nil {
+		t.Fatal("canceled delete request removed the lease")
 	}
 }
