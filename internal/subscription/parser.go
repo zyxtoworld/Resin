@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -4404,7 +4405,7 @@ func normalizeTextContent(content string) string {
 		case '\u200B', '\u200C', '\u200D':
 			continue
 		}
-		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
 			continue
 		}
 		b.WriteRune(r)

@@ -283,6 +283,28 @@ proxies:
 	}
 }
 
+func TestParseGeneralSubscription_ClashYAMLStripsC1Controls(t *testing.T) {
+	data := []byte("proxies:\n" +
+		"  - name: vmess-" + string(rune(0x85)) + "yaml\n" +
+		"    type: vmess\n" +
+		"    server: 3.3.3.3\n" +
+		"    port: 443\n" +
+		"    uuid: 26a1d547-b031-4139-9fc5-6671e1d0408a\n" +
+		"    cipher: auto\n")
+
+	nodes, err := ParseGeneralSubscription(data)
+	if err != nil {
+		t.Fatalf("C1 control should be normalized before YAML parsing: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 parsed node, got %d", len(nodes))
+	}
+	obj := parseNodeRaw(t, nodes[0].RawOptions)
+	if got := obj["tag"]; got != "vmess-yaml" {
+		t.Fatalf("expected normalized tag vmess-yaml, got %v", got)
+	}
+}
+
 func TestParseGeneralSubscription_ClashJSON_NewProtocolsAndDialFields(t *testing.T) {
 	data := []byte(`{
 		"proxies": [
