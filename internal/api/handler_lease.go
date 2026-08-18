@@ -69,28 +69,37 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
+		fuzzy, ok := parseStrictBoolQuery(w, r, "fuzzy")
+		if !ok {
+			return
+		}
+		useFuzzyAccountMatch := fuzzy != nil && *fuzzy
+		accountQuery := r.URL.Query().Get("account")
+		accountFilter := strings.TrimSpace(accountQuery)
+		if accountQuery != "" && accountFilter == "" {
+			writeInvalidArgument(w, "account query: must be non-empty when provided")
+			return
+		}
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"account", "expiry", "last_accessed"}, "expiry", "asc")
+		if !ok {
+			return
+		}
+		pg, ok := parsePaginationOrWriteInvalid(w, r)
+		if !ok {
+			return
+		}
+
 		leases, err := cp.ListLeasesContext(r.Context(), platformID)
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
 
-		fuzzy, ok := parseStrictBoolQuery(w, r, "fuzzy")
-		if !ok {
-			return
-		}
-		useFuzzyAccountMatch := fuzzy != nil && *fuzzy
-
 		// Optional account filter.
-		if raw := r.URL.Query().Get("account"); raw != "" {
-			account := strings.TrimSpace(raw)
-			if account == "" {
-				writeInvalidArgument(w, "account query: must be non-empty when provided")
-				return
-			}
+		if accountQuery != "" {
 			filtered := make([]service.LeaseResponse, 0, len(leases))
 			if useFuzzyAccountMatch {
-				accountLower := strings.ToLower(account)
+				accountLower := strings.ToLower(accountFilter)
 				for _, l := range leases {
 					if strings.Contains(strings.ToLower(l.Account), accountLower) {
 						filtered = append(filtered, l)
@@ -98,7 +107,7 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 				}
 			} else {
 				for _, l := range leases {
-					if l.Account == account {
+					if l.Account == accountFilter {
 						filtered = append(filtered, l)
 					}
 				}
@@ -106,16 +115,7 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			leases = filtered
 		}
 
-		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"account", "expiry", "last_accessed"}, "expiry", "asc")
-		if !ok {
-			return
-		}
 		sortLeaseResponses(leases, sorting)
-
-		pg, ok := parsePaginationOrWriteInvalid(w, r)
-		if !ok {
-			return
-		}
 		WritePage(w, http.StatusOK, leases, pg)
 	}
 }
@@ -184,22 +184,21 @@ func HandleIPLoad(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"egress_ip", "lease_count"}, "lease_count", "desc")
+		if !ok {
+			return
+		}
+		pg, ok := parsePaginationOrWriteInvalid(w, r)
+		if !ok {
+			return
+		}
+
 		entries, err := cp.GetIPLoadContext(r.Context(), platformID)
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
-
-		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"egress_ip", "lease_count"}, "lease_count", "desc")
-		if !ok {
-			return
-		}
 		sortIPLoadEntries(entries, sorting)
-
-		pg, ok := parsePaginationOrWriteInvalid(w, r)
-		if !ok {
-			return
-		}
 		WritePage(w, http.StatusOK, entries, pg)
 	}
 }

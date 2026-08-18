@@ -74,25 +74,24 @@ func comparePlatformsForList(a, b service.PlatformResponse, sorting Sorting) int
 // HandleListPlatforms returns a handler for GET /api/v1/platforms.
 func HandleListPlatforms(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"name", "id", "updated_at"}, "name", "asc")
+		if !ok {
+			return
+		}
+		pg, ok := parsePaginationOrWriteInvalid(w, r)
+		if !ok {
+			return
+		}
+
 		platforms, err := cp.ListPlatformsContext(r.Context())
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
 		platforms = filterPlatformsByKeyword(platforms, r.URL.Query().Get("keyword"))
-
-		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"name", "id", "updated_at"}, "name", "asc")
-		if !ok {
-			return
-		}
 		slices.SortStableFunc(platforms, func(a, b service.PlatformResponse) int {
 			return comparePlatformsForList(a, b, sorting)
 		})
-
-		pg, ok := parsePaginationOrWriteInvalid(w, r)
-		if !ok {
-			return
-		}
 		WritePage(w, http.StatusOK, platforms, pg)
 	}
 }
@@ -210,13 +209,13 @@ func HandlePreviewFilter(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeInvalidArgument(w, "platform_id: must be a valid UUID")
 			return
 		}
+		pg, ok := parsePaginationOrWriteInvalid(w, r)
+		if !ok {
+			return
+		}
 		nodes, err := cp.PreviewFilterContext(r.Context(), req)
 		if err != nil {
 			writeServiceError(w, err)
-			return
-		}
-		pg, ok := parsePaginationOrWriteInvalid(w, r)
-		if !ok {
 			return
 		}
 		WritePage(w, http.StatusOK, nodes, pg)

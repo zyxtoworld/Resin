@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -69,8 +70,9 @@ type PlatformGenerationExecutor interface {
 
 // Router handles route selection and lease management.
 type Router struct {
-	pool   PoolAccessor
-	states *xsync.Map[string, *PlatformRoutingState]
+	pool                        PoolAccessor
+	states                      *xsync.Map[string, *PlatformRoutingState]
+	nextPlatformStateGeneration uint64
 	// lifecycleMu is the platform-routing lifetime owner. Routes, lease writes,
 	// reads, and cleaner sweeps hold the read side. Platform removal first
 	// unregisters the platform from the pool, then takes the write side to drain
@@ -638,7 +640,8 @@ func (r *Router) resolvePlatform(platName string) (*platform.Platform, error) {
 
 func (r *Router) ensurePlatformState(platformID string) *PlatformRoutingState {
 	state, _ := r.states.LoadOrCompute(platformID, func() (*PlatformRoutingState, bool) {
-		return NewPlatformRoutingState(), false
+		generation := atomic.AddUint64(&r.nextPlatformStateGeneration, 1)
+		return newPlatformRoutingState(generation), false
 	})
 	return state
 }
@@ -1610,7 +1613,8 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 			continue
 		}
 		state, _ := r.states.LoadOrCompute(ml.PlatformID, func() (*PlatformRoutingState, bool) {
-			return NewPlatformRoutingState(), false
+			generation := atomic.AddUint64(&r.nextPlatformStateGeneration, 1)
+			return newPlatformRoutingState(generation), false
 		})
 
 		l := Lease{

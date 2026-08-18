@@ -146,22 +146,21 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 			filters.ProbedSince = &t
 		}
 
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"tag", "created_at", "failure_count", "region"}, "tag", "asc")
+		if !ok {
+			return
+		}
+		pg, ok := parsePaginationOrWriteInvalid(w, r)
+		if !ok {
+			return
+		}
+
 		nodes, err := cp.ListNodesContext(r.Context(), filters)
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
-
-		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"tag", "created_at", "failure_count", "region"}, "tag", "asc")
-		if !ok {
-			return
-		}
 		sortNodeSummaries(nodes, sorting)
-
-		pg, ok := parsePaginationOrWriteInvalid(w, r)
-		if !ok {
-			return
-		}
 		WriteJSON(w, http.StatusOK, nodeListPageResponse{
 			Items:                  PaginateSlice(nodes, pg),
 			Total:                  len(nodes),

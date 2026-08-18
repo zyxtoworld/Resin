@@ -65,6 +65,7 @@ type LeasePage struct {
 type leasePageCursor struct {
 	Version        int    `json:"version"`
 	PlatformID     string `json:"platform_id"`
+	Generation     uint64 `json:"generation"`
 	SortBy         string `json:"sort_by"`
 	Desc           bool   `json:"desc"`
 	FilterAccount  string `json:"filter_account"`
@@ -146,10 +147,11 @@ func compareLeasePageItems(left, right LeasePageItem, query LeasePageQuery) int 
 	return compare
 }
 
-func encodeLeasePageCursor(item LeasePageItem, query LeasePageQuery) string {
+func encodeLeasePageCursor(item LeasePageItem, query LeasePageQuery, generation uint64) string {
 	cursor := leasePageCursor{
 		Version:        1,
 		PlatformID:     query.platformID,
+		Generation:     generation,
 		SortBy:         normalizeLeaseSort(query.SortBy),
 		Desc:           query.Desc,
 		FilterAccount:  strings.TrimSpace(query.Account),
@@ -174,33 +176,33 @@ func encodeLeasePageCursor(item LeasePageItem, query LeasePageQuery) string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
-func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, error) {
+func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, uint64, error) {
 	if strings.TrimSpace(raw) == "" || len(raw) > 2048 {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	var cursor leasePageCursor
 	decoder := json.NewDecoder(bytes.NewReader(decoded))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cursor); err != nil {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	providedMAC, err := base64.RawURLEncoding.DecodeString(cursor.MAC)
 	if err != nil || len(providedMAC) != sha256.Size {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	cursor.MAC = ""
 	payload, err := json.Marshal(cursor)
 	if err != nil {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	hasher := hmac.New(sha256.New, leaseCursorSecret)
 	_, _ = hasher.Write(payload)
 	if !hmac.Equal(providedMAC, hasher.Sum(nil)) {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF ||
@@ -209,11 +211,11 @@ func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, err
 		cursor.SortBy != normalizeLeaseSort(query.SortBy) || cursor.Desc != query.Desc ||
 		cursor.FilterAccount != strings.TrimSpace(query.Account) || cursor.Fuzzy != query.Fuzzy ||
 		cursor.Limit != query.Limit || cursor.LastAccount == "" || cursor.NodeHash == "" {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	hash, err := node.ParseHex(cursor.NodeHash)
 	if err != nil {
-		return LeasePageItem{}, ErrLeaseCursorInvalid
+		return LeasePageItem{}, 0, ErrLeaseCursorInvalid
 	}
 	return LeasePageItem{
 		Account: cursor.LastAccount,
@@ -222,7 +224,7 @@ func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, err
 			ExpiryNs:       cursor.ExpiryNs,
 			LastAccessedNs: cursor.LastAccessedNs,
 		},
-	}, nil
+	}, cursor.Generation, nil
 }
 
 func leaseMatchesQuery(account string, query LeasePageQuery) bool {
@@ -258,14 +260,15 @@ func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePage
 	}
 	query.Limit = limit
 	query.SortBy = normalizeLeaseSort(query.SortBy)
-
 	var cursorItem *LeasePageItem
+	var cursorGeneration uint64
 	if query.Cursor != "" {
-		decoded, err := decodeLeasePageCursor(query.Cursor, query)
+		decoded, generation, err := decodeLeasePageCursor(query.Cursor, query)
 		if err != nil {
 			return LeasePage{}, false, err
 		}
 		cursorItem = &decoded
+		cursorGeneration = generation
 	}
 
 	r.lifecycleMu.RLock()
@@ -276,6 +279,11 @@ func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePage
 
 	page := LeasePage{Items: []LeasePageItem{}, Counts: make(map[node.Hash]int)}
 	state, ok := r.states.Load(platformID)
+	if query.Cursor != "" {
+		if !ok || state == nil || cursorGeneration != state.generation {
+			return LeasePage{}, false, ErrLeaseCursorInvalid
+		}
+	}
 	if !ok || state == nil {
 		return page, true, nil
 	}
@@ -312,7 +320,7 @@ func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePage
 	page.HasMore = len(items) > limit
 	if page.HasMore {
 		items = items[:limit]
-		page.NextCursor = encodeLeasePageCursor(items[len(items)-1], query)
+		page.NextCursor = encodeLeasePageCursor(items[len(items)-1], query, state.generation)
 	}
 	page.Items = append(page.Items, items...)
 	return page, true, nil

@@ -65,13 +65,6 @@ func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		subs, err := cp.ListSubscriptionsContext(r.Context(), enabled)
-		if err != nil {
-			writeServiceError(w, err)
-			return
-		}
-		subs = filterSubscriptionsByKeyword(subs, r.URL.Query().Get("keyword"))
-
 		sorting, ok := parseSortingOrWriteInvalid(
 			w,
 			r,
@@ -82,12 +75,18 @@ func HandleListSubscriptions(cp *service.ControlPlaneService) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		sortSubscriptionResponses(subs, sorting)
-
 		pg, ok := parsePaginationOrWriteInvalid(w, r)
 		if !ok {
 			return
 		}
+
+		subs, err := cp.ListSubscriptionsContext(r.Context(), enabled)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		subs = filterSubscriptionsByKeyword(subs, r.URL.Query().Get("keyword"))
+		sortSubscriptionResponses(subs, sorting)
 		WritePage(w, http.StatusOK, subs, pg)
 	}
 }

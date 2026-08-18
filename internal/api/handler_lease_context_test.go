@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +170,130 @@ func TestListLeasesHandlerStopsOnCanceledRequestDuringRuntimeMutation(t *testing
 	if !returnedBeforeRelease {
 		t.Fatal("canceled lease list handler remained blocked by runtime mutation")
 	}
+}
+
+func TestListLeasesHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/platforms/"+fixture.platformID+"/leases?fuzzy=1",
+		nil,
+	)
+	request.SetPathValue("id", fixture.platformID)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleListLeases(fixture.cp).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid fuzzy query status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		fixture.finish(t)
+		t.Fatal("invalid lease query waited for the unrelated runtime mutation")
+	}
+	fixture.finish(t)
+}
+
+func TestIPLoadHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/platforms/"+fixture.platformID+"/ip-load?sort_by=unknown",
+		nil,
+	)
+	request.SetPathValue("id", fixture.platformID)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleIPLoad(fixture.cp).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid ip-load sort status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		fixture.finish(t)
+		t.Fatal("invalid ip-load query waited for the unrelated runtime mutation")
+	}
+	fixture.finish(t)
+}
+
+func TestListSubscriptionsHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/subscriptions?sort_by=unknown", nil)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleListSubscriptions(fixture.cp).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid subscription sort status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		fixture.finish(t)
+		t.Fatal("invalid subscription query waited for the unrelated runtime mutation")
+	}
+	fixture.finish(t)
+}
+
+func TestListNodesHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/nodes?sort_by=unknown", nil)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleListNodes(fixture.cp).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid node sort status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		fixture.finish(t)
+		t.Fatal("invalid node query waited for the unrelated runtime mutation")
+	}
+	fixture.finish(t)
+}
+
+func TestPreviewFilterHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing.T) {
+	fixture := newBlockingLeaseReadFixture(t)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/platforms/preview-filter?limit=bad",
+		bytes.NewBufferString(`{}`),
+	)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandlePreviewFilter(fixture.cp).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid preview pagination status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		fixture.finish(t)
+		t.Fatal("invalid preview query waited for the unrelated runtime mutation")
+	}
+	fixture.finish(t)
 }
 
 func TestGetLeaseHandlerStopsOnCanceledRequestDuringRuntimeMutation(t *testing.T) {
