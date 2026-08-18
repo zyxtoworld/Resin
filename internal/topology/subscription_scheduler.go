@@ -65,6 +65,12 @@ type SubscriptionScheduler struct {
 	// Package-private test seam used to cancel a synchronous refresh after its
 	// input has been read but before parsing begins.
 	beforeRefreshParseHook func()
+	// Package-private test seam immediately before a refresh tries to acquire
+	// the subscription operation lock for its apply phase.
+	beforeRefreshApplyLockHook func()
+	// Package-private test seam immediately before a refresh failure tries to
+	// acquire the subscription operation lock for its failure record.
+	beforeRefreshFailureLockHook func()
 	// Package-private test seam after the re-enable runtime mutation has
 	// published and immediately before deferred node-runtime callbacks run.
 	beforeReenabledRuntimeHook func()
@@ -466,7 +472,10 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 	// 4. Diff, swap, add/remove — under lock.
 	applied := false
 	var runtimePreparation []nodeRuntimePreparation
-	sub.WithOpLock(func() {
+	if hook := s.beforeRefreshApplyLockHook; hook != nil {
+		hook()
+	}
+	if err := sub.WithOpLockContext(ctx, func() {
 		mutate := func(admission PersistenceAdmission) {
 			if err := ctx.Err(); err != nil {
 				return
@@ -590,7 +599,9 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 		} else {
 			applyMutation(nil)
 		}
-	})
+	}); err != nil {
+		return
+	}
 	if !applied {
 		log.Printf("[scheduler] stale success ignored for %s", sub.ID)
 		return
@@ -625,7 +636,10 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 		ctx = context.Background()
 	}
 	applied := false
-	sub.WithOpLock(func() {
+	if hook := s.beforeRefreshFailureLockHook; hook != nil {
+		hook()
+	}
+	if err := sub.WithOpLockContext(ctx, func() {
 		if ctx.Err() != nil {
 			return
 		}
@@ -647,7 +661,9 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 		sub.MarkAppliedAttempt(attemptSeq)
 		sub.SetLastError(err.Error())
 		applied = true
-	})
+	}); err != nil {
+		return
+	}
 	if !applied {
 		log.Printf("[scheduler] stale %s failure ignored for %s: %v", stage, sub.ID, err)
 		return

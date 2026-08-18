@@ -1448,6 +1448,180 @@ func TestScheduler_RequestDeadlineDoesNotRecordFailure(t *testing.T) {
 	}
 }
 
+func TestScheduler_RequestCancellationWhileWaitingForApplyOpLock(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-apply-lock-cancel", "Apply lock cancel", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	sched := newTestScheduler(subMgr, newTestPool(subMgr), func(context.Context, string) ([]byte, error) {
+		return makeSubscriptionJSON(`{"type":"shadowsocks","tag":"apply-lock-cancel","server":"1.1.1.1","server_port":443}`), nil
+	})
+
+	parseReached := make(chan struct{})
+	allowParse := make(chan struct{})
+	sched.beforeRefreshParseHook = func() {
+		close(parseReached)
+		<-allowParse
+	}
+	defer func() {
+		select {
+		case <-allowParse:
+		default:
+			close(allowParse)
+		}
+	}()
+
+	applyLockReached := make(chan struct{})
+	allowApply := make(chan struct{})
+	sched.beforeRefreshApplyLockHook = func() {
+		close(applyLockReached)
+		<-allowApply
+	}
+	defer func() {
+		select {
+		case <-allowApply:
+		default:
+			close(allowApply)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan bool, 1)
+	go func() {
+		result <- sched.UpdateSubscriptionContext(ctx, sub)
+	}()
+
+	select {
+	case <-parseReached:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach parse barrier after reading its input")
+	}
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan struct{})
+	go func() {
+		defer close(lockDone)
+		sub.WithOpLock(func() {
+			close(lockHeld)
+			<-releaseLock
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case <-time.After(time.Second):
+		t.Fatal("test operation lock was not acquired")
+	}
+	close(allowParse)
+	select {
+	case <-applyLockReached:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach apply lock admission")
+	}
+	cancel()
+	close(allowApply)
+
+	select {
+	case accepted := <-result:
+		if !accepted {
+			t.Fatal("refresh admission was rejected before cancellation")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("canceled refresh remained blocked on subscription operation lock")
+	}
+
+	close(releaseLock)
+	select {
+	case <-lockDone:
+	case <-time.After(time.Second):
+		t.Fatal("test operation lock did not release")
+	}
+}
+
+func TestScheduler_RequestCancellationWhileWaitingForFailureOpLock(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-failure-lock-cancel", "Failure lock cancel", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+	sched := newTestScheduler(subMgr, newTestPool(subMgr), func(context.Context, string) ([]byte, error) {
+		return nil, errors.New("fetch failed")
+	})
+
+	sourceAdmissionReached := make(chan struct{})
+	allowSource := make(chan struct{})
+	sched.beforeRefreshUpdateHook = func() {
+		close(sourceAdmissionReached)
+		<-allowSource
+	}
+	failureLockReached := make(chan struct{})
+	allowFailure := make(chan struct{})
+	sched.beforeRefreshFailureLockHook = func() {
+		close(failureLockReached)
+		<-allowFailure
+	}
+	defer func() {
+		for _, ch := range []chan struct{}{allowSource, allowFailure} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan bool, 1)
+	go func() {
+		result <- sched.UpdateSubscriptionContext(ctx, sub)
+	}()
+	select {
+	case <-sourceAdmissionReached:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach source admission")
+	}
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan struct{})
+	go func() {
+		defer close(lockDone)
+		sub.WithOpLock(func() {
+			close(lockHeld)
+			<-releaseLock
+		})
+	}()
+	select {
+	case <-lockHeld:
+	case <-time.After(time.Second):
+		t.Fatal("test operation lock was not acquired")
+	}
+	close(allowSource)
+	select {
+	case <-failureLockReached:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach failure lock admission")
+	}
+
+	cancel()
+	close(allowFailure)
+	select {
+	case accepted := <-result:
+		if !accepted {
+			t.Fatal("refresh admission was rejected before cancellation")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("canceled refresh failure remained blocked on subscription operation lock")
+	}
+	close(releaseLock)
+	select {
+	case <-lockDone:
+	case <-time.After(time.Second):
+		t.Fatal("test operation lock did not release")
+	}
+	if got := sub.GetLastError(); got != "" {
+		t.Fatalf("canceled failure changed LastError: %q", got)
+	}
+}
+
 func TestScheduler_FetcherDeadlineWhileCallerAliveRecordsFailure(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s-fetcher-deadline", "Fetcher deadline", "https://example.com/sub", true, false)
