@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
@@ -181,11 +185,15 @@ type gatedBindingPool struct {
 	bindingEntered  chan struct{}
 	allowBinding    chan struct{}
 	bindingCallOnce sync.Once
+	beforeBinding   func()
 }
 
 func (p *gatedBindingPool) GetEntry(node.Hash) (*node.NodeEntry, bool) {
 	if p.getCalls.Add(1) == 3 {
 		p.bindingCallOnce.Do(func() { close(p.bindingEntered) })
+		if p.beforeBinding != nil {
+			p.beforeBinding()
+		}
 		<-p.allowBinding
 	}
 	return p.staticRoutePool.GetEntry(node.Zero)
@@ -243,6 +251,103 @@ func TestResolveRoutedOutboundRejectsHealthChangeBeforeBinding(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("resolver did not finish after releasing binding lookup")
+	}
+}
+
+func TestForwardProxyRejectsEgressChangeBeforeBinding(t *testing.T) {
+	payload := json.RawMessage(`{"id":"proxy-egress-binding"}`)
+	hash := node.HashFromRawOptions(payload)
+	entry := newProxyHealthyEntry(t, hash, "203.0.113.243")
+	plat := platform.NewPlatform("plat-egress-binding", "Plat-Egress-Binding", nil, nil)
+	plat.FullRebuild(
+		func(fn func(node.Hash, *node.NodeEntry) bool) { fn(hash, entry) },
+		func(_ string, _ node.Hash) (string, bool, []string, bool) {
+			return "sub-test", true, nil, true
+		},
+		func(_ netip.Addr) string { return "" },
+	)
+	rules, err := platform.CompileResponseRules("plat-egress-binding", []model.PlatformResponseRule{{
+		ID: "cooldown", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown",
+			CooldownScope: "egress_ip",
+			Fallback:      "next_utc_midnight",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+
+	var upstreamRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamRequests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, "quota-limited")
+	}))
+	defer upstream.Close()
+	var wrapped adapter.Outbound = &mockOutbound{dialFunc: func(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+	}}
+	entry.Outbound.Store(&wrapped)
+
+	pool := &gatedBindingPool{
+		staticRoutePool: &staticRoutePool{entry: entry, platform: plat},
+		bindingEntered:  make(chan struct{}),
+		allowBinding:    make(chan struct{}),
+		beforeBinding: func() {
+			entry.SetEgressIP(netip.MustParseAddr("203.0.113.244"))
+		},
+	}
+	router := routing.NewRouter(routing.RouterConfig{
+		Pool:        pool,
+		Authorities: func() []string { return nil },
+		P2CWindow:   func() time.Duration { return time.Minute },
+	})
+	proxy := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     router,
+		Pool:       pool,
+	})
+
+	requestDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.Header.Set("Proxy-Authorization", basicAuth(plat.Name, "tok"))
+		writer := httptest.NewRecorder()
+		proxy.ServeHTTP(writer, req)
+		requestDone <- writer
+	}()
+	select {
+	case <-pool.bindingEntered:
+	case <-time.After(time.Second):
+		select {
+		case writer := <-requestDone:
+			t.Fatalf("forward proxy returned before binding lookup: status=%d body=%q; GetEntry calls=%d", writer.Code, writer.Body.String(), pool.getCalls.Load())
+		default:
+			t.Fatalf("forward proxy did not reach the binding lookup; GetEntry calls=%d", pool.getCalls.Load())
+		}
+	}
+	close(pool.allowBinding)
+
+	select {
+	case writer := <-requestDone:
+		if writer.Code != http.StatusServiceUnavailable {
+			t.Fatalf("stale egress binding status: got %d body=%q, want %d", writer.Code, writer.Body.String(), http.StatusServiceUnavailable)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forward proxy did not finish after releasing binding lookup")
+	}
+	if got := upstreamRequests.Load(); got != 0 {
+		t.Fatalf("stale egress binding reached upstream %d time(s)", got)
+	}
+	cooldowns, ok := router.SnapshotResponseCooldownsForPlatform(plat.ID, time.Now())
+	if !ok {
+		t.Fatal("platform cooldown snapshot unavailable")
+	}
+	if len(cooldowns) != 0 {
+		t.Fatalf("stale egress response created cooldowns: %#v", cooldowns)
 	}
 }
 

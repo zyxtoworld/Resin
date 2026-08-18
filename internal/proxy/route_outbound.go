@@ -49,7 +49,7 @@ func bindRoutedOutbound(result routing.RouteResult, pool outbound.PoolAccessor) 
 		return routedOutbound{}, ErrNoAvailableNodes
 	}
 	entry, ok := pool.GetEntry(result.NodeHash)
-	if !ok || entry != selectedEntry || entry == nil || !entry.IsHealthy() || pool.IsNodeDisabled(result.NodeHash) {
+	if !ok || entry != selectedEntry || entry == nil || entry.GetEgressIP() != result.EgressIP || !entry.IsHealthy() || pool.IsNodeDisabled(result.NodeHash) {
 		return routedOutbound{}, ErrNoAvailableNodes
 	}
 	leasedOutbound, ready := entry.NewLeasedOutbound()
