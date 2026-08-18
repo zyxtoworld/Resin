@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -199,5 +201,70 @@ func TestPreviewFilter_RegionNegation_UnknownRegionExcluded(t *testing.T) {
 		if node.NodeHash == fixture.unknownHash {
 			t.Fatalf("node with unknown region %s should not match region filters", fixture.unknownHash)
 		}
+	}
+}
+
+func TestPreviewFilterContextRejectsInvalidRequestBeforeRuntimeMutation(t *testing.T) {
+	subMgr := topology.NewSubscriptionManager()
+	pool := newNodeListTestPool(subMgr)
+	service := &ControlPlaneService{Pool: pool, SubMgr: subMgr}
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not enter")
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseWriter:
+		default:
+			close(releaseWriter)
+		}
+		select {
+		case <-writerDone:
+		case <-time.After(time.Second):
+			t.Error("runtime mutation did not finish during cleanup")
+		}
+	})
+
+	readAttempted := make(chan struct{})
+	service.afterRuntimeReadAttemptHook = func(error) {
+		close(readAttempted)
+	}
+	t.Cleanup(func() { service.afterRuntimeReadAttemptHook = nil })
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.PreviewFilterContext(context.Background(), PreviewFilterRequest{})
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("invalid preview filter request unexpectedly succeeded")
+		}
+		var serviceErr *ServiceError
+		if !errors.As(err, &serviceErr) || serviceErr.Code != "INVALID_ARGUMENT" {
+			t.Fatalf("invalid preview filter error = %v, want INVALID_ARGUMENT", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("invalid preview filter waited for the unrelated runtime mutation")
+	}
+
+	select {
+	case <-readAttempted:
+		t.Fatal("invalid preview filter entered runtime read before validation")
+	default:
 	}
 }

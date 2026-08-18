@@ -496,3 +496,53 @@ func TestHandleGetNode_HonorsCanceledRequestWhileRuntimeBatchWriterWaits(t *test
 		t.Fatal("runtime mutation did not finish")
 	}
 }
+
+func TestHandleGetNodeRejectsInvalidHashBeforeRuntimeMutation(t *testing.T) {
+	_, cp, _ := newControlPlaneTestServer(t)
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		cp.Pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not enter")
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseWriter:
+		default:
+			close(releaseWriter)
+		}
+		select {
+		case <-writerDone:
+		case <-time.After(time.Second):
+			t.Error("runtime mutation did not finish during cleanup")
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/not-a-node-hash", nil)
+	req.SetPathValue("hash", "not-a-node-hash")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		HandleGetNode(cp)(rec, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid node hash status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("invalid node hash waited for the unrelated runtime mutation")
+	}
+}

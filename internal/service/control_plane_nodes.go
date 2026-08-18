@@ -237,21 +237,21 @@ func (s *ControlPlaneService) GetNode(hashStr string) (*NodeSummary, error) {
 // effective while waiting for a complete runtime generation; an admitted
 // snapshot still runs to completion.
 func (s *ControlPlaneService) GetNodeContext(ctx context.Context, hashStr string) (*NodeSummary, error) {
+	h, err := node.ParseHex(hashStr)
+	if err != nil {
+		return nil, invalidArg("node_hash: invalid format")
+	}
 	var result *NodeSummary
 	var resultErr error
 	if readErr := s.withRuntimeReadContext(ctx, func() {
-		result, resultErr = s.getNode(hashStr)
+		result, resultErr = s.getNode(h)
 	}); readErr != nil {
 		return nil, readErr
 	}
 	return result, resultErr
 }
 
-func (s *ControlPlaneService) getNode(hashStr string) (*NodeSummary, error) {
-	h, err := node.ParseHex(hashStr)
-	if err != nil {
-		return nil, invalidArg("node_hash: invalid format")
-	}
+func (s *ControlPlaneService) getNode(h node.Hash) (*NodeSummary, error) {
 	entry, ok := s.Pool.GetEntry(h)
 	if !ok {
 		return nil, notFound("node not found")

@@ -274,7 +274,7 @@ func TestPreviewFilterHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing
 	fixture := newBlockingLeaseReadFixture(t)
 	request := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/platforms/preview-filter?limit=bad",
+		"/api/v1/platforms/preview-filter",
 		bytes.NewBufferString(`{}`),
 	)
 	recorder := httptest.NewRecorder()
@@ -287,7 +287,7 @@ func TestPreviewFilterHandlerRejectsInvalidQueryBeforeRuntimeMutation(t *testing
 	select {
 	case <-done:
 		if recorder.Code != http.StatusBadRequest {
-			t.Fatalf("invalid preview pagination status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			t.Fatalf("invalid preview filter status = %d, want %d", recorder.Code, http.StatusBadRequest)
 		}
 	case <-time.After(time.Second):
 		fixture.finish(t)

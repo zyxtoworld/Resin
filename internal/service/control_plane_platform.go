@@ -1077,44 +1077,61 @@ func (s *ControlPlaneService) PreviewFilter(req PreviewFilterRequest) ([]NodeSum
 // is effective while waiting for a complete runtime generation; an admitted
 // snapshot still runs to completion.
 func (s *ControlPlaneService) PreviewFilterContext(ctx context.Context, req PreviewFilterRequest) ([]NodeSummary, error) {
+	plan, err := preparePreviewFilter(req)
+	if err != nil {
+		return nil, err
+	}
 	var result []NodeSummary
-	var err error
 	if readErr := s.withRuntimeReadContext(ctx, func() {
-		result, err = s.previewFilter(req)
+		result, err = s.previewFilter(plan)
 	}); readErr != nil {
 		return nil, readErr
 	}
 	return result, err
 }
 
-func (s *ControlPlaneService) previewFilter(req PreviewFilterRequest) ([]NodeSummary, error) {
+type previewFilterPlan struct {
+	platformID    string
+	fromPlatform  bool
+	regexFilters  node.TagFilter
+	regionFilters []string
+}
+
+func preparePreviewFilter(req PreviewFilterRequest) (previewFilterPlan, error) {
 	hasPlatformID := req.PlatformID != nil && *req.PlatformID != ""
 	hasPlatformSpec := req.PlatformSpec != nil
 
 	if hasPlatformID == hasPlatformSpec {
-		return nil, invalidArg("exactly one of platform_id or platform_spec is required")
+		return previewFilterPlan{}, invalidArg("exactly one of platform_id or platform_spec is required")
 	}
 
-	var regexFilters node.TagFilter
-	var regionFilters []string
+	if hasPlatformSpec {
+		compiled, err := platform.CompileRegexFilters(req.PlatformSpec.RegexFilters)
+		if err != nil {
+			return previewFilterPlan{}, invalidArg(err.Error())
+		}
+		if err := platform.ValidateRegionFilters(req.PlatformSpec.RegionFilters); err != nil {
+			return previewFilterPlan{}, invalidArg(err.Error())
+		}
+		return previewFilterPlan{
+			regexFilters:  compiled,
+			regionFilters: append([]string(nil), req.PlatformSpec.RegionFilters...),
+		}, nil
+	}
 
-	if hasPlatformID {
-		plat, ok := s.Pool.GetPlatform(*req.PlatformID)
+	return previewFilterPlan{platformID: *req.PlatformID, fromPlatform: true}, nil
+}
+
+func (s *ControlPlaneService) previewFilter(plan previewFilterPlan) ([]NodeSummary, error) {
+	regexFilters := plan.regexFilters
+	regionFilters := plan.regionFilters
+	if plan.fromPlatform {
+		plat, ok := s.Pool.GetPlatform(plan.platformID)
 		if !ok {
 			return nil, notFound("platform not found")
 		}
 		regexFilters = plat.RegexFilters
 		regionFilters = plat.RegionFilters
-	} else {
-		compiled, err := platform.CompileRegexFilters(req.PlatformSpec.RegexFilters)
-		if err != nil {
-			return nil, invalidArg(err.Error())
-		}
-		regexFilters = compiled
-		regionFilters = req.PlatformSpec.RegionFilters
-		if err := platform.ValidateRegionFilters(regionFilters); err != nil {
-			return nil, invalidArg(err.Error())
-		}
 	}
 
 	var subLookup node.SubLookupFunc
