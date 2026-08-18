@@ -223,6 +223,11 @@ func TestGetSubscriptionDoesNotReenterRuntimeReadWhenWriterPending(t *testing.T)
 
 	select {
 	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime writer did not acquire its owner after the read completed")
+	}
+	select {
+	case <-writerDone:
 		t.Fatal("runtime writer completed before its gate was released")
 	default:
 	}
