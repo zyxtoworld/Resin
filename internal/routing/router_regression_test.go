@@ -16,6 +16,7 @@ import (
 
 type routerTestPool struct {
 	mu          sync.RWMutex
+	platformMu  sync.RWMutex
 	entries     map[node.Hash]*node.NodeEntry
 	platsByID   map[string]*platform.Platform
 	platsByName map[string]*platform.Platform
@@ -30,15 +31,15 @@ func newRouterTestPool() *routerTestPool {
 }
 
 func (p *routerTestPool) addPlatform(plat *platform.Platform) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.platformMu.Lock()
+	defer p.platformMu.Unlock()
 	p.platsByID[plat.ID] = plat
 	p.platsByName[plat.Name] = plat
 }
 
 func (p *routerTestPool) removePlatform(id string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.platformMu.Lock()
+	defer p.platformMu.Unlock()
 	plat, ok := p.platsByID[id]
 	if !ok {
 		return
@@ -79,29 +80,40 @@ func (p *routerTestPool) WithCurrentEntry(hash node.Hash, expected *node.NodeEnt
 	return true
 }
 
+func (p *routerTestPool) WithPlatformReadByID(id string, expected *platform.Platform, fn func()) bool {
+	p.platformMu.RLock()
+	defer p.platformMu.RUnlock()
+	current, ok := p.platsByID[id]
+	if !ok || current != expected || fn == nil {
+		return false
+	}
+	fn()
+	return true
+}
+
 func (p *routerTestPool) IsNodeDisabled(node.Hash) bool { return false }
 
 func (p *routerTestPool) GetPlatform(id string) (*platform.Platform, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.platformMu.RLock()
+	defer p.platformMu.RUnlock()
 	plat, ok := p.platsByID[id]
 	return plat, ok
 }
 
 func (p *routerTestPool) GetPlatformByName(name string) (*platform.Platform, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.platformMu.RLock()
+	defer p.platformMu.RUnlock()
 	plat, ok := p.platsByName[name]
 	return plat, ok
 }
 
 func (p *routerTestPool) RangePlatforms(fn func(*platform.Platform) bool) {
-	p.mu.RLock()
+	p.platformMu.RLock()
 	plats := make([]*platform.Platform, 0, len(p.platsByID))
 	for _, plat := range p.platsByID {
 		plats = append(plats, plat)
 	}
-	p.mu.RUnlock()
+	p.platformMu.RUnlock()
 
 	for _, plat := range plats {
 		if !fn(plat) {
@@ -189,6 +201,33 @@ func newTestRouter(pool PoolAccessor, onEvent LeaseEventFunc) *Router {
 		P2CWindow:    func() time.Duration { return 10 * time.Minute },
 		OnLeaseEvent: onEvent,
 	})
+}
+
+// poolAccessorOnly deliberately exposes the historical lookup surface without
+// either publication owner. A sticky side effect must fail closed for such a
+// pool instead of falling back to a check-then-write sequence.
+type poolAccessorOnly struct {
+	inner *routerTestPool
+}
+
+func (p *poolAccessorOnly) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
+	return p.inner.GetEntry(hash)
+}
+
+func (p *poolAccessorOnly) IsNodeDisabled(hash node.Hash) bool {
+	return p.inner.IsNodeDisabled(hash)
+}
+
+func (p *poolAccessorOnly) GetPlatform(id string) (*platform.Platform, bool) {
+	return p.inner.GetPlatform(id)
+}
+
+func (p *poolAccessorOnly) GetPlatformByName(name string) (*platform.Platform, bool) {
+	return p.inner.GetPlatformByName(name)
+}
+
+func (p *poolAccessorOnly) RangePlatforms(fn func(*platform.Platform) bool) {
+	p.inner.RangePlatforms(fn)
 }
 
 func TestRouteRequestKeepsPublishedViewDuringFullRebuild(t *testing.T) {

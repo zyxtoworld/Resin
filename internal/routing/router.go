@@ -114,6 +114,9 @@ type Router struct {
 	// Package-private seam called after QuarantineRoute validates the exact
 	// selected entry and immediately before it records the cooldown.
 	beforeResponseCooldownMarkHook func()
+	// Package-private seam used to pause a sticky lease commit immediately
+	// before it enters the platform and entry publication owners.
+	beforeStickyLeaseCommitOwnerHook func()
 	// Package-private seam called after Stop closes route admission and before
 	// it waits for lease-event delivery.
 	afterStopAdmissionHook func()
@@ -435,26 +438,43 @@ func (r *Router) CommitRouteForAccount(route RouteResult, account string) bool {
 		return false
 	}
 	events := r.newLeaseEventBatch()
+	platformID := route.platform.ID
+	committed := false
 	r.lifecycleMu.RLock()
 	if r.stopped || r.pool == nil {
 		r.lifecycleMu.RUnlock()
 		events.finish()
 		return false
 	}
-	currentPlatform, platformOK := r.pool.GetPlatform(route.platform.ID)
-	currentEntry, entryOK := r.pool.GetEntry(route.NodeHash)
-	if !platformOK || currentPlatform != route.platform || !entryOK || currentEntry != route.selectedEntry || !currentEntry.IsHealthy() || r.pool.IsNodeDisabled(route.NodeHash) || !route.platform.ContainsViewEntry(route.NodeHash, route.selectedEntry) {
+	platformExecutor, platformOK := r.pool.(PlatformGenerationExecutor)
+	entryExecutor, entryOK := r.pool.(ExactEntryExecutor)
+	if !platformOK || !entryOK {
 		r.lifecycleMu.RUnlock()
 		events.finish()
 		return false
 	}
-	r.upsertLeaseUnlocked(route.platform.ID, account, Lease{
-		NodeHash: route.NodeHash, EgressIP: route.EgressIP,
-		CreatedAtNs: now.UnixNano(), LastAccessedNs: now.UnixNano(), ExpiryNs: expiry,
-	}, events)
+	if hook := r.beforeStickyLeaseCommitOwnerHook; hook != nil {
+		hook()
+	}
+	platformExecutor.WithPlatformReadByID(platformID, route.platform, func() {
+		entryExecutor.WithCurrentEntry(route.NodeHash, route.selectedEntry, func() {
+			// The two executor callbacks already established the exact
+			// platform and entry identities. Do not re-enter GetPlatform or
+			// GetEntry here: custom executors may hold their lookup mutexes.
+			currentEntry := route.selectedEntry
+			if !currentEntry.IsHealthy() || currentEntry.GetEgressIP() != route.EgressIP || r.pool.IsNodeDisabled(route.NodeHash) || !route.platform.ContainsViewEntry(route.NodeHash, currentEntry) {
+				return
+			}
+			r.upsertLeaseUnlocked(platformID, account, Lease{
+				NodeHash: route.NodeHash, EgressIP: route.EgressIP,
+				CreatedAtNs: now.UnixNano(), LastAccessedNs: now.UnixNano(), ExpiryNs: expiry,
+			}, events)
+			committed = true
+		})
+	})
 	r.lifecycleMu.RUnlock()
 	events.finish()
-	return true
+	return committed
 }
 
 // RouteRequestForPlatform routes with an already captured platform generation.
