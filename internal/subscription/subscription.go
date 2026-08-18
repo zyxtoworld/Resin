@@ -208,6 +208,9 @@ type ConfigSnapshot struct {
 	EphemeralNodeEvictDelayNs int64
 	CreatedAtNs               int64
 	UpdatedAtNs               int64
+	LastCheckedNs             int64
+	LastUpdatedNs             int64
+	LastError                 string
 }
 
 // NewSubscription creates a Subscription with an empty ManagedNodes map.
@@ -302,9 +305,14 @@ func (s *Subscription) SnapshotConfigContext(ctx context.Context) (ConfigSnapsho
 		s.mu.RUnlock()
 
 		// These timestamps are immutable/operation-owned respectively. Holding
-		// opMu makes their copy part of the same configuration generation.
+		// opMu makes their copy part of the same configuration and refresh-status
+		// generation. The response builder may then do slower runtime reads
+		// without combining old configuration with a newer refresh result.
 		snapshot.CreatedAtNs = s.CreatedAtNs
 		snapshot.UpdatedAtNs = s.UpdatedAtNs
+		snapshot.LastCheckedNs = s.LastCheckedNs.Load()
+		snapshot.LastUpdatedNs = s.LastUpdatedNs.Load()
+		snapshot.LastError = *s.LastError.Load()
 	}); err != nil {
 		return ConfigSnapshot{}, err
 	}

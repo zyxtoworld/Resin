@@ -82,13 +82,13 @@ func (s *ControlPlaneService) subToResponseSnapshot(sub *subscription.Subscripti
 		Enabled:                 cfg.Enabled,
 		CreatedAt:               time.Unix(0, cfg.CreatedAtNs).UTC().Format(time.RFC3339Nano),
 	}
-	if lc := sub.LastCheckedNs.Load(); lc > 0 {
+	if lc := cfg.LastCheckedNs; lc > 0 {
 		resp.LastChecked = time.Unix(0, lc).UTC().Format(time.RFC3339Nano)
 	}
-	if lu := sub.LastUpdatedNs.Load(); lu > 0 {
+	if lu := cfg.LastUpdatedNs; lu > 0 {
 		resp.LastUpdated = time.Unix(0, lu).UTC().Format(time.RFC3339Nano)
 	}
-	resp.LastError = sub.GetLastError()
+	resp.LastError = cfg.LastError
 	return resp
 }
 

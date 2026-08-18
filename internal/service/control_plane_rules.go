@@ -82,6 +82,13 @@ func (s *ControlPlaneService) ListAccountHeaderRulesContext(ctx context.Context)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Mutations hold ruleMu from their persisted snapshot through the atomic
+	// matcher publish. Read the same owner so this API cannot expose a newer
+	// database generation while request-time matching still uses the old one.
+	if err := s.ruleMu.lockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer s.ruleMu.unlock()
 	rules, err := s.Engine.ListAccountHeaderRulesContext(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

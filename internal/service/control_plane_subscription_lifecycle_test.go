@@ -306,6 +306,84 @@ func TestSubscriptionResponseDoesNotMixConcurrentPatchGeneration(t *testing.T) {
 	}
 }
 
+func TestSubscriptionResponseCapturesRefreshStatusGeneration(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, true)
+	f.sub.SetLastError("old refresh error")
+	oldChecked := time.Now().Add(-2 * time.Hour).UnixNano()
+	f.sub.LastCheckedNs.Store(oldChecked)
+	f.sub.LastUpdatedNs.Store(oldChecked)
+
+	responseStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	var responseOnce sync.Once
+	f.cp.afterSubscriptionNameReadHook = func() {
+		responseOnce.Do(func() {
+			close(responseStarted)
+			<-allowResponse
+		})
+	}
+	defer func() {
+		select {
+		case <-allowResponse:
+		default:
+			close(allowResponse)
+		}
+		f.cp.afterSubscriptionNameReadHook = nil
+	}()
+	f.cp.Scheduler.Fetcher = func(context.Context, string) ([]byte, error) {
+		return nil, errors.New("new refresh error")
+	}
+
+	type readResult struct {
+		response *SubscriptionResponse
+		err      error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		response, err := f.cp.GetSubscription(f.sub.ID)
+		readDone <- readResult{response: response, err: err}
+	}()
+	select {
+	case <-responseStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetSubscription did not reach response snapshot")
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := f.cp.Scheduler.UpdateSubscriptionContextResult(context.Background(), f.sub)
+		refreshDone <- err
+	}()
+	select {
+	case err := <-refreshDone:
+		if err == nil || err.Error() != "new refresh error" {
+			t.Fatalf("refresh error = %v, want new refresh error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refresh did not record its failure")
+	}
+	if got := f.sub.GetLastError(); got != "new refresh error" {
+		t.Fatalf("refresh LastError = %q, want new refresh error", got)
+	}
+	if got := f.sub.LastCheckedNs.Load(); got == oldChecked {
+		t.Fatal("refresh did not advance LastCheckedNs")
+	}
+
+	close(allowResponse)
+	var got readResult
+	select {
+	case got = <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetSubscription did not finish after response release")
+	}
+	if got.err != nil || got.response == nil {
+		t.Fatalf("GetSubscription: response=%+v err=%v", got.response, got.err)
+	}
+	if got.response.LastError != "old refresh error" || got.response.LastChecked != time.Unix(0, oldChecked).UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("response mixed refresh status generation: %+v", *got.response)
+	}
+}
+
 func TestListSubscriptionsEnabledFilterUsesSamePatchSnapshot(t *testing.T) {
 	f := newSubscriptionPatchFixture(t, false)
 	nameRead := make(chan struct{})

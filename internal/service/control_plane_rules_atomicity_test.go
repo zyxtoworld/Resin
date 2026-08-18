@@ -136,6 +136,88 @@ func TestUpsertAccountHeaderRule_StateWriteAdmissionCoversMatcherPublish(t *test
 	}
 }
 
+func TestListAccountHeaderRules_DoesNotExposePersistedGenerationBeforeMatcherPublish(t *testing.T) {
+	root := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(root, "state"),
+		filepath.Join(root, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	oldRule := model.AccountHeaderRule{
+		URLPrefix:   "old.example.com",
+		Headers:     []string{"X-Old"},
+		UpdatedAtNs: time.Now().UnixNano(),
+	}
+	if _, err := engine.UpsertAccountHeaderRuleWithCreated(oldRule); err != nil {
+		t.Fatalf("seed old rule: %v", err)
+	}
+	loaded, err := engine.ListAccountHeaderRules()
+	if err != nil {
+		t.Fatalf("load old rules: %v", err)
+	}
+	runtime := proxy.NewAccountMatcherRuntime(proxy.BuildAccountMatcher(loaded))
+	cp := &ControlPlaneService{Engine: engine, MatcherRuntime: runtime}
+	persisted := make(chan struct{})
+	releasePublish := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releasePublish) }) })
+	cp.ruleMutationHook = func(stage ruleMutationStage) {
+		if stage == ruleMutationAfterPersist {
+			close(persisted)
+			<-releasePublish
+		}
+	}
+
+	upsertDone := make(chan error, 1)
+	go func() {
+		_, _, err := cp.UpsertAccountHeaderRule("new.example.com", []string{"X-New"})
+		upsertDone <- err
+	}()
+	select {
+	case <-persisted:
+	case <-time.After(time.Second):
+		t.Fatal("rule upsert did not reach the persisted-before-publish boundary")
+	}
+
+	type listResult struct {
+		rules []RuleResponse
+		err   error
+	}
+	listDone := make(chan listResult, 1)
+	go func() {
+		rules, err := cp.ListAccountHeaderRulesContext(context.Background())
+		listDone <- listResult{rules: rules, err: err}
+	}()
+	select {
+	case result := <-listDone:
+		t.Fatalf("list returned before matcher publish: rules=%+v err=%v", result.rules, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if prefix, headers := runtime.MatchWithPrefix("new.example.com", "/"); prefix != "" || headers != nil {
+		t.Fatalf("matcher unexpectedly exposed the pending rule: prefix=%q headers=%v", prefix, headers)
+	}
+
+	releaseOnce.Do(func() { close(releasePublish) })
+	if err := <-upsertDone; err != nil {
+		t.Fatalf("UpsertAccountHeaderRule: %v", err)
+	}
+	select {
+	case result := <-listDone:
+		if result.err != nil {
+			t.Fatalf("ListAccountHeaderRulesContext after publish: %v", result.err)
+		}
+		if len(result.rules) != 2 {
+			t.Fatalf("published rule list = %+v, want both rules", result.rules)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("list did not finish after matcher publish")
+	}
+}
+
 func TestDeleteAccountHeaderRule_PublishesCandidateWhenReloadListFailsAfterPersist(t *testing.T) {
 	root := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(
