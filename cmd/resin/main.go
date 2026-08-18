@@ -875,34 +875,54 @@ func loadBootstrapNodeStatics(
 
 func warmupBootstrapOutbounds(
 	hashes []node.Hash,
+	pool *topology.GlobalNodePool,
 	outboundMgr *outbound.OutboundManager,
-) {
+) error {
 	if len(hashes) == 0 {
-		return
+		return nil
 	}
 
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 1 {
 		workers = 1
 	}
-	hashCh := make(chan node.Hash, len(hashes))
-	for _, h := range hashes {
-		hashCh <- h
+	type warmupJob struct {
+		index int
+		hash  node.Hash
 	}
-	close(hashCh)
+	jobCh := make(chan warmupJob, len(hashes))
+	results := make([]error, len(hashes))
+	for index, h := range hashes {
+		jobCh <- warmupJob{index: index, hash: h}
+	}
+	close(jobCh)
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for h := range hashCh {
-				outboundMgr.EnsureNodeOutbound(h)
+			for job := range jobCh {
+				outboundMgr.EnsureNodeOutbound(job.hash)
+				entry, ok := pool.GetEntry(job.hash)
+				if !ok {
+					results[job.index] = fmt.Errorf("bootstrap outbound %s: node disappeared", job.hash.Hex())
+					continue
+				}
+				if !entry.HasOutbound() {
+					results[job.index] = fmt.Errorf("bootstrap outbound %s: %s", job.hash.Hex(), entry.GetLastError())
+				}
 			}
 		}()
 	}
 	wg.Wait()
+	for _, err := range results {
+		if err != nil {
+			return err
+		}
+	}
 	log.Printf("Parallel outbound init complete (%d workers)", workers)
+	return nil
 }
 
 func restoreBootstrapSubscriptionBindings(
@@ -1104,18 +1124,21 @@ func bootstrapNodes(
 	envCfg *config.EnvConfig,
 	latencyAuthorities []string,
 ) error {
-	hashes, err := loadBootstrapNodeStatics(engine, pool, envCfg)
-	if err != nil {
-		return err
-	}
-
-	warmupBootstrapOutbounds(hashes, outboundMgr)
 	bootstrapSucceeded := false
 	defer func() {
 		if !bootstrapSucceeded {
 			outboundMgr.RetireAllOutboundsAndWait()
 		}
 	}()
+
+	hashes, err := loadBootstrapNodeStatics(engine, pool, envCfg)
+	if err != nil {
+		return err
+	}
+
+	if err := warmupBootstrapOutbounds(hashes, pool, outboundMgr); err != nil {
+		return err
+	}
 
 	if err := restoreBootstrapSubscriptionBindings(engine, pool, subManager); err != nil {
 		return err
