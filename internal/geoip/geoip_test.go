@@ -884,11 +884,12 @@ func TestGeoIPStopAdmissionIsNotBlockedByOldReaderClose(t *testing.T) {
 		s.Stop()
 		close(stopDone)
 	}()
-	stopAdmissionObserved := false
 	select {
 	case <-stopAdmitted:
-		stopAdmissionObserved = true
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
+		close(allowClose)
+		<-updateDone
+		t.Fatal("Stop did not reach GeoIP stop admission")
 	}
 	if got := s.Lookup(netip.MustParseAddr("1.2.3.4")); got != "" {
 		t.Fatalf("reader remained visible after Stop admission while old Close was blocked: %q", got)
@@ -902,9 +903,6 @@ func TestGeoIPStopAdmissionIsNotBlockedByOldReaderClose(t *testing.T) {
 	case <-stopDone:
 	case <-time.After(time.Second):
 		t.Fatal("Stop did not finish after old reader Close was released")
-	}
-	if !stopAdmissionObserved {
-		t.Fatal("Stop admission was blocked by old reader Close")
 	}
 	if got := oldReader.closes(); got != 1 {
 		t.Fatalf("old reader Close count = %d, want 1", got)

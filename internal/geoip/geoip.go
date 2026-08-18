@@ -332,18 +332,27 @@ func (s *Service) StopContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var stoppedReader GeoReader
 	s.lifecycleMu.Lock()
 	if !s.stopped {
 		s.stopped = true
 		if s.lifeCancel != nil {
 			s.lifeCancel()
 		}
+		// Detach under the same lifecycleMu -> mu order used by reader
+		// publication. The shutdown admission hook must never observe a
+		// reader that Lookup can still reach, while arbitrary Close code runs
+		// outside lifecycleMu.
+		stoppedReader = s.swapReader(nil)
 		if hook := s.afterGeoIPStopAdmissionHook; hook != nil {
 			hook()
 		}
 	}
 	c := s.cron
 	s.lifecycleMu.Unlock()
+	if stoppedReader != nil {
+		s.closeReaderAsync(stoppedReader)
+	}
 
 	if c != nil {
 		// Stop prevents new scheduled jobs. The update owner below tracks the
