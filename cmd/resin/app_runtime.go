@@ -832,6 +832,11 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		go func() {
 			<-topologyReady
 			var errs []error
+			if a.endpointManager != nil {
+				if err := a.endpointManager.WaitForHTTPHandlers(context.Background()); err != nil {
+					errs = append(errs, err)
+				}
+			}
 			if _, err := closeStateWrites(context.Background()); err != nil {
 				errs = append(errs, err)
 			}
