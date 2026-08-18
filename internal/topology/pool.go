@@ -783,6 +783,24 @@ func (p *GlobalNodePool) WithPlatformReadByName(name string, fn func(*platform.P
 	return true
 }
 
+// WithPlatformReadByID runs fn while the exact platform generation remains
+// published under the platform read lock. It is the short publication owner
+// for side effects that belong to a captured platform pointer; a replacement
+// either waits for fn or makes this method fail closed before fn starts.
+func (p *GlobalNodePool) WithPlatformReadByID(id string, expected *platform.Platform, fn func()) bool {
+	if p == nil || id == "" || expected == nil || fn == nil {
+		return false
+	}
+	p.platMu.RLock()
+	defer p.platMu.RUnlock()
+	current, ok := p.platformByID[id]
+	if !ok || current != expected {
+		return false
+	}
+	fn()
+	return true
+}
+
 // SnapshotPlatformViewEntries returns one published platform view together
 // with the exact NodeEntry identity that satisfied each view member. The
 // platform publication lock covers the platform lookup and view copy, so a

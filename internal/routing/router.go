@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -58,6 +59,14 @@ type ExactEntryExecutor interface {
 	WithCurrentEntry(hash node.Hash, expected *node.NodeEntry, fn func()) bool
 }
 
+// PlatformGenerationExecutor provides the platform publication linearization
+// point for a side effect tied to one captured platform generation. The
+// implementation must hold its platform read owner across the identity check
+// and fn, so a replacement cannot publish between those operations.
+type PlatformGenerationExecutor interface {
+	WithPlatformReadByID(id string, expected *platform.Platform, fn func()) bool
+}
+
 // Router handles route selection and lease management.
 type Router struct {
 	pool   PoolAccessor
@@ -66,7 +75,7 @@ type Router struct {
 	// reads, and cleaner sweeps hold the read side. Platform removal first
 	// unregisters the platform from the pool, then takes the write side to drain
 	// old operations before deleting the complete routing state.
-	lifecycleMu            sync.RWMutex
+	lifecycleMu            contextRWMutex
 	stopped                bool
 	leaseEventsMu          sync.Mutex
 	leaseEventsCond        *sync.Cond
@@ -106,6 +115,10 @@ type Router struct {
 	// Package-private seam called after Stop closes route admission and before
 	// it waits for lease-event delivery.
 	afterStopAdmissionHook func()
+	// Package-private seam used to prove request cancellation while an IP-load
+	// snapshot waits for the Router lifecycle read owner. Production leaves it
+	// nil.
+	beforeIPLoadSnapshotLockHook func()
 }
 
 type RouterConfig struct {
@@ -1164,17 +1177,24 @@ func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleS
 	mark := func() {
 		r.responseCooldowns(route.PlatformID).markForEntry(scope, route.NodeHash, route.selectedEntry, route.EgressIP, until, r.now())
 	}
-	if executor, ok := r.pool.(ExactEntryExecutor); ok {
-		executor.WithCurrentEntry(route.NodeHash, route.selectedEntry, mark)
+	markCurrentEntry := func() {
+		if executor, ok := r.pool.(ExactEntryExecutor); ok {
+			executor.WithCurrentEntry(route.NodeHash, route.selectedEntry, mark)
+			return
+		}
+		// Test and narrow custom PoolAccessor implementations may not expose
+		// the node lifecycle owner. Preserve exact-pointer fail-closed behavior
+		// for those accessors.
+		if current, ok := r.pool.GetEntry(route.NodeHash); !ok || current != route.selectedEntry {
+			return
+		}
+		mark()
+	}
+	if executor, ok := r.pool.(PlatformGenerationExecutor); ok {
+		executor.WithPlatformReadByID(route.PlatformID, route.platform, markCurrentEntry)
 		return
 	}
-	// Test and narrow custom PoolAccessor implementations may not expose the
-	// lifecycle owner. Preserve the exact-pointer fail-closed behavior for
-	// those accessors; production GlobalNodePool implements the atomic path.
-	if current, ok := r.pool.GetEntry(route.NodeHash); !ok || current != route.selectedEntry {
-		return
-	}
-	mark()
+	markCurrentEntry()
 }
 
 func sameIPCandidateLatency(
@@ -1412,18 +1432,34 @@ func (r *Router) SnapshotIPLoad(platformID string) map[netip.Addr]int64 {
 // Router mutation admission has been stopped; a true value with an empty map
 // means no routing state or active leases.
 func (r *Router) SnapshotIPLoadForPlatform(platformID string) (map[netip.Addr]int64, bool) {
-	r.lifecycleMu.RLock()
+	snapshot, exists, _ := r.SnapshotIPLoadForPlatformContext(context.Background(), platformID)
+	return snapshot, exists
+}
+
+// SnapshotIPLoadForPlatformContext is the request-bound IP-load snapshot.
+// Cancellation is effective while waiting for Router lifecycle admission; an
+// admitted snapshot still completes under the same read owner.
+func (r *Router) SnapshotIPLoadForPlatformContext(ctx context.Context, platformID string) (map[netip.Addr]int64, bool, error) {
+	if r == nil {
+		return nil, false, nil
+	}
+	if hook := r.beforeIPLoadSnapshotLockHook; hook != nil {
+		hook()
+	}
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return nil, false, err
+	}
 	if r.stopped {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	if !r.platformExistsLocked(platformID) {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	snapshot := r.snapshotIPLoadUnlocked(platformID)
 	r.lifecycleMu.RUnlock()
-	return snapshot, true
+	return snapshot, true, nil
 }
 
 // SnapshotResponseCooldownsForPlatform atomically checks platform lifetime and

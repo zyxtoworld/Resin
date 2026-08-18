@@ -1162,6 +1162,76 @@ func TestPool_ReplacePlatform_WaitsForPlatformReadOwner(t *testing.T) {
 	}
 }
 
+func TestPool_WithPlatformReadByID_HoldsExactGeneration(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	pool := newTestPool(subMgr)
+	oldPlat := platform.NewPlatform("p-read-id-owner", "ReadIDOwner", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+
+	readEntered := make(chan struct{})
+	allowRead := make(chan struct{})
+	readDone := make(chan bool, 1)
+	go func() {
+		readDone <- pool.WithPlatformReadByID(oldPlat.ID, oldPlat, func() {
+			close(readEntered)
+			<-allowRead
+		})
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("platform read owner did not enter")
+	}
+
+	replaceAttempted := make(chan struct{})
+	pool.beforePlatformReplaceLockHook = func() { close(replaceAttempted) }
+	defer func() {
+		pool.beforePlatformReplaceLockHook = nil
+		select {
+		case <-allowRead:
+		default:
+			close(allowRead)
+		}
+	}()
+
+	nextPlat := platform.NewPlatform(oldPlat.ID, "ReadIDOwnerNext", nil, nil)
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	select {
+	case <-replaceAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("platform replacement did not reach its publication lock")
+	}
+	select {
+	case err := <-replaceDone:
+		t.Fatalf("ReplacePlatform committed while exact platform read owner was held: %v", err)
+	default:
+	}
+
+	close(allowRead)
+	select {
+	case ok := <-readDone:
+		if !ok {
+			t.Fatal("WithPlatformReadByID unexpectedly rejected the current generation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("platform read owner did not release")
+	}
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReplacePlatform did not finish after exact read owner release")
+	}
+	if got, ok := pool.GetPlatform(oldPlat.ID); !ok || got != nextPlat {
+		t.Fatalf("replacement not published after exact read owner release: got=%p ok=%v", got, ok)
+	}
+}
+
 func TestPool_ReplacePlatform_NameConflict(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	pool := newTestPool(subMgr)

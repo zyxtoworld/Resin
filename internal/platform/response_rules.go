@@ -555,7 +555,10 @@ func responseRuleDeadline(rule ResponseRule, body []byte, bodyComplete bool, hea
 		if ok {
 			var until time.Time
 			var valid bool
-			if source.typ == "retry_after" && source.format == "" {
+			// retry_after is an HTTP-defined source. Older persisted rules may
+			// still carry format:"delta_seconds", but that legacy field must not
+			// disable HTTP-date parsing.
+			if source.typ == "retry_after" {
 				until, valid = parseRetryAfter(raw, now)
 			} else {
 				until, valid = parseResponseExpiry(raw, source.format, now)

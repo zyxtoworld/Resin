@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"sync"
@@ -12,6 +13,63 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 )
+
+func TestSnapshotIPLoadContextCancellationInterruptsLifecycleReadWait(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-ip-load-cancel", "Plat-IP-Load-Cancel", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+
+	router.lifecycleMu.Lock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		router.lifecycleMu.Unlock()
+	}
+	defer release()
+
+	lockAttempted := make(chan struct{})
+	var attemptOnce sync.Once
+	router.beforeIPLoadSnapshotLockHook = func() {
+		attemptOnce.Do(func() { close(lockAttempted) })
+	}
+	defer func() { router.beforeIPLoadSnapshotLockHook = nil }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type snapshotResult struct {
+		err error
+	}
+	done := make(chan snapshotResult, 1)
+	go func() {
+		_, _, err := router.SnapshotIPLoadForPlatformContext(ctx, plat.ID)
+		done <- snapshotResult{err: err}
+	}()
+	select {
+	case <-lockAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("IP-load snapshot did not reach lifecycle lock boundary")
+	}
+	cancel()
+
+	timedOut := false
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled IP-load snapshot error = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(time.Second):
+		timedOut = true
+	}
+	if timedOut {
+		release()
+		<-done
+		t.Fatal("canceled IP-load snapshot remained blocked until lifecycle writer release")
+	}
+}
 
 func TestLeaseCallbackReadReentryDoesNotDeadlockWithPendingPlatformRemoval(t *testing.T) {
 	pool := newRouterTestPool()

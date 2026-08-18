@@ -199,6 +199,29 @@ func TestResponseRules_ExpirySourcesOnlyUseConfiguredOrder(t *testing.T) {
 	}
 }
 
+func TestResponseRules_LegacyRetryAfterFormatKeepsHTTPDateSemantics(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	rules, err := CompileResponseRules("plat-legacy-retry-after", []model.PlatformResponseRule{{
+		ID: "legacy-retry-after", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{
+			Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none",
+			ExpirySources: []model.PlatformResponseExpirySource{{Type: "retry_after", Format: "delta_seconds"}},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+
+	until := now.Add(90 * time.Second)
+	decision, ok := rules.Match(http.StatusTooManyRequests, nil, true, http.Header{
+		"Retry-After": []string{until.Format(http.TimeFormat)},
+	}, now)
+	if !ok || !decision.Cooldown || !decision.Until.Equal(until) {
+		t.Fatalf("legacy Retry-After HTTP-date was not parsed: decision=%+v matched=%v", decision, ok)
+	}
+}
+
 func TestResponseRules_ExpiryRejectsPastAndFarFuture(t *testing.T) {
 	rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{{
 		ID: "expiry", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}},

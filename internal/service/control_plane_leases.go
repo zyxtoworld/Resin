@@ -287,7 +287,11 @@ func (s *ControlPlaneService) GetIPLoadContext(ctx context.Context, platformID s
 	var result []IPLoadEntry
 	var readErr error
 	if err := s.withRuntimeReadContext(ctx, func() {
-		snapshot, exists := s.Router.SnapshotIPLoadForPlatform(platformID)
+		snapshot, exists, err := s.Router.SnapshotIPLoadForPlatformContext(ctx, platformID)
+		if err != nil {
+			readErr = err
+			return
+		}
 		if !exists {
 			readErr = notFound("platform not found")
 			return

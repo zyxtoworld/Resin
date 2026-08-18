@@ -333,6 +333,11 @@ type ControlPlaneService struct {
 	// read has acquired the pool read owner. Production leaves it nil.
 	afterRuntimeReadLockHook func()
 
+	// afterRouteStateNodesHook is a package-test seam after route-state has
+	// copied the platform node view and before it reads Router state. Production
+	// leaves it nil.
+	afterRouteStateNodesHook func()
+
 	// beforePlatformReadHook is a package-test seam immediately before a
 	// platform read enters the service-owned platform generation boundary.
 	// Production leaves it nil.

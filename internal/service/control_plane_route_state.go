@@ -80,6 +80,15 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 	if s == nil || s.Router == nil {
 		return nil, internal("route state", routing.ErrRouterStopped)
 	}
+	// Platform replacement serializes the persisted model and pool view under
+	// platformMu. Take the same owner before the runtime read so a route-state
+	// response cannot copy the old node view and then observe Router state after
+	// a new platform generation is published.
+	if err := s.platformMu.lockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer s.platformMu.Unlock()
+
 	var result *PlatformRouteStateResponse
 	var resultErr error
 	if err := s.withRuntimeReadContext(ctx, func() {
@@ -88,6 +97,9 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 		if err != nil {
 			resultErr = err
 			return
+		}
+		if hook := s.afterRouteStateNodesHook; hook != nil {
+			hook()
 		}
 		leasePage, exists, err := s.Router.SnapshotLeasePageForPlatform(platformID, routing.LeasePageQuery{
 			Account: query.LeaseAccount,
