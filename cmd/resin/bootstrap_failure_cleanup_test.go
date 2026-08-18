@@ -170,7 +170,7 @@ func TestBootstrapNodes_ErrorRetiresWarmupOutbounds(t *testing.T) {
 	}
 }
 
-func TestBootstrapNodes_FailsAndRetiresWhenWarmupBuildFails(t *testing.T) {
+func TestBootstrapNodes_IsolatesWarmupBuildFailureAndRetainsHealthyOutbounds(t *testing.T) {
 	stateDir := t.TempDir()
 	cacheDir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(stateDir, cacheDir)
@@ -195,21 +195,21 @@ func TestBootstrapNodes_FailsAndRetiresWhenWarmupBuildFails(t *testing.T) {
 	builder := &bootstrapWarmupFailureBuilder{}
 	outboundMgr := outbound.NewOutboundManager(pool, builder)
 
-	if err := bootstrapNodes(engine, pool, subManager, outboundMgr, envCfg, runtimeCfg.LatencyAuthorities); err == nil {
-		t.Fatal("bootstrapNodes unexpectedly succeeded after a warmup outbound build failed")
+	if err := bootstrapNodes(engine, pool, subManager, outboundMgr, envCfg, runtimeCfg.LatencyAuthorities); err != nil {
+		t.Fatalf("bootstrapNodes should isolate a warmup outbound build failure: %v", err)
 	}
 	if got := builder.builds.Load(); got != 2 {
 		t.Fatalf("warmup builds = %d, want 2", got)
 	}
-	if got := builder.closes.Load(); got != 1 {
-		t.Fatalf("successful warmup outbound closes = %d, want 1 during rollback", got)
+	if got := builder.closes.Load(); got != 0 {
+		t.Fatalf("successful warmup outbound closes = %d before explicit retirement, want 0", got)
 	}
 	workingEntry, ok := pool.GetEntry(node.HashFromRawOptions(workingRaw))
 	if !ok {
 		t.Fatal("working bootstrap node disappeared unexpectedly")
 	}
-	if workingEntry.Outbound.Load() != nil {
-		t.Fatal("failed bootstrap left a working outbound published")
+	if workingEntry.Outbound.Load() == nil {
+		t.Fatal("isolated bootstrap failure lost the working outbound")
 	}
 	failingEntry, ok := pool.GetEntry(node.HashFromRawOptions(failingRaw))
 	if !ok {
@@ -218,9 +218,13 @@ func TestBootstrapNodes_FailsAndRetiresWhenWarmupBuildFails(t *testing.T) {
 	if failingEntry.Outbound.Load() != nil {
 		t.Fatal("failed warmup node published an outbound")
 	}
+	outboundMgr.RetireAllOutboundsAndWait()
+	if got := builder.closes.Load(); got != 1 {
+		t.Fatalf("successful warmup outbound closes = %d after retirement, want 1", got)
+	}
 }
 
-func TestWarmupBootstrapOutbounds_ReturnsInputOrderErrorAfterReverseCompletion(t *testing.T) {
+func TestWarmupBootstrapOutbounds_ReturnsInputOrderFailuresAfterReverseCompletion(t *testing.T) {
 	previousMaxProcs := runtime.GOMAXPROCS(2)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previousMaxProcs) })
 
@@ -260,7 +264,7 @@ func TestWarmupBootstrapOutbounds_ReturnsInputOrderErrorAfterReverseCompletion(t
 		outboundMgr.RetireAllOutboundsAndWait()
 	})
 
-	warmupDone := make(chan error, 1)
+	warmupDone := make(chan []error, 1)
 	go func() {
 		warmupDone <- warmupBootstrapOutbounds([]node.Hash{firstHash, secondHash, workingHash}, pool, outboundMgr)
 	}()
@@ -289,32 +293,41 @@ func TestWarmupBootstrapOutbounds_ReturnsInputOrderErrorAfterReverseCompletion(t
 	}
 
 	builder.releaseFirst()
-	var err error
+	var failures []error
 	select {
-	case err = <-warmupDone:
+	case failures = <-warmupDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("warmup did not finish after all build gates were released")
 	}
-	if err == nil || !strings.Contains(err.Error(), "first warmup build failed") {
-		t.Fatalf("warmup error = %v, want input-first failure", err)
+	if len(failures) != 2 || !strings.Contains(failures[0].Error(), "first warmup build failed") {
+		t.Fatalf("warmup failures = %v, want input-first failure first", failures)
 	}
-	if strings.Contains(err.Error(), "second warmup build failed") {
-		t.Fatalf("warmup returned later input failure: %v", err)
+	if strings.Contains(failures[0].Error(), "second warmup build failed") {
+		t.Fatalf("warmup returned later input failure first: %v", failures)
+	}
+	if !strings.Contains(failures[1].Error(), "second warmup build failed") {
+		t.Fatalf("warmup failures = %v, want second input failure second", failures)
 	}
 	if got := builder.builds.Load(); got != 3 {
 		t.Fatalf("warmup builds = %d, want all 3 inputs processed", got)
 	}
 
-	outboundMgr.RetireAllOutboundsAndWait()
-	if got := builder.closes.Load(); got != 1 {
-		t.Fatalf("successful warmup outbound closes = %d, want 1", got)
-	}
 	pool.RangeNodes(func(hash node.Hash, entry *node.NodeEntry) bool {
+		if hash == workingHash {
+			if entry.Outbound.Load() == nil {
+				t.Errorf("working node %s lost its published outbound", hash.Hex())
+			}
+			return true
+		}
 		if entry.Outbound.Load() != nil {
-			t.Errorf("node %s retained a published outbound after failed warmup", hash.Hex())
+			t.Errorf("failed node %s retained a published outbound", hash.Hex())
 		}
 		return true
 	})
+	outboundMgr.RetireAllOutboundsAndWait()
+	if got := builder.closes.Load(); got != 1 {
+		t.Fatalf("successful warmup outbound closes = %d after retirement, want 1", got)
+	}
 }
 
 var _ adapter.Outbound = (*bootstrapCleanupTrackingOutbound)(nil)

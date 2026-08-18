@@ -50,6 +50,15 @@ func (b *failBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
 	return nil, errors.New("simulated build failure")
 }
 
+type partialFailBuilder struct {
+	partial *closableOnly
+}
+
+func (b *partialFailBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
+	b.partial = &closableOnly{}
+	return b.partial, errors.New("simulated partial build failure")
+}
+
 type panicBuilder struct{}
 
 func (b *panicBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
@@ -233,6 +242,26 @@ func TestEnsureNodeOutbound_BuildFailure(t *testing.T) {
 	}
 	if entry.GetLastError() == "" {
 		t.Fatal("expected GetLastError() non-empty after build failure")
+	}
+}
+
+func TestEnsureNodeOutbound_PartialBuildFailureClosesAdapter(t *testing.T) {
+	entry := newTestEntry(`{"type":"partial-fail"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	builder := &partialFailBuilder{}
+
+	mgr := NewOutboundManager(pool, builder)
+	mgr.EnsureNodeOutbound(entry.Hash)
+
+	if builder.partial == nil || !builder.partial.closed.Load() {
+		t.Fatal("partially-created outbound was not closed after build failure")
+	}
+	if entry.HasOutbound() {
+		t.Fatal("failed partial build published an outbound")
+	}
+	if !strings.Contains(entry.GetLastError(), "simulated partial build failure") {
+		t.Fatalf("unexpected partial build error: %q", entry.GetLastError())
 	}
 }
 

@@ -877,7 +877,7 @@ func warmupBootstrapOutbounds(
 	hashes []node.Hash,
 	pool *topology.GlobalNodePool,
 	outboundMgr *outbound.OutboundManager,
-) error {
+) []error {
 	if len(hashes) == 0 {
 		return nil
 	}
@@ -916,13 +916,18 @@ func warmupBootstrapOutbounds(
 		}()
 	}
 	wg.Wait()
+	failures := make([]error, 0)
 	for _, err := range results {
 		if err != nil {
-			return err
+			failures = append(failures, err)
 		}
 	}
-	log.Printf("Parallel outbound init complete (%d workers)", workers)
-	return nil
+	if len(failures) == 0 {
+		log.Printf("Parallel outbound init complete (%d workers)", workers)
+		return nil
+	}
+	log.Printf("Parallel outbound init completed with %d degraded node(s) (%d workers)", len(failures), workers)
+	return failures
 }
 
 func restoreBootstrapSubscriptionBindings(
@@ -1136,8 +1141,12 @@ func bootstrapNodes(
 		return err
 	}
 
-	if err := warmupBootstrapOutbounds(hashes, pool, outboundMgr); err != nil {
-		return err
+	for _, err := range warmupBootstrapOutbounds(hashes, pool, outboundMgr) {
+		// A malformed persisted node must not take down the whole process. The
+		// OutboundManager leaves the exact entry without an outbound and records
+		// the build error, so all routing paths fail closed for that node while
+		// healthy entries continue through bootstrap.
+		log.Printf("[bootstrap] node degraded: %v", err)
 	}
 
 	if err := restoreBootstrapSubscriptionBindings(engine, pool, subManager); err != nil {

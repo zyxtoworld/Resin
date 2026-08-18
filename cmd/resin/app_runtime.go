@@ -500,7 +500,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		MatcherRuntime: a.accountMatcher,
 	}
 
-	apiSrv := api.NewServerWithAddress(
+	apiSrv := api.NewServerWithAddressAndHealth(
 		a.envCfg.ListenAddress,
 		a.envCfg.ResinPort,
 		a.envCfg.AdminToken,
@@ -511,6 +511,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		int64(a.envCfg.APIMaxBodyBytes),
 		a.requestlogRepo,
 		a.metricsManager,
+		a.healthzStatus,
 	)
 	tokenActionHandler := api.NewTokenActionHandler(
 		a.envCfg.ProxyToken,
@@ -627,6 +628,30 @@ func (a *resinApp) buildProxyEvents() proxy.ConfigAwareEventEmitter {
 			}
 		},
 	}
+}
+
+// healthzStatus exposes node-local bootstrap failures without turning a
+// liveness endpoint into a process-fatal readiness gate. Routing itself still
+// excludes entries without an outbound, so a degraded node cannot be picked.
+func (a *resinApp) healthzStatus() api.HealthzStatus {
+	status := api.HealthzStatus{Status: "ok"}
+	if a == nil || a.topoRuntime == nil || a.topoRuntime.pool == nil {
+		return status
+	}
+	degraded := 0
+	a.topoRuntime.pool.WithRuntimeRead(func() {
+		a.topoRuntime.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
+			if entry != nil && !entry.HasOutbound() && entry.GetLastError() != "" {
+				degraded++
+			}
+			return true
+		})
+	})
+	if degraded > 0 {
+		status.Status = "degraded"
+		status.DegradedNodes = degraded
+	}
+	return status
 }
 
 func (a *resinApp) startServers() <-chan error {

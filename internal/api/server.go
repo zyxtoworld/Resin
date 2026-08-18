@@ -59,10 +59,40 @@ func NewServerWithAddress(
 	requestlogRepo *requestlog.Repo,
 	metricsManager *metrics.Manager,
 ) *Server {
+	return NewServerWithAddressAndHealth(
+		listenAddress,
+		port,
+		adminToken,
+		systemInfo,
+		runtimeCfg,
+		envCfg,
+		cp,
+		apiMaxBodyBytes,
+		requestlogRepo,
+		metricsManager,
+		nil,
+	)
+}
+
+// NewServerWithAddressAndHealth creates a server with an optional dynamic
+// liveness/degraded status provider for /healthz.
+func NewServerWithAddressAndHealth(
+	listenAddress string,
+	port int,
+	adminToken string,
+	systemInfo service.SystemInfo,
+	runtimeCfg *atomic.Pointer[config.RuntimeConfig],
+	envCfg *config.EnvConfig,
+	cp *service.ControlPlaneService,
+	apiMaxBodyBytes int64,
+	requestlogRepo *requestlog.Repo,
+	metricsManager *metrics.Manager,
+	healthProvider func() HealthzStatus,
+) *Server {
 	mux := http.NewServeMux()
 
 	// Public (no auth)
-	mux.Handle("GET /healthz", HandleHealthz())
+	mux.Handle("GET /healthz", HandleHealthzWithStatus(healthProvider))
 
 	// Authenticated routes
 	authed := http.NewServeMux()

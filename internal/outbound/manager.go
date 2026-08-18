@@ -148,6 +148,11 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 
 	ob, err := buildOutboundSafely(m.builder, entry.RawOptions)
 	if err != nil {
+		// Builders are allowed to return a partially-created adapter alongside
+		// an error. It is still owned by this failed attempt and must not leak.
+		if ob != nil {
+			closeOutbound(ob)
+		}
 		entry.SetLastError("outbound build: " + err.Error())
 		return
 	}
@@ -169,6 +174,9 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 		closeOutbound(ob)
 		return
 	}
+	// A later successful build is the recovery boundary for a prior
+	// node-local outbound error.
+	entry.SetLastError("")
 
 	// Retire-and-close if the node disappeared/replaced right after install.
 	if !m.isLiveEntry(hash, entry) {
