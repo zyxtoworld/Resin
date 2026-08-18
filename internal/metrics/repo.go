@@ -349,6 +349,10 @@ func (r *MetricsRepo) acquireContextConn(ctx context.Context) (*sql.Conn, func()
 		return nil, nil, timeoutErr
 	}
 	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+		// The driver may apply the pragma before reporting an error. Mark
+		// the connection bad before Close so database/sql cannot return a
+		// partially configured connection to the pool.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 		_ = conn.Close()
 		return nil, nil, err
 	}

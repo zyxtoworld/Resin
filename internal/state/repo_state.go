@@ -61,6 +61,11 @@ func newStateRepo(db *sql.DB) *StateRepo {
 
 var ErrStateWriteAdmissionClosed = errors.New("state write admission closed")
 
+type stateWriteExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
 // withWrite admits one strong-persistence mutation. Shutdown closes this
 // admission before closing state.db so a handler that outlives HTTP draining
 // cannot start a new state mutation.
@@ -155,20 +160,34 @@ func (r *StateRepo) withWriteContextAndCommit(parent context.Context, fn func(co
 	}
 }
 
-func (r *StateRepo) lockWriteContext(ctx context.Context) (func(), error) {
+func (r *StateRepo) lockWriteContext(ctx context.Context) (stateWriteExecutor, func(), error) {
 	if err := r.mu.lockContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !isContextSQLiteWrite(ctx) {
-		return r.mu.Unlock, nil
+		return r.db, r.mu.Unlock, nil
 	}
 
-	if _, err := r.db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", contextSQLiteBusyTimeoutMs)); err != nil {
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
 		r.mu.Unlock()
-		return nil, err
+		return nil, nil, err
 	}
-	return func() {
-		_, _ = r.db.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", contextSQLiteBusyTimeoutMs)); err != nil {
+		// The driver may apply the pragma before reporting an error. Do not
+		// return the request-sized connection to database/sql's idle pool.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		_ = conn.Close()
+		r.mu.Unlock()
+		return nil, nil, err
+	}
+	return conn, func() {
+		if !resetStateSQLiteBusyTimeout(conn) {
+			// A failed reset leaves the connection state unknown. It must not
+			// be reused by a later legacy write.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
 		r.mu.Unlock()
 	}, nil
 }
@@ -254,7 +273,11 @@ func (r *StateRepo) withCommitTx(
 			return err
 		}
 		defer func() {
-			_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+			if !resetStateSQLiteBusyTimeout(conn) {
+				// A failed reset may leave the driver-side timeout changed. Do
+				// not return that connection to database/sql's idle pool.
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
 			_ = conn.Close()
 		}()
 
@@ -266,6 +289,9 @@ func (r *StateRepo) withCommitTx(
 			busyTimeoutMs = contextSQLiteBusyTimeoutMs
 		}
 		if _, err := conn.ExecContext(writeCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMs)); err != nil {
+			// The driver may apply the pragma before reporting an error. The
+			// setup failed, so never return this connection to the idle pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			return err
 		}
 		rollback := true
@@ -275,7 +301,11 @@ func (r *StateRepo) withCommitTx(
 				// its context-aware call returns after acquiring the writer,
 				// the connection still needs an explicit rollback before it
 				// can return to the pool.
-				_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+				if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+					// The transaction state is unknown. Do not let a possibly
+					// open transaction return to database/sql's idle pool.
+					_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+				}
 			}
 		}()
 		if _, err := conn.ExecContext(writeCtx, "BEGIN IMMEDIATE"); err != nil {
@@ -420,13 +450,13 @@ func (r *StateRepo) SaveSystemConfigContext(ctx context.Context, cfg *config.Run
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(writeCtx, systemConfigUpsertSQL,
+		_, err = exec.ExecContext(writeCtx, systemConfigUpsertSQL,
 			string(data), version, updatedAtNs)
 		return err
 	})
@@ -566,13 +596,13 @@ func (r *StateRepo) UpsertPlatformContext(ctx context.Context, p model.Platform)
 	}
 
 	return r.withWriteContext(ctx, func(ctx context.Context) error {
-		unlock, err := r.lockWriteContext(ctx)
+		exec, unlock, err := r.lockWriteContext(ctx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(ctx, platformUpsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		_, err = exec.ExecContext(ctx, platformUpsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
 		if err != nil {
 			if isSQLiteUniqueConstraint(err) {
 				return fmt.Errorf("%w: platform name already exists", ErrConflict)
@@ -617,13 +647,13 @@ func (r *StateRepo) InsertPlatformContext(ctx context.Context, p model.Platform)
 	}
 
 	return r.withWriteContext(ctx, func(ctx context.Context) error {
-		unlock, err := r.lockWriteContext(ctx)
+		exec, unlock, err := r.lockWriteContext(ctx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(ctx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
+		_, err = exec.ExecContext(ctx, platformInsertSQL, platformPersistenceArgs(p, regexFiltersJSON, regionFiltersJSON, responseRulesJSON)...)
 		if err != nil {
 			if isSQLitePlatformConflict(err) {
 				return fmt.Errorf("%w: platform ID or name already exists", ErrConflict)
@@ -690,13 +720,13 @@ func (r *StateRepo) DeletePlatform(id string) error {
 // DeletePlatformContext removes a platform by ID while honoring ctx.
 func (r *StateRepo) DeletePlatformContext(ctx context.Context, id string) error {
 	return r.withWriteContext(ctx, func(ctx context.Context) error {
-		unlock, err := r.lockWriteContext(ctx)
+		exec, unlock, err := r.lockWriteContext(ctx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(ctx, "DELETE FROM platforms WHERE id = ?", id)
+		result, err := exec.ExecContext(ctx, "DELETE FROM platforms WHERE id = ?", id)
 		if err != nil {
 			return err
 		}
@@ -884,13 +914,13 @@ func (r *StateRepo) UpsertSubscriptionContext(ctx context.Context, s model.Subsc
 		if err := writeCtx.Err(); err != nil {
 			return err
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(writeCtx, subscriptionUpsertSQL,
+		_, err = exec.ExecContext(writeCtx, subscriptionUpsertSQL,
 			s.ID, s.Name, s.SourceType, s.URL, s.Content, s.UpdateIntervalNs, s.Enabled,
 			s.Ephemeral, s.IncrementalAliveNodes, s.EphemeralNodeEvictDelayNs, s.CreatedAtNs, s.UpdatedAtNs)
 		return err
@@ -926,13 +956,13 @@ func (r *StateRepo) DeleteSubscriptionContext(ctx context.Context, id string) er
 		if err := writeCtx.Err(); err != nil {
 			return err
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(writeCtx, "DELETE FROM subscriptions WHERE id = ?", id)
+		result, err := exec.ExecContext(writeCtx, "DELETE FROM subscriptions WHERE id = ?", id)
 		if err != nil {
 			return err
 		}
@@ -999,13 +1029,13 @@ func (r *StateRepo) InsertEndpointContext(ctx context.Context, endpoint model.En
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		_, err = r.db.ExecContext(writeCtx, `
+		_, err = exec.ExecContext(writeCtx, `
 		INSERT INTO endpoints (
 			id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
 			allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
@@ -1032,13 +1062,13 @@ func (r *StateRepo) UpdateEndpointContext(ctx context.Context, endpoint model.En
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(writeCtx, `
+		result, err := exec.ExecContext(writeCtx, `
 		UPDATE endpoints SET
 			port = ?,
 			enabled = ?,
@@ -1079,13 +1109,13 @@ func (r *StateRepo) DeleteEndpointContext(ctx context.Context, id string) error 
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(writeCtx, "DELETE FROM endpoints WHERE id = ?", id)
+		result, err := exec.ExecContext(writeCtx, "DELETE FROM endpoints WHERE id = ?", id)
 		if err != nil {
 			return err
 		}
@@ -1227,13 +1257,13 @@ func (r *StateRepo) EnsureAccountHeaderRuleContext(ctx context.Context, rule mod
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(writeCtx, `
+		result, err := exec.ExecContext(writeCtx, `
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
 		VALUES (?, ?, ?)
 		ON CONFLICT(url_prefix) DO NOTHING
@@ -1267,13 +1297,13 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreatedContext(ctx context.Contex
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		tx, err := r.db.BeginTx(writeCtx, nil)
+		tx, err := exec.BeginTx(writeCtx, nil)
 		if err != nil {
 			return err
 		}
@@ -1319,13 +1349,13 @@ func (r *StateRepo) DeleteAccountHeaderRuleContext(ctx context.Context, prefix s
 		if hook := r.beforeWriteMutexHook; hook != nil {
 			hook()
 		}
-		unlock, err := r.lockWriteContext(writeCtx)
+		exec, unlock, err := r.lockWriteContext(writeCtx)
 		if err != nil {
 			return err
 		}
 		defer unlock()
 
-		result, err := r.db.ExecContext(writeCtx, "DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
+		result, err := exec.ExecContext(writeCtx, "DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
 		if err != nil {
 			return err
 		}
