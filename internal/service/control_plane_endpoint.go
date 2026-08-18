@@ -460,6 +460,16 @@ func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id stri
 		persistCtx := writeCtx
 		if runtimeStage != nil {
 			persistCtx = commitCtx
+		} else if s.EndpointRuntime != nil && !next.Enabled {
+			// Disabling an endpoint has no prepared listener candidate, but the
+			// database update and the subsequent runtime removal are still one
+			// irreversible generation. Cross that boundary only after the
+			// request has remained live, then keep the DB write independent of a
+			// client disconnect just like the staged path above.
+			if err := writeCtx.Err(); err != nil {
+				return err
+			}
+			persistCtx = commitCtx
 		}
 		if err := s.Engine.UpdateEndpointContext(persistCtx, next); err != nil {
 			if runtimeStage != nil {

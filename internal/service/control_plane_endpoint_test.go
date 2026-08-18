@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -13,7 +14,34 @@ import (
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/state"
+	moderncsqlite "modernc.org/sqlite"
 )
+
+var cancelAfterEndpointUpdate struct {
+	sync.Mutex
+	cancel context.CancelFunc
+}
+
+var registerCancelAfterEndpointUpdate sync.Once
+
+func registerCancelAfterEndpointUpdateFunction() {
+	registerCancelAfterEndpointUpdate.Do(func() {
+		moderncsqlite.MustRegisterDeterministicScalarFunction(
+			"resin_test_cancel_after_endpoint_update",
+			0,
+			func(_ *moderncsqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+				cancelAfterEndpointUpdate.Lock()
+				cancel := cancelAfterEndpointUpdate.cancel
+				cancelAfterEndpointUpdate.cancel = nil
+				cancelAfterEndpointUpdate.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+				return int64(1), nil
+			},
+		)
+	})
+}
 
 type endpointRuntimeStub struct {
 	endpoints    map[string]model.Endpoint
@@ -1118,4 +1146,70 @@ func TestControlPlaneEndpoints_EnableAndDisableWithPatch(t *testing.T) {
 	} else {
 		assertServiceErrorCode(t, err, "CONFLICT")
 	}
+}
+
+func TestUpdateEndpointContext_DisableSurvivesCancellationAfterSQLiteMutation(t *testing.T) {
+	registerCancelAfterEndpointUpdateFunction()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	cacheDir := filepath.Join(root, "cache")
+	engine, closer, err := state.PersistenceBootstrap(stateDir, cacheDir)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+	runtime := newEndpointRuntimeStub()
+	cp := &ControlPlaneService{
+		Engine:          engine,
+		EnvCfg:          &config.EnvConfig{ResinPort: 2260, AuthVersion: config.AuthVersionV1},
+		EndpointRuntime: runtime,
+	}
+	created, err := cp.CreateEndpoint(CreateEndpointRequest{Port: 32063})
+	if err != nil {
+		t.Fatalf("CreateEndpoint: %v", err)
+	}
+
+	triggerDB, err := state.OpenDB(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("OpenDB for cancellation trigger: %v", err)
+	}
+	t.Cleanup(func() { _ = triggerDB.Close() })
+	if _, err := triggerDB.Exec(`
+		CREATE TRIGGER cancel_after_endpoint_disable
+		AFTER UPDATE ON endpoints
+		WHEN NEW.id = '` + created.ID + `' AND NEW.enabled = 0
+		BEGIN
+			SELECT resin_test_cancel_after_endpoint_update();
+		END;`); err != nil {
+		t.Fatalf("create endpoint cancellation trigger: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelAfterEndpointUpdate.Lock()
+	cancelAfterEndpointUpdate.cancel = cancel
+	cancelAfterEndpointUpdate.Unlock()
+
+	response, updateErr := cp.UpdateEndpointContext(requestCtx, created.ID, json.RawMessage(`{"enabled":false}`))
+	persisted, err := engine.GetEndpoint(created.ID)
+	if err != nil {
+		t.Fatalf("GetEndpoint after canceled disable: %v", err)
+	}
+	if updateErr != nil {
+		t.Fatalf("disable after SQLite mutation cancellation: err=%v response=%+v persisted=%+v runtimePresent=%v", updateErr, response, persisted, hasEndpoint(runtime, created.ID))
+	}
+	if _, ok := runtime.endpoints[created.ID]; ok {
+		t.Fatalf("runtime endpoint survived committed disable: %+v", runtime.endpoints[created.ID])
+	}
+	if persisted.Enabled {
+		t.Fatalf("persisted endpoint remained enabled after committed disable: %+v", persisted)
+	}
+}
+
+func hasEndpoint(runtime *endpointRuntimeStub, id string) bool {
+	if runtime == nil {
+		return false
+	}
+	_, ok := runtime.endpoints[id]
+	return ok
 }
