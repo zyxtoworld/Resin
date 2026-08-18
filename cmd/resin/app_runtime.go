@@ -957,13 +957,23 @@ func (a *resinApp) stopTopologyEventSources(contexts ...context.Context) (error,
 		} else {
 			log.Println("Lease cleaner stopped")
 			if a.topoRuntime.router != nil {
-				a.topoRuntime.router.Stop()
-				log.Println("Router stopped")
+				if err, continuation := stopRouterForShutdown(ctx, a.topoRuntime.router); err != nil {
+					stopErrs = append(stopErrs, err)
+					pendingContinuations = append(pendingContinuations, continuation)
+					log.Println("Router stop continues in shutdown owner")
+				} else {
+					log.Println("Router stopped")
+				}
 			}
 		}
 	} else if a.topoRuntime.router != nil {
-		a.topoRuntime.router.Stop()
-		log.Println("Router stopped")
+		if err, continuation := stopRouterForShutdown(ctx, a.topoRuntime.router); err != nil {
+			stopErrs = append(stopErrs, err)
+			pendingContinuations = append(pendingContinuations, continuation)
+			log.Println("Router stop continues in shutdown owner")
+		} else {
+			log.Println("Router stopped")
+		}
 	}
 	if a.topoRuntime.ephemeralCleaner != nil {
 		ephemeralErr := a.topoRuntime.ephemeralCleaner.StopContext(ctx)
@@ -1016,6 +1026,29 @@ func (a *resinApp) stopTopologyEventSources(contexts ...context.Context) (error,
 		joined <- errors.Join(continuationErrs...)
 	}()
 	return errors.Join(stopErrs...), joined
+}
+
+// stopRouterForShutdown starts the single Router stop owner and lets the
+// caller's context bound only its wait. Router.Stop itself has no context and
+// must finish draining admitted lease callbacks before persistence closes.
+func stopRouterForShutdown(ctx context.Context, router *routing.Router) (error, <-chan error) {
+	if router == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan error, 1)
+	go func() {
+		router.Stop()
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		return err, nil
+	case <-ctx.Done():
+		return ctx.Err(), done
+	}
 }
 
 type shutdownContinuations struct {
