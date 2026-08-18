@@ -639,14 +639,21 @@ func (a *resinApp) healthzStatus() api.HealthzStatus {
 		return status
 	}
 	degraded := 0
-	a.topoRuntime.pool.WithRuntimeRead(func() {
+	if !a.topoRuntime.pool.TryWithRuntimeRead(func() {
 		a.topoRuntime.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
 			if entry != nil && !entry.HasOutbound() && entry.GetLastError() != "" {
 				degraded++
 			}
 			return true
 		})
-	})
+	}) {
+		// Liveness must not wait behind a large runtime generation publish. A
+		// busy writer means the current generation is changing; report that
+		// explicitly instead of reading a partial view or fabricating a zero
+		// degraded count.
+		status.Status = "updating"
+		return status
+	}
 	if degraded > 0 {
 		status.Status = "degraded"
 		status.DegradedNodes = degraded
