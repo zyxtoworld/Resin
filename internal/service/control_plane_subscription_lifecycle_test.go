@@ -1057,6 +1057,45 @@ func TestUpdateSubscription_AsyncRefreshIsJoinedBySchedulerStop(t *testing.T) {
 	}
 }
 
+func TestUpdateSubscription_ClearsOldLastErrorBeforeAsyncRefresh(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, true)
+	f.sub.SetLastError("old configuration refresh failed")
+	fetchStarted := make(chan struct{})
+	releaseFetch := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseFetch) })
+	f.cp.Scheduler.Fetcher = func(context.Context, string) ([]byte, error) {
+		close(fetchStarted)
+		<-releaseFetch
+		return nil, errors.New("new configuration refresh failed")
+	}
+
+	response, err := f.cp.UpdateSubscriptionContext(
+		context.Background(),
+		f.sub.ID,
+		[]byte(`{"url":"https://example.com/new-config"}`),
+	)
+	if err != nil {
+		t.Fatalf("UpdateSubscriptionContext: %v", err)
+	}
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async refresh did not reach the new configuration fetch")
+	}
+	if response.LastError != "" {
+		t.Fatalf("response retained old configuration error: %q", response.LastError)
+	}
+	if got := f.sub.GetLastError(); got != "" {
+		t.Fatalf("subscription retained old configuration error: %q", got)
+	}
+	releaseOnce.Do(func() { close(releaseFetch) })
+	f.stopScheduler()
+	if got := f.sub.GetLastError(); got != "new configuration refresh failed" {
+		t.Fatalf("new configuration refresh error = %q", got)
+	}
+}
+
 func TestRefreshSubscription_ReportsStoppedScheduler(t *testing.T) {
 	f := newSubscriptionPatchFixture(t, true)
 	var fetchCalls atomic.Int32

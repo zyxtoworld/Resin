@@ -560,6 +560,12 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				sub.SetIncrementalAliveNodes(newIncrementalAliveNodes)
 				sub.SetEphemeralNodeEvictDelayNs(newEphemeralNodeEvictDelay)
 				sub.UpdatedAtNs = now
+				if urlChanged || contentChanged {
+					// A new refresh input starts a new error generation. Do not
+					// expose a failure from the superseded source while its
+					// replacement refresh is still pending.
+					sub.SetLastError("")
+				}
 
 				if nameChanged {
 					if s.Scheduler != nil {
