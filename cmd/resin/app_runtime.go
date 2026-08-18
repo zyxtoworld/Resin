@@ -48,11 +48,14 @@ type resinApp struct {
 
 	// Package-private shutdown seam for deterministic ordering tests. Production
 	// leaves it nil.
+	beforeLeaseEventMetricsHook        func()
+	afterLeaseEventMetricsHook         func()
 	beforeTopologyEventSourcesStopHook func()
 	afterTopologySchedulerStopHook     func()
 	beforeTransportPoolShutdownHook    func()
 	afterStateWriteAdmissionCloseHook  func()
 	afterStateWriteTimeoutHook         func()
+	afterMetricsManagerShutdownHook    func()
 	beforeOutboundShutdownHook         func()
 	afterOutboundShutdownHook          func()
 }
@@ -248,18 +251,25 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 		// lock is released. This callback persists dirty-set state and metrics;
 		// it must not call Router mutation APIs that emit another lease event.
 		OnLeaseEvent: func(e routing.LeaseEvent) {
-			switch e.Type {
-			case routing.LeaseCreate, routing.LeaseTouch, routing.LeaseReplace:
-				engine.MarkLease(e.PlatformID, e.Account)
-			case routing.LeaseRemove, routing.LeaseExpire:
-				engine.MarkLeaseDelete(e.PlatformID, e.Account)
-			}
-			a.onLeaseEventForMetrics(e)
+			a.handleLeaseEvent(engine, e)
 		},
 	})
 	a.topoRuntime.leaseCleaner = routing.NewLeaseCleaner(a.topoRuntime.router)
 	log.Println("Router and LeaseCleaner initialized")
 	return retryDL, nil
+}
+
+func (a *resinApp) handleLeaseEvent(engine *state.StateEngine, e routing.LeaseEvent) {
+	switch e.Type {
+	case routing.LeaseCreate, routing.LeaseTouch, routing.LeaseReplace:
+		engine.MarkLease(e.PlatformID, e.Account)
+	case routing.LeaseRemove, routing.LeaseExpire:
+		engine.MarkLeaseDelete(e.PlatformID, e.Account)
+	}
+	if hook := a.beforeLeaseEventMetricsHook; hook != nil {
+		hook()
+	}
+	a.onLeaseEventForMetrics(e)
 }
 
 func (a *resinApp) onProbeConnectionLifecycle(op netutil.ConnLifecycleOp) {
@@ -301,6 +311,9 @@ func (a *resinApp) onLeaseEventForMetrics(e routing.LeaseEvent) {
 		Op:         op,
 		LifetimeNs: lifetimeNs,
 	})
+	if hook := a.afterLeaseEventMetricsHook; hook != nil {
+		hook()
+	}
 }
 
 func (a *resinApp) wireRetryDownloader(retryDL *netutil.RetryDownloader) {
@@ -696,6 +709,7 @@ func formatListenURL(listenAddress string, port int) string {
 func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 	var continuations shutdownContinuations
 	var topologyReady <-chan struct{}
+	var topologySinksReady <-chan struct{}
 	if err, continuation := closeEndpointForShutdown(ctx, a.endpointManager); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 		if continuation != nil {
@@ -756,7 +770,13 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 	if topologyReady == nil {
 		dirtyAdmission = a.flushWorker
 	}
-	httpDrainErr := drainHTTPHandlersBeforePersistence(ctx, a.endpointManager, dirtyAdmission, a.stateEngine)
+	drainStateEngine := a.stateEngine
+	if topologyReady != nil {
+		// A lease callback may still be inside the real state/metrics wiring. Its
+		// topology continuation is the owner that must close those sinks.
+		drainStateEngine = nil
+	}
+	httpDrainErr := drainHTTPHandlersBeforePersistence(ctx, a.endpointManager, dirtyAdmission, drainStateEngine)
 	if httpDrainErr != nil {
 		log.Printf("HTTP handler drain error: %v", httpDrainErr)
 	}
@@ -782,20 +802,58 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 			log.Println("Direct proxy transports closed")
 		}
 	}
-	stateWritesDrained := a.stateEngine == nil
-	if a.stateEngine != nil {
-		if err := a.stateEngine.CloseStateWriteAdmissionAndWait(ctx); err != nil {
-			stateWritesDrained = false
+	closeStateWrites := func(closeCtx context.Context) (bool, error) {
+		if a.stateEngine == nil {
+			return true, nil
+		}
+		err := a.stateEngine.CloseStateWriteAdmissionAndWait(closeCtx)
+		if err != nil {
 			log.Printf("State write shutdown error: %v", err)
 		}
 		if hook := a.afterStateWriteAdmissionCloseHook; hook != nil {
 			hook()
 		}
-		if !stateWritesDrained {
+		if err != nil {
 			if hook := a.afterStateWriteTimeoutHook; hook != nil {
 				hook()
 			}
+			return false, err
 		}
+		return true, nil
+	}
+	stateWritesDrained := a.stateEngine == nil
+	if topologyReady == nil {
+		stateWritesDrained, _ = closeStateWrites(ctx)
+	} else {
+		// Router's synchronous lease callback is a dependency of both state and
+		// metrics. Keep their close owners behind one continuation so a timed-out
+		// shutdown cannot close either sink while that callback is still running.
+		topologySinks := make(chan error, 1)
+		go func() {
+			<-topologyReady
+			var errs []error
+			if _, err := closeStateWrites(context.Background()); err != nil {
+				errs = append(errs, err)
+			}
+			if a.metricsManager != nil {
+				err, continuation := closeMetricsManagerForShutdown(context.Background(), a.metricsManager)
+				if continuation != nil {
+					err = errors.Join(err, <-continuation)
+				}
+				if hook := a.afterMetricsManagerShutdownHook; hook != nil {
+					hook()
+				}
+				if err != nil {
+					errs = append(errs, err)
+				}
+			} else if a.metricsDB != nil {
+				if err := a.metricsDB.Close(); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			topologySinks <- errors.Join(errs...)
+		}()
+		continuations.topologySinks, topologySinksReady = trackShutdownContinuation(topologySinks)
 	}
 
 	shutdownOutbound := func(shutdownCtx context.Context) (error, <-chan error) {
@@ -826,7 +884,9 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		if !stateWritesDrained || waitForDirtyWrites {
 			continuation := make(chan error, 1)
 			go func() {
-				if topologyReady != nil {
+				if topologySinksReady != nil {
+					<-topologySinksReady
+				} else if topologyReady != nil {
 					<-topologyReady
 				}
 				if !stateWritesDrained {
@@ -878,20 +938,22 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		log.Println("Request log repo closed")
 	}
 
-	if a.metricsManager != nil {
-		err, continuation := closeMetricsManagerForShutdown(ctx, a.metricsManager)
-		if err != nil {
-			log.Printf("Metrics shutdown/close error: %v", err)
+	if topologyReady == nil {
+		if a.metricsManager != nil {
+			err, continuation := closeMetricsManagerForShutdown(ctx, a.metricsManager)
+			if err != nil {
+				log.Printf("Metrics shutdown/close error: %v", err)
+			}
+			if continuation != nil {
+				continuations.metrics = continuation
+			}
+			log.Println("Metrics manager and DB stopped")
+		} else if a.metricsDB != nil {
+			if err := a.metricsDB.Close(); err != nil {
+				log.Printf("Metrics DB close error: %v", err)
+			}
+			log.Println("Metrics DB closed")
 		}
-		if continuation != nil {
-			continuations.metrics = continuation
-		}
-		log.Println("Metrics manager and DB stopped")
-	} else if a.metricsDB != nil {
-		if err := a.metricsDB.Close(); err != nil {
-			log.Printf("Metrics DB close error: %v", err)
-		}
-		log.Println("Metrics DB closed")
 	}
 
 	// 3. Stop infrastructure. The outbound helper closes SingboxBuilder
@@ -902,7 +964,11 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		continuation := make(chan error, 1)
 		continuations.cacheFlush = continuation
 		go func() {
-			<-topologyReady
+			if topologySinksReady != nil {
+				<-topologySinksReady
+			} else {
+				<-topologyReady
+			}
 			cacheErr, ownerContinuation := closeCacheFlushWorkerForShutdown(context.Background(), a.flushWorker)
 			if ownerContinuation != nil {
 				cacheErr = errors.Join(cacheErr, <-ownerContinuation)
@@ -1052,14 +1118,15 @@ func stopRouterForShutdown(ctx context.Context, router *routing.Router) (error, 
 }
 
 type shutdownContinuations struct {
-	endpoint    <-chan error
-	directProxy <-chan error
-	geoIP       <-chan error
-	topology    <-chan error
-	outbound    <-chan error
-	cacheFlush  <-chan error
-	requestLog  <-chan error
-	metrics     <-chan error
+	endpoint      <-chan error
+	directProxy   <-chan error
+	geoIP         <-chan error
+	topology      <-chan error
+	topologySinks <-chan error
+	outbound      <-chan error
+	cacheFlush    <-chan error
+	requestLog    <-chan error
+	metrics       <-chan error
 }
 
 // wait joins all shutdown owners in dependency order. Cache persistence must
@@ -1067,7 +1134,7 @@ type shutdownContinuations struct {
 // joined so the process cannot return and kill tracked goroutines.
 func (c shutdownContinuations) wait() error {
 	var errs []error
-	for _, continuation := range []<-chan error{c.endpoint, c.directProxy, c.geoIP, c.topology, c.outbound, c.cacheFlush, c.requestLog, c.metrics} {
+	for _, continuation := range []<-chan error{c.endpoint, c.directProxy, c.geoIP, c.topology, c.topologySinks, c.outbound, c.cacheFlush, c.requestLog, c.metrics} {
 		if continuation == nil {
 			continue
 		}
