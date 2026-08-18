@@ -3,6 +3,7 @@ package routing
 import (
 	"bytes"
 	"container/heap"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -250,6 +251,14 @@ func leaseMatchesQuery(account string, query LeasePageQuery) bool {
 // service/API. Concurrent changes have best-effort cursor semantics: the
 // cursor is a stable exclusive sort position for the observed generation.
 func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePageQuery) (LeasePage, bool, error) {
+	return r.SnapshotLeasePageForPlatformContext(context.Background(), platformID, query)
+}
+
+// SnapshotLeasePageForPlatformContext is the request-bound form of
+// SnapshotLeasePageForPlatform. Cancellation is effective while waiting for
+// the Router lifecycle read owner; an admitted snapshot still completes under
+// that owner.
+func (r *Router) SnapshotLeasePageForPlatformContext(ctx context.Context, platformID string, query LeasePageQuery) (LeasePage, bool, error) {
 	query.platformID = platformID
 	limit := query.Limit
 	if limit <= 0 {
@@ -271,7 +280,9 @@ func (r *Router) SnapshotLeasePageForPlatform(platformID string, query LeasePage
 		cursorGeneration = generation
 	}
 
-	r.lifecycleMu.RLock()
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return LeasePage{}, false, err
+	}
 	defer r.lifecycleMu.RUnlock()
 	if r.stopped || !r.platformExistsLocked(platformID) {
 		return LeasePage{}, false, nil

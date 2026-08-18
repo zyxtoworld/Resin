@@ -98,7 +98,11 @@ func (s *ControlPlaneService) ListLeasesContext(ctx context.Context, platformID 
 	var result []LeaseResponse
 	var resultErr error
 	if err := s.withRuntimeReadContext(ctx, func() {
-		leases, exists := s.Router.ListLeasesForPlatform(platformID)
+		leases, exists, err := s.Router.ListLeasesForPlatformContext(ctx, platformID)
+		if err != nil {
+			resultErr = err
+			return
+		}
 		if !exists {
 			resultErr = notFound("platform not found")
 			return
@@ -133,7 +137,11 @@ func (s *ControlPlaneService) GetLeaseContext(ctx context.Context, platformID, a
 	var result *LeaseResponse
 	var resultErr error
 	if err := s.withRuntimeReadContext(ctx, func() {
-		ml, exists := s.Router.ReadLeaseForPlatform(model.LeaseKey{PlatformID: platformID, Account: account})
+		ml, exists, err := s.Router.ReadLeaseForPlatformContext(ctx, model.LeaseKey{PlatformID: platformID, Account: account})
+		if err != nil {
+			resultErr = err
+			return
+		}
 		if !exists {
 			resultErr = notFound("platform not found")
 			return

@@ -71,6 +71,184 @@ func TestSnapshotIPLoadContextCancellationInterruptsLifecycleReadWait(t *testing
 	}
 }
 
+func TestListLeasesContextCancellationInterruptsLifecycleReadWait(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-lease-list-cancel", "Plat-Lease-List-Cancel", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+
+	router.lifecycleMu.Lock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		router.lifecycleMu.Unlock()
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type snapshotResult struct {
+		err error
+	}
+	done := make(chan snapshotResult, 1)
+	go func() {
+		_, _, err := router.ListLeasesForPlatformContext(ctx, plat.ID)
+		done <- snapshotResult{err: err}
+	}()
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("request context error = %v, want context.Canceled", ctx.Err())
+	}
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled lease list error = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("lease list remained blocked until lifecycle writer release")
+	}
+
+	if !released {
+		release()
+	}
+}
+
+func TestReadLeaseContextCancellationInterruptsLifecycleReadWait(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-lease-read-cancel", "Plat-Lease-Read-Cancel", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+
+	router.lifecycleMu.Lock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		router.lifecycleMu.Unlock()
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type snapshotResult struct {
+		err error
+	}
+	done := make(chan snapshotResult, 1)
+	go func() {
+		_, _, err := router.ReadLeaseForPlatformContext(ctx, model.LeaseKey{PlatformID: plat.ID, Account: "cancel-account"})
+		done <- snapshotResult{err: err}
+	}()
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("request context error = %v, want context.Canceled", ctx.Err())
+	}
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled lease read error = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("lease read remained blocked until lifecycle writer release")
+	}
+
+	if !released {
+		release()
+	}
+}
+
+func TestSnapshotLeasePageContextCancellationInterruptsLifecycleReadWait(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-lease-page-cancel", "Plat-Lease-Page-Cancel", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+
+	router.lifecycleMu.Lock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		router.lifecycleMu.Unlock()
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := router.SnapshotLeasePageForPlatformContext(ctx, plat.ID, LeasePageQuery{Limit: 1})
+		done <- err
+	}()
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("request context error = %v, want context.Canceled", ctx.Err())
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled lease page error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("lease page read remained blocked until lifecycle writer release")
+	}
+}
+
+func TestSnapshotResponseCooldownsContextCancellationInterruptsLifecycleReadWait(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-cooldown-snapshot-cancel", "Plat-Cooldown-Snapshot-Cancel", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+
+	router.lifecycleMu.Lock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		router.lifecycleMu.Unlock()
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := router.SnapshotResponseCooldownsForPlatformContext(ctx, plat.ID, time.Now())
+		done <- err
+	}()
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("request context error = %v, want context.Canceled", ctx.Err())
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled cooldown snapshot error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		release()
+		<-done
+		t.Fatal("cooldown snapshot remained blocked until lifecycle writer release")
+	}
+}
+
 func TestLeaseCallbackReadReentryDoesNotDeadlockWithPendingPlatformRemoval(t *testing.T) {
 	pool := newRouterTestPool()
 	plat := platform.NewPlatform("plat-callback-reentry", "Plat-Callback-Reentry", nil, nil)

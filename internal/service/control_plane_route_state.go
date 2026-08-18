@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -101,7 +102,7 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 		if hook := s.afterRouteStateNodesHook; hook != nil {
 			hook()
 		}
-		leasePage, exists, err := s.Router.SnapshotLeasePageForPlatform(platformID, routing.LeasePageQuery{
+		leasePage, exists, err := s.Router.SnapshotLeasePageForPlatformContext(ctx, platformID, routing.LeasePageQuery{
 			Account: query.LeaseAccount,
 			Fuzzy:   query.LeaseFuzzy,
 			Limit:   limit,
@@ -110,6 +111,10 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 			Desc:    query.LeaseOrder == "desc",
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				resultErr = err
+				return
+			}
 			resultErr = invalidArg(err.Error())
 			return
 		}
@@ -117,7 +122,15 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 			resultErr = notFound("platform not found")
 			return
 		}
-		cooldowns, exists := s.Router.SnapshotResponseCooldownsForPlatform(platformID, observedAt)
+		cooldowns, exists, err := s.Router.SnapshotResponseCooldownsForPlatformContext(ctx, platformID, observedAt)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				resultErr = err
+				return
+			}
+			resultErr = invalidArg(err.Error())
+			return
+		}
 		if !exists {
 			resultErr = notFound("platform not found")
 			return

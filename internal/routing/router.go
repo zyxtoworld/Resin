@@ -1325,21 +1325,35 @@ func (r *Router) ReadLeaseForPersistence(key model.LeaseKey) *model.Lease {
 // mutation admission has been stopped; a true value with an empty slice means
 // the platform has no routing state or leases.
 func (r *Router) ListLeasesForPlatform(platformID string) ([]model.Lease, bool) {
-	r.lifecycleMu.RLock()
+	result, exists, _ := r.ListLeasesForPlatformContext(context.Background(), platformID)
+	return result, exists
+}
+
+// ListLeasesForPlatformContext is the request-bound form of
+// ListLeasesForPlatform. Cancellation is effective while waiting for the
+// Router lifecycle read owner; an admitted snapshot still completes under
+// that owner.
+func (r *Router) ListLeasesForPlatformContext(ctx context.Context, platformID string) ([]model.Lease, bool, error) {
+	if r == nil {
+		return nil, false, nil
+	}
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return nil, false, err
+	}
 	if r.stopped {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	if !r.platformExistsLocked(platformID) {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	if hook := r.beforeAtomicPlatformReadHook; hook != nil {
 		hook()
 	}
 	result := r.listLeasesUnlocked(platformID)
 	r.lifecycleMu.RUnlock()
-	return result, true
+	return result, true, nil
 }
 
 // ReadLeaseForPlatform atomically checks platform lifetime and reads one
@@ -1347,18 +1361,32 @@ func (r *Router) ListLeasesForPlatform(platformID string) ([]model.Lease, bool) 
 // mutation admission has been stopped; a true value with a nil lease means the
 // platform has no such lease.
 func (r *Router) ReadLeaseForPlatform(key model.LeaseKey) (*model.Lease, bool) {
-	r.lifecycleMu.RLock()
+	lease, exists, _ := r.ReadLeaseForPlatformContext(context.Background(), key)
+	return lease, exists
+}
+
+// ReadLeaseForPlatformContext is the request-bound form of
+// ReadLeaseForPlatform. Cancellation is effective while waiting for the
+// Router lifecycle read owner; an admitted read still completes under that
+// owner.
+func (r *Router) ReadLeaseForPlatformContext(ctx context.Context, key model.LeaseKey) (*model.Lease, bool, error) {
+	if r == nil {
+		return nil, false, nil
+	}
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return nil, false, err
+	}
 	if r.stopped {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	if !r.platformExistsLocked(key.PlatformID) {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	lease := r.readLeaseUnlocked(key)
 	r.lifecycleMu.RUnlock()
-	return lease, true
+	return lease, true, nil
 }
 
 // UpsertLease writes or replaces a lease for (platform_id, account).
@@ -1490,25 +1518,39 @@ func (r *Router) SnapshotIPLoadForPlatformContext(ctx context.Context, platformI
 // state is a valid empty snapshot; the boolean is false only when the platform
 // is not registered or Router admission has stopped.
 func (r *Router) SnapshotResponseCooldownsForPlatform(platformID string, now time.Time) ([]ResponseCooldownSnapshot, bool) {
-	r.lifecycleMu.RLock()
+	result, exists, _ := r.SnapshotResponseCooldownsForPlatformContext(context.Background(), platformID, now)
+	return result, exists
+}
+
+// SnapshotResponseCooldownsForPlatformContext is the request-bound form of
+// SnapshotResponseCooldownsForPlatform. Cancellation is effective while
+// waiting for the Router lifecycle read owner; an admitted snapshot still
+// completes under that owner.
+func (r *Router) SnapshotResponseCooldownsForPlatformContext(ctx context.Context, platformID string, now time.Time) ([]ResponseCooldownSnapshot, bool, error) {
+	if r == nil {
+		return nil, false, nil
+	}
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return nil, false, err
+	}
 	if r.stopped {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	if !r.platformExistsLocked(platformID) {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	state, ok := r.states.Load(platformID)
 	if !ok || state == nil || state.ResponseCooldowns == nil {
 		r.lifecycleMu.RUnlock()
-		return []ResponseCooldownSnapshot{}, true
+		return []ResponseCooldownSnapshot{}, true, nil
 	}
 	snapshot := state.ResponseCooldowns.Snapshot(now)
 	plat, ok := r.pool.GetPlatform(platformID)
 	if !ok || plat == nil {
 		r.lifecycleMu.RUnlock()
-		return nil, false
+		return nil, false, nil
 	}
 	filtered := snapshot[:0]
 	for _, item := range snapshot {
@@ -1529,7 +1571,7 @@ func (r *Router) SnapshotResponseCooldownsForPlatform(platformID string, now tim
 		filtered = append(filtered, item)
 	}
 	r.lifecycleMu.RUnlock()
-	return filtered, true
+	return filtered, true, nil
 }
 
 // InheritLeaseForPlatform validates the parent and creates/replaces the child
