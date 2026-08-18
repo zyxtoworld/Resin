@@ -3067,6 +3067,44 @@ a {
   justify-content: space-between;
 }
 
+.response-rule-subsection-head > div {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.response-rule-subsection-head p {
+  margin: 4px 0 0;
+  line-height: 1.45;
+}
+
+.response-rule-source-priority {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  border-radius: 999px;
+  background: rgba(56, 105, 176, 0.12);
+  color: #275789;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.response-rule-source-help {
+  min-width: 0;
+  flex: 1 1 180px;
+  line-height: 1.4;
+}
+
+.response-rule-source > div:not(.response-rule-condition) {
+  min-width: 0;
+}
+
+.response-rule-source > div:not(.response-rule-condition) > .input {
+  width: 100%;
+  max-width: 100%;
+}
+
 .response-rule-source .response-rule-condition > .select:first-child {
   flex: 1.1 1 130px;
 }
@@ -3580,6 +3618,18 @@ a {
 
   .response-rule-condition > .input,
   .response-rule-condition > .select {
+    flex-basis: 100%;
+  }
+
+  .response-rule-subsection-head {
+    align-items: flex-start;
+  }
+
+  .response-rule-subsection-head > .btn {
+    flex-shrink: 0;
+  }
+
+  .response-rule-source-help {
     flex-basis: 100%;
   }
 

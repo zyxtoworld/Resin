@@ -67,7 +67,7 @@ const expirySourceSchema = z.object({
   const hasCapture = source.capture !== undefined;
   if (source.type === "retry_after") {
     if (hasHeader || hasPointer || hasRegex || hasCapture || (source.format !== undefined && source.format !== "delta_seconds")) {
-      ctx.addIssue({ code: "custom", path: ["type"], message: "retry_after 只能使用 delta_seconds，且不能带其他字段" });
+      ctx.addIssue({ code: "custom", path: ["type"], message: "Retry-After 不能带其他字段或非标准格式" });
     }
     return;
   }
@@ -166,7 +166,7 @@ export function normalizeResponseRuleHeaderOp(header: ResponseRuleHeader, op: Re
 
 export function normalizeResponseRuleExpirySourceType(type: ResponseRuleExpirySource["type"]): ResponseRuleExpirySource {
   if (type === "retry_after") {
-    return { type, format: "delta_seconds" };
+    return { type };
   }
   if (type === "header") {
     return { type, header: "", format: "delta_seconds" };
@@ -175,6 +175,45 @@ export function normalizeResponseRuleExpirySourceType(type: ResponseRuleExpirySo
     return { type, json_pointer: "", format: "rfc3339_utc" };
   }
   return { type, regex: "", capture: 1, format: "rfc3339_utc" };
+}
+
+/**
+ * Retry-After has its own HTTP semantics: the server may send delta-seconds
+ * or an HTTP-date. Keep the legacy delta_seconds field readable, but never
+ * write it back from the visual editor.
+ */
+export function normalizeResponseRuleExpirySource(source: ResponseRuleExpirySource): ResponseRuleExpirySource {
+  return source.type === "retry_after" ? { type: "retry_after" } : { ...source };
+}
+
+export function normalizeResponseRules(rules: PlatformResponseRule[]): PlatformResponseRule[] {
+  return rules.map((rule) => {
+    const sources = rule.action.expiry_sources;
+    if (!sources) {
+      return rule;
+    }
+    return {
+      ...rule,
+      action: {
+        ...rule.action,
+        expiry_sources: sources.map(normalizeResponseRuleExpirySource),
+      },
+    };
+  });
+}
+
+export function moveResponseRuleExpirySource(
+  sources: ResponseRuleExpirySource[],
+  index: number,
+  direction: -1 | 1,
+): ResponseRuleExpirySource[] {
+  const target = index + direction;
+  if (index < 0 || target < 0 || index >= sources.length || target >= sources.length) {
+    return sources;
+  }
+  const next = sources.map(normalizeResponseRuleExpirySource);
+  [next[index], next[target]] = [next[target], next[index]];
+  return next;
 }
 
 export function parseResponseRulesText(text: string): { rules: PlatformResponseRule[] | null; error?: string } {
@@ -188,7 +227,7 @@ export function parseResponseRulesText(text: string): { rules: PlatformResponseR
   if (!result.success) {
     return { rules: null, error: result.error.issues[0]?.message ?? "响应规则结构无效" };
   }
-  return { rules: result.data as PlatformResponseRule[] };
+  return { rules: normalizeResponseRules(result.data as PlatformResponseRule[]) };
 }
 
 function isEditorRule(value: unknown): value is PlatformResponseRule {
@@ -268,6 +307,9 @@ function isEditorExpirySource(value: unknown): boolean {
   if (value.capture !== undefined && typeof value.capture !== "number") {
     return false;
   }
+  if (value.type === "retry_after" && value.format !== undefined && value.format !== "delta_seconds") {
+    return false;
+  }
   return value.format === undefined || isOneOf(value.format, editorExpiryFormats);
 }
 
@@ -296,14 +338,14 @@ function isEditorAction(value: unknown): value is PlatformResponseRule["action"]
 export function parseResponseRulesEditorText(text: string): PlatformResponseRule[] {
   try {
     const parsed: unknown = JSON.parse(text.trim() || "[]");
-    return Array.isArray(parsed) ? parsed.filter(isEditorRule) : [];
+    return Array.isArray(parsed) ? normalizeResponseRules(parsed.filter(isEditorRule)) : [];
   } catch {
     return [];
   }
 }
 
 export function formatResponseRules(rules: PlatformResponseRule[]): string {
-  return JSON.stringify(rules, null, 2);
+  return JSON.stringify(normalizeResponseRules(rules), null, 2);
 }
 
 export function cloneResponseRule(rule: PlatformResponseRule): PlatformResponseRule {
@@ -362,7 +404,7 @@ export function createCooldownTemplate(rules: PlatformResponseRule[]): PlatformR
     action: {
       type: "cooldown_then_retry_next",
       cooldown_scope: "egress_ip",
-      expiry_sources: [{ type: "retry_after", format: "delta_seconds" }],
+      expiry_sources: [{ type: "retry_after" }],
       fallback: "next_utc_midnight",
     },
   };

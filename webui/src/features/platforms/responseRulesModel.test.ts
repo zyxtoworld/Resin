@@ -2,6 +2,8 @@ import {
   createCooldownTemplate,
   formatResponseRules,
   normalizeResponseRuleAction,
+  moveResponseRuleExpirySource,
+  normalizeResponseRuleExpirySource,
   normalizeResponseRuleExpirySourceType,
   normalizeResponseRuleFallback,
   normalizeResponseRuleHeaderOp,
@@ -123,6 +125,48 @@ assert.deepEqual(normalizeResponseRuleExpirySourceType("body_regex"), {
   capture: 1,
   format: "rfc3339_utc",
 });
+assert.deepEqual(normalizeResponseRuleExpirySourceType("retry_after"), { type: "retry_after" });
+assert.deepEqual(normalizeResponseRuleExpirySourceType("header"), {
+  type: "header",
+  header: "",
+  format: "delta_seconds",
+});
+assert.deepEqual(
+  normalizeResponseRuleExpirySourceType("retry_after"),
+  { type: "retry_after" },
+  "header to Retry-After must discard header-only fields",
+);
+assert.deepEqual(
+  normalizeResponseRuleExpirySourceType("header"),
+  { type: "header", header: "", format: "delta_seconds" },
+  "Retry-After to header must create its required fields",
+);
+
+const legacyRetryRule: PlatformResponseRule = {
+  ...validRule,
+  id: "legacy-retry-after",
+  action: {
+    type: "cooldown",
+    cooldown_scope: "egress_ip",
+    expiry_sources: [{ type: "retry_after", format: "delta_seconds" }],
+    fallback: "next_utc_midnight",
+  },
+};
+const normalizedLegacy = parseResponseRulesText(JSON.stringify([legacyRetryRule]));
+assert.deepEqual(normalizedLegacy.rules?.[0]?.action.expiry_sources, [{ type: "retry_after" }]);
+assert.deepEqual(normalizeResponseRuleExpirySource({ type: "retry_after", format: "delta_seconds" }), { type: "retry_after" });
+assert.ok(!formatResponseRules([legacyRetryRule]).includes('"format"'), "saved Retry-After must use standard semantics");
+
+const orderedSources = [
+  { type: "retry_after" as const },
+  { type: "header" as const, header: "X-Reset", format: "unix_seconds" as const },
+  { type: "body_regex" as const, regex: "reset", capture: 1, format: "rfc3339_utc" as const },
+];
+assert.deepEqual(
+  moveResponseRuleExpirySource(orderedSources, 2, -1).map((source) => source.type),
+  ["retry_after", "body_regex", "header"],
+);
+assert.deepEqual(moveResponseRuleExpirySource(orderedSources, 0, -1), orderedSources);
 
 const draftState = { first: "429,abc", second: "200" };
 assert.deepEqual(remapRuleDraftState(draftState, "first", "renamed"), { renamed: "429,abc", second: "200" });

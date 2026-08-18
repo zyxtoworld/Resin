@@ -11,6 +11,7 @@ import {
   createCooldownTemplate,
   createResponseRule,
   formatResponseRules,
+  moveResponseRuleExpirySource,
   normalizeResponseRuleAction,
   normalizeResponseRuleExpirySourceType,
   normalizeResponseRuleFallback,
@@ -47,10 +48,6 @@ let nextResponseRuleRowKey = 0;
 function newResponseRuleRowKey(): string {
   nextResponseRuleRowKey += 1;
   return `response-rule-row-${nextResponseRuleRowKey}`;
-}
-
-function formatsForSource(source: ResponseRuleExpirySource): NonNullable<ResponseRuleExpirySource["format"]>[] {
-  return source.type === "retry_after" ? ["delta_seconds"] : sourceFormats;
 }
 
 function parseNumberList(value: string): { values?: number[]; error?: string } {
@@ -93,6 +90,20 @@ function updateSource(source: ResponseRuleExpirySource, key: keyof ResponseRuleE
   }
   return { ...source, [key]: value };
 }
+
+const sourceTypeLabels: Record<ResponseRuleExpirySource["type"], string> = {
+  retry_after: "标准 Retry-After 响应头",
+  header: "指定响应头",
+  json_pointer: "响应体 JSON 字段",
+  body_regex: "响应正文正则捕获",
+};
+
+const sourceFormatLabels: Record<NonNullable<ResponseRuleExpirySource["format"]>, string> = {
+  delta_seconds: "从现在起的秒数",
+  unix_seconds: "Unix 时间戳（秒）",
+  unix_millis: "Unix 时间戳（毫秒）",
+  rfc3339_utc: "UTC 日期时间（RFC3339）",
+};
 
 export function ResponseRulesEditor({ rules, onChange, onValidationChange, error }: ResponseRulesEditorProps) {
   const { t } = useI18n();
@@ -170,6 +181,16 @@ export function ResponseRulesEditor({ rules, onChange, onValidationChange, error
     }
     setRowKeys((current) => current.filter((_, rowIndex) => rowIndex !== index));
     onChange(rules.filter((_, ruleIndex) => ruleIndex !== index));
+  };
+
+  const moveExpirySource = (ruleIndex: number, sourceIndex: number, direction: -1 | 1) => {
+    updateAt(ruleIndex, (current) => ({
+      ...current,
+      action: {
+        ...current.action,
+        expiry_sources: moveResponseRuleExpirySource(current.action.expiry_sources ?? [], sourceIndex, direction),
+      },
+    }));
   };
 
   const applyAdvanced = () => {
@@ -351,30 +372,39 @@ export function ResponseRulesEditor({ rules, onChange, onValidationChange, error
                         <option value="egress_ip">{t("出口 IP")}</option>
                         <option value="route_entry">{t("当前路由节点")}</option>
                       </Select>
-                      <div className="response-rule-subsection-head"><strong>{t("到期来源（按顺序）")}</strong><Button variant="ghost" size="sm" onClick={() => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: [...(current.action.expiry_sources ?? []), { type: "retry_after", format: "delta_seconds" }] } }))}><Plus size={14} /></Button></div>
+                      <div className="response-rule-subsection-head">
+                        <div>
+                          <strong>{t("冷却到期时间（按优先级尝试）")}</strong>
+                          <p className="muted">{t("依次从响应中读取到期时间，首个可解析值生效；都取不到时使用下方兜底策略。")}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" aria-label={t("添加到期来源")} onClick={() => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: [...(current.action.expiry_sources ?? []), { type: "retry_after" }] } }))}><Plus size={14} /></Button>
+                      </div>
                       {sources.map((source, sourceIndex) => (
                         <div className="response-rule-source" key={`${source.type}-${sourceIndex}`}>
                           <div className="response-rule-condition">
-                            <Select value={source.type} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "type", event.target.value) : item) } }))}>
-                              {sourceTypes.map((type) => <option key={type} value={type}>{type}</option>)}
+                            <span className="response-rule-source-priority" aria-label={t("优先级 {{number}}", { number: sourceIndex + 1 })}>{sourceIndex + 1}</span>
+                            <Select aria-label={t("到期来源类型")} value={source.type} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? normalizeResponseRuleExpirySourceType(event.target.value as ResponseRuleExpirySource["type"]) : item) } }))}>
+                              {sourceTypes.map((type) => <option key={type} value={type}>{t(sourceTypeLabels[type])}</option>)}
                             </Select>
-                            <Select value={source.format ?? "delta_seconds"} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "format", event.target.value) : item) } }))}>
-                              {formatsForSource(source).map((format) => <option key={format} value={format}>{format}</option>)}
-                            </Select>
-                            <Button variant="ghost" size="sm" onClick={() => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).filter((_, itemIndex) => itemIndex !== sourceIndex) } }))}><Trash2 size={14} /></Button>
+                            {source.type !== "retry_after" ? <Select aria-label={t("到期时间格式")} value={source.format ?? "delta_seconds"} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "format", event.target.value) : item) } }))}>
+                              {sourceFormats.map((format) => <option key={format} value={format}>{t(sourceFormatLabels[format])}</option>)}
+                            </Select> : <span className="muted response-rule-source-help">{t("支持秒数和 HTTP-date")}</span>}
+                            <Button variant="ghost" size="sm" onClick={() => moveExpirySource(index, sourceIndex, -1)} disabled={sourceIndex === 0} aria-label={t("上移到期来源")}> <ChevronUp size={14} /> </Button>
+                            <Button variant="ghost" size="sm" onClick={() => moveExpirySource(index, sourceIndex, 1)} disabled={sourceIndex === sources.length - 1} aria-label={t("下移到期来源")}> <ChevronDown size={14} /> </Button>
+                            <Button variant="ghost" size="sm" onClick={() => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).filter((_, itemIndex) => itemIndex !== sourceIndex) } }))} aria-label={t("删除到期来源")}><Trash2 size={14} /></Button>
                           </div>
-                          {source.type === "header" ? <Input placeholder={t("Header 名称")} value={source.header ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "header", event.target.value) : item) } }))} /> : null}
-                          {source.type === "json_pointer" ? <Input placeholder="/error/reset_at" value={source.json_pointer ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "json_pointer", event.target.value) : item) } }))} /> : null}
-                          {source.type === "body_regex" ? <div className="response-rule-condition"><Input placeholder={t("正则") } value={source.regex ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "regex", event.target.value) : item) } }))} /><Input type="number" min={1} placeholder={t("捕获组") } value={source.capture ?? 1} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "capture", event.target.value) : item) } }))} /></div> : null}
+                          {source.type === "header" ? <div><label className="field-label">{t("响应头名称")}</label><Input aria-label={t("响应头名称")} placeholder="X-Reset-At" value={source.header ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "header", event.target.value) : item) } }))} /><p className="muted">{t("填写一个合法的响应头字段名，例如 X-Reset-At。")}</p></div> : null}
+                          {source.type === "json_pointer" ? <div><label className="field-label">{t("JSON Pointer")}</label><Input aria-label={t("JSON Pointer") } placeholder="/error/reset_at" value={source.json_pointer ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "json_pointer", event.target.value) : item) } }))} /><p className="muted">{t("例如 /error/reset_at，用于读取响应体 JSON 中的字段。")}</p></div> : null}
+                      {source.type === "body_regex" ? <div><div className="response-rule-condition"><div><label className="field-label">{t("正文正则表达式")}</label><Input aria-label={t("正文正则表达式")} placeholder={'例如 "resets_at":"([^"]+)"'} value={source.regex ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "regex", event.target.value) : item) } }))} /></div><div><label className="field-label">{t("捕获组编号")}</label><Input aria-label={t("捕获组编号")} type="number" min={1} max={16} value={source.capture ?? 1} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "capture", event.target.value) : item) } }))} /></div></div><p className="muted">{t("正则必须包含要解析的捕获组，捕获组编号从 1 开始。")}</p></div> : null}
                         </div>
                       ))}
-                      <label className="field-label">{t("兜底")}</label>
+                      <label className="field-label">{t("无法解析时的兜底")}</label>
                       <Select value={action.fallback ?? "none"} onChange={(event) => updateAt(index, (current) => ({ ...current, action: normalizeResponseRuleFallback(current.action, event.target.value as NonNullable<PlatformResponseRule["action"]["fallback"]>) }))}>
-                        <option value="next_utc_midnight">{t("下一个 UTC 0 点")}</option>
-                        <option value="fixed_duration">{t("固定时长")}</option>
-                        <option value="none">{t("无")}</option>
+                        <option value="next_utc_midnight">{t("次日 UTC 00:00")}</option>
+                        <option value="fixed_duration">{t("固定冷却时长")}</option>
+                        <option value="none">{t("无法确定时不自动解除")}</option>
                       </Select>
-                      {action.fallback === "fixed_duration" ? <Input placeholder="例如 1h" value={action.fixed_duration ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, fixed_duration: event.target.value } }))} /> : null}
+                      {action.fallback === "fixed_duration" ? <div><label className="field-label">{t("固定冷却时长")}</label><Input aria-label={t("固定冷却时长")} placeholder={t("例如 1h") } value={action.fixed_duration ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, fixed_duration: event.target.value } }))} /><p className="muted">{t("例如 1h，表示从本次响应开始固定冷却 1 小时。")}</p></div> : null}
                     </>
                   ) : null}
                 </div>
