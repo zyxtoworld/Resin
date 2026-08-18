@@ -887,6 +887,135 @@ func TestSubscriptionMutationsPublishAfterRequestCancellationAtCommitBoundary(t 
 	})
 }
 
+func TestUpdateSubscriptionContextCancellationDoesNotHoldStateWriteForBusyOperationLock(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, false)
+	lockEntered := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseLock) })
+
+	go f.sub.WithOpLock(func() {
+		close(lockEntered)
+		<-releaseLock
+	})
+	select {
+	case <-lockEntered:
+	case <-time.After(time.Second):
+		t.Fatal("subscription lock holder did not start")
+	}
+
+	operationLockAttempted := make(chan struct{})
+	allowAttempt := make(chan struct{})
+	f.cp.beforeSubscriptionOperationLockHook = func() {
+		close(operationLockAttempted)
+		<-allowAttempt
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.cp.UpdateSubscriptionContext(ctx, f.sub.ID, []byte(`{"name":"should-not-persist"}`))
+		done <- err
+	}()
+
+	select {
+	case <-operationLockAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("subscription update did not reach operation-lock boundary")
+	}
+	cancel()
+	close(allowAttempt)
+
+	var got error
+	select {
+	case got = <-done:
+	case <-time.After(250 * time.Millisecond):
+		// Release the holder before waiting for the old implementation to
+		// unwind, so this regression test does not leak a blocked goroutine.
+		releaseOnce.Do(func() { close(releaseLock) })
+		got = <-done
+		t.Fatalf("canceled subscription update remained blocked on operation lock: %v", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("UpdateSubscriptionContext error = %v, want context.Canceled", got)
+	}
+	releaseOnce.Do(func() { close(releaseLock) })
+
+	if got := f.sub.Name(); got != "initial" {
+		t.Fatalf("subscription name changed after canceled update: %q", got)
+	}
+	rows, err := f.engine.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("ListSubscriptions: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "initial" {
+		t.Fatalf("canceled update changed persisted subscription: %+v", rows)
+	}
+}
+
+func TestDeleteSubscriptionContextCancellationDoesNotHoldStateWriteForBusyOperationLock(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, false)
+	lockEntered := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseLock) })
+
+	go f.sub.WithOpLock(func() {
+		close(lockEntered)
+		<-releaseLock
+	})
+	select {
+	case <-lockEntered:
+	case <-time.After(time.Second):
+		t.Fatal("subscription lock holder did not start")
+	}
+
+	operationLockAttempted := make(chan struct{})
+	allowAttempt := make(chan struct{})
+	f.cp.beforeSubscriptionOperationLockHook = func() {
+		close(operationLockAttempted)
+		<-allowAttempt
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- f.cp.DeleteSubscriptionContext(ctx, f.sub.ID)
+	}()
+
+	select {
+	case <-operationLockAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("subscription delete did not reach operation-lock boundary")
+	}
+	cancel()
+	close(allowAttempt)
+
+	var got error
+	select {
+	case got = <-done:
+	case <-time.After(250 * time.Millisecond):
+		releaseOnce.Do(func() { close(releaseLock) })
+		got = <-done
+		t.Fatalf("canceled subscription delete remained blocked on operation lock: %v", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("DeleteSubscriptionContext error = %v, want context.Canceled", got)
+	}
+	releaseOnce.Do(func() { close(releaseLock) })
+
+	if f.cp.SubMgr.Lookup(f.sub.ID) != f.sub {
+		t.Fatal("canceled delete removed the runtime subscription")
+	}
+	rows, err := f.engine.ListSubscriptions()
+	if err != nil {
+		t.Fatalf("ListSubscriptions: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != f.sub.ID {
+		t.Fatalf("canceled delete changed persisted subscriptions: %+v", rows)
+	}
+}
+
 func TestUpdateSubscription_AsyncRefreshIsJoinedBySchedulerStop(t *testing.T) {
 	f := newSubscriptionPatchFixture(t, true)
 	fetchStarted := make(chan struct{})

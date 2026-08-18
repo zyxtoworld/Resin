@@ -417,13 +417,17 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 	)
 	s.runSubscriptionMutationHook(subscriptionMutationBeforeLock)
 	mutate := func() error {
-		return s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
-			sub.WithOpLock(func() {
+		if hook := s.beforeSubscriptionOperationLockHook; hook != nil {
+			hook()
+		}
+		var opErr error
+		if err := sub.WithOpLockContext(ctx, func() {
+			opErr = s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
 				// Delete can win after the initial lookup but before this operation gets
 				// the lock. Do not resurrect a deleted row or runtime object.
 				if s.SubMgr.Lookup(id) != sub {
 					updateErr = notFound("subscription not found")
-					return
+					return updateErr
 				}
 
 				nameChanged := false
@@ -435,7 +439,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newName := sub.Name()
 				if nameStr, ok, err := patch.optionalNonEmptyString("name"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					newName = nameStr
 					nameChanged = newName != sub.Name()
@@ -444,15 +448,15 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newURL := sub.URL()
 				if urlStr, ok, err := patch.optionalString("url"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					if sourceType != subscription.SourceTypeRemote {
 						updateErr = invalidArg("url: field is not allowed for local subscription")
-						return
+						return updateErr
 					}
 					if _, verr := parseHTTPAbsoluteURL("url", urlStr); verr != nil {
 						updateErr = verr
-						return
+						return updateErr
 					}
 					newURL = urlStr
 					urlChanged = newURL != sub.URL()
@@ -461,15 +465,15 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newContent := sub.Content()
 				if contentStr, ok, err := patch.optionalString("content"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					if sourceType != subscription.SourceTypeLocal {
 						updateErr = invalidArg("content: field is not allowed for remote subscription")
-						return
+						return updateErr
 					}
 					if strings.TrimSpace(contentStr) == "" {
 						updateErr = invalidArg("content: must be a non-empty string")
-						return
+						return updateErr
 					}
 					newContent = contentStr
 					contentChanged = newContent != sub.Content()
@@ -478,11 +482,11 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newInterval := sub.UpdateIntervalNs()
 				if d, ok, err := patch.optionalDurationString("update_interval"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					if d < minSubscriptionUpdateInterval {
 						updateErr = invalidArg("update_interval: must be >= 30s")
-						return
+						return updateErr
 					}
 					newInterval = int64(d)
 				}
@@ -490,7 +494,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newEnabled := sub.Enabled()
 				if b, ok, err := patch.optionalBool("enabled"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					enabledChanged = b != newEnabled
 					newEnabled = b
@@ -499,7 +503,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newEphemeral := sub.Ephemeral()
 				if b, ok, err := patch.optionalBool("ephemeral"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					newEphemeral = b
 				}
@@ -507,7 +511,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newIncrementalAliveNodes := sub.IncrementalAliveNodes()
 				if b, ok, err := patch.optionalBool("incremental_alive_nodes"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					newIncrementalAliveNodes = b
 				}
@@ -515,11 +519,11 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				newEphemeralNodeEvictDelay := sub.EphemeralNodeEvictDelayNs()
 				if d, ok, err := patch.optionalDurationString("ephemeral_node_evict_delay"); err != nil {
 					updateErr = err
-					return
+					return updateErr
 				} else if ok {
 					if d < 0 {
 						updateErr = invalidArg("ephemeral_node_evict_delay: must be non-negative")
-						return
+						return updateErr
 					}
 					newEphemeralNodeEvictDelay = int64(d)
 				}
@@ -542,7 +546,7 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 				}
 				if err := s.Engine.UpsertSubscriptionContextAndCommit(writeCtx, ms); err != nil {
 					updateErr = internal("persist subscription", err)
-					return
+					return updateErr
 				}
 				if hook := s.afterSubscriptionPersistHook; hook != nil {
 					hook()
@@ -575,12 +579,15 @@ func (s *ControlPlaneService) UpdateSubscriptionContext(ctx context.Context, id 
 					hook()
 				}
 				refreshRuntime = (urlChanged || contentChanged) && s.Scheduler != nil
+				if updateErr != nil {
+					return updateErr
+				}
+				return nil
 			})
-			if updateErr != nil {
-				return updateErr
-			}
-			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		return opErr
 	}
 	var err error
 	if s.Scheduler != nil {
@@ -647,14 +654,18 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 	// if DB delete fails, do not mutate runtime subscription/node state. The
 	// state admission also spans the runtime callbacks, so shutdown cannot
 	// close dirty admission between the DB delete and node cleanup.
-	if err := s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
-		sub.WithOpLock(func() {
+	if hook := s.beforeSubscriptionOperationLockHook; hook != nil {
+		hook()
+	}
+	var opErr error
+	if err := sub.WithOpLockContext(ctx, func() {
+		opErr = s.Engine.WithStateWriteAdmissionContextAndCommit(ctx, func(writeCtx, _ context.Context) error {
 			// Re-check under lock in case another goroutine removed it between
 			// the initial Lookup and lock acquisition.
 			lockedSub := s.SubMgr.Lookup(id)
 			if lockedSub != sub {
 				deleteErr = notFound("subscription not found")
-				return
+				return deleteErr
 			}
 
 			lockedSub.ManagedNodes().RangeNodes(func(h node.Hash, _ subscription.ManagedNode) bool {
@@ -668,7 +679,7 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 				} else {
 					deleteErr = internal("delete subscription", err)
 				}
-				return
+				return deleteErr
 			}
 			if hook := s.afterSubscriptionPersistHook; hook != nil {
 				hook()
@@ -683,15 +694,15 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 				}
 				s.SubMgr.Unregister(id)
 			})
+			return deleteErr
 		})
-		return deleteErr
 	}); err != nil {
 		if errors.Is(err, state.ErrStateWriteAdmissionClosed) {
 			return internal("delete subscription", err)
 		}
 		return err
 	}
-	return nil
+	return opErr
 }
 
 // RefreshSubscription triggers an immediate subscription refresh (blocks).

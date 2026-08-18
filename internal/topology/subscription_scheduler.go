@@ -497,6 +497,7 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	// 4. Diff, swap, add/remove — under lock.
 	applied := false
 	mutationAdmitted := true
+	var runtimeMutationErr error
 	var runtimePreparation []nodeRuntimePreparation
 	if hook := s.beforeRefreshApplyLockHook; hook != nil {
 		hook()
@@ -611,7 +612,7 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 		}
 		applyMutation := func(admission PersistenceAdmission) {
 			if s.pool != nil {
-				s.pool.WithRuntimeMutation(func() {
+				runtimeMutationErr = s.pool.WithRuntimeMutationContext(ctx, func() {
 					mutate(admission)
 				})
 				return
@@ -631,7 +632,13 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	if !mutationAdmitted {
 		return ErrRefreshMutationRejected
 	}
+	if runtimeMutationErr != nil {
+		return runtimeMutationErr
+	}
 	if !applied {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		log.Printf("[scheduler] stale success ignored for %s", sub.ID)
 		return nil
 	}

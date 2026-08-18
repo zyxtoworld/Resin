@@ -154,7 +154,9 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 			}
 			if nextDelay, retry := inboundDemuxAcceptRetryDelay(err, tempDelay); retry {
 				tempDelay = nextDelay
-				time.Sleep(tempDelay)
+				if !s.waitForAcceptRetry(tempDelay) {
+					return http.ErrServerClosed
+				}
 				continue
 			}
 			return err
@@ -168,6 +170,20 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 			hook()
 		}
 		go s.handleAcceptedConn(conn)
+	}
+}
+
+func (s *inboundDemuxServer) waitForAcceptRetry(delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-s.baseContext().Done():
+		return false
 	}
 }
 

@@ -260,6 +260,11 @@ type ControlPlaneService struct {
 	// interleaving around the real subscription mutation path.
 	subscriptionMutationHook func(subscriptionMutationStage)
 
+	// beforeSubscriptionOperationLockHook is a package-test seam immediately
+	// before a subscription mutation attempts its operation lock. Production
+	// leaves it nil.
+	beforeSubscriptionOperationLockHook func()
+
 	// afterSubscriptionPersistHook is a package-test seam after the
 	// subscription row is persisted and before its runtime mutation.
 	afterSubscriptionPersistHook func()
