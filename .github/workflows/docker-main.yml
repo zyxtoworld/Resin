@@ -14,9 +14,10 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
-  build-webui:
-    name: Build WebUI
+  verify-race:
+    name: Verify Go race tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -36,36 +37,11 @@ jobs:
           npm ci
           npm run build
 
-      - name: Upload WebUI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: resin-webui-dist
-          path: webui/dist
-          if-no-files-found: error
-          retention-days: 1
-
-  verify-race:
-    name: Verify Go race tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: build-webui
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: 1.25.x
           cache: true
-
-      - name: Download WebUI artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: resin-webui-dist
-          path: webui/dist
 
       - name: Run Go race tests
         env:
@@ -75,9 +51,7 @@ jobs:
   build-binaries:
     name: Build Linux ${{ matrix.goarch }} binary
     runs-on: ubuntu-latest
-    needs:
-      - build-webui
-      - verify-race
+    needs: verify-race
     permissions:
       contents: read
     strategy:
@@ -90,11 +64,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download WebUI artifact
-        uses: actions/download-artifact@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          name: resin-webui-dist
-          path: webui/dist
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
 
       - name: Set up Go
         uses: actions/setup-go@v5
