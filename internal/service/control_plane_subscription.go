@@ -737,10 +737,15 @@ func (s *ControlPlaneService) RefreshSubscriptionContext(ctx context.Context, id
 		}
 		return internal("refresh subscription", errors.New("subscription scheduler is stopped"))
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if refreshErr != nil {
+		// A scheduler error means the refresh did not commit. Preserve a
+		// request cancellation for the API caller, but do not inspect ctx again
+		// after a nil result: nil is the scheduler's commit boundary, and the
+		// request may be canceled by a late persistence/runtime callback after
+		// the new generation is already published.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return internal("refresh subscription", refreshErr)
 	}
 	return nil

@@ -1095,6 +1095,66 @@ func TestRefreshSubscription_ReportsSynchronousFetchFailure(t *testing.T) {
 	}
 }
 
+func TestRefreshSubscriptionContextCancellationAfterRuntimePublishKeepsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	engine, closer, err := state.PersistenceBootstrap(
+		filepath.Join(dir, "state"),
+		filepath.Join(dir, "cache"),
+	)
+	if err != nil {
+		t.Fatalf("PersistenceBootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	subMgr := topology.NewSubscriptionManager()
+	sub := subscription.NewSubscription("sub-refresh-post-commit-cancel", "post-commit-cancel", "https://example.com/sub", true, false)
+	subMgr.Register(sub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var cancelOnce sync.Once
+	raw := []byte(`{"outbounds":[{"type":"shadowsocks","tag":"post-commit-cancel","server":"1.1.1.1","server_port":443}]}`)
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		MaxConsecutiveFailures: func() int { return 3 },
+		OnSubNodeChangedWithPersistence: func(subID string, hash node.Hash, added bool, admission topology.PersistenceAdmission) {
+			if subID == sub.ID && added {
+				if !admission.MarkSubscriptionNode(subID, hash.Hex()) {
+					t.Errorf("MarkSubscriptionNode(%s, %s) was rejected", subID, hash.Hex())
+				}
+				cancelOnce.Do(cancel)
+			}
+		},
+	})
+	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
+		SubManager: subMgr,
+		Pool:       pool,
+		Fetcher: func(context.Context, string) ([]byte, error) {
+			return raw, nil
+		},
+		RunRefreshMutation: func(fn func(topology.PersistenceAdmission)) bool {
+			return engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
+				fn(admission)
+			})
+		},
+	})
+	t.Cleanup(scheduler.Stop)
+	cp := &ControlPlaneService{Pool: pool, SubMgr: subMgr, Scheduler: scheduler}
+
+	if err := cp.RefreshSubscriptionContext(ctx, sub.ID); err != nil {
+		t.Fatalf("RefreshSubscriptionContext: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test did not cancel the request after runtime publication")
+	}
+	if got := pool.Size(); got != 1 {
+		t.Fatalf("runtime publication was lost after request cancellation: pool size=%d", got)
+	}
+	if got := sub.GetLastError(); got != "" {
+		t.Fatalf("successful refresh retained LastError: %q", got)
+	}
+}
+
 func TestRefreshSubscription_ReportsRejectedPersistenceMutation(t *testing.T) {
 	f := newSubscriptionPatchFixture(t, true)
 	raw := []byte(`{"type":"shadowsocks","tag":"refresh-rejected","server":"1.1.1.1","server_port":443}`)
