@@ -950,6 +950,46 @@ func TestRefreshSubscription_ReportsStoppedScheduler(t *testing.T) {
 	}
 }
 
+func TestRefreshSubscription_ReportsSynchronousFetchFailure(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, true)
+	f.cp.Scheduler.Fetcher = func(context.Context, string) ([]byte, error) {
+		return nil, errors.New("upstream unavailable")
+	}
+
+	err := f.cp.RefreshSubscription(f.sub.ID)
+	if err == nil {
+		t.Fatal("RefreshSubscription reported success after the synchronous fetch failed")
+	}
+	assertServiceErrorCode(t, err, "INTERNAL")
+	if got := f.sub.GetLastError(); got != "upstream unavailable" {
+		t.Fatalf("LastError = %q, want the fetch failure", got)
+	}
+}
+
+func TestRefreshSubscription_ReportsRejectedPersistenceMutation(t *testing.T) {
+	f := newSubscriptionPatchFixture(t, true)
+	raw := []byte(`{"type":"shadowsocks","tag":"refresh-rejected","server":"1.1.1.1","server_port":443}`)
+	f.cp.Scheduler = topology.NewSubscriptionScheduler(topology.SchedulerConfig{
+		SubManager: f.cp.SubMgr,
+		Pool:       f.cp.Pool,
+		Fetcher: func(context.Context, string) ([]byte, error) {
+			return []byte(`{"outbounds":[{"type":"shadowsocks","tag":"refresh-rejected","server":"1.1.1.1","server_port":443}]}`), nil
+		},
+		RunRefreshMutation: func(func(topology.PersistenceAdmission)) bool {
+			return false
+		},
+	})
+
+	err := f.cp.RefreshSubscription(f.sub.ID)
+	if err == nil {
+		t.Fatal("RefreshSubscription reported success after persistence admission rejected the mutation")
+	}
+	assertServiceErrorCode(t, err, "INTERNAL")
+	if _, ok := f.cp.Pool.GetEntry(node.HashFromRawOptions(raw)); ok {
+		t.Fatal("rejected refresh published a runtime node")
+	}
+}
+
 func TestDeleteSubscription_DropsInFlightRefreshResult(t *testing.T) {
 	dir := t.TempDir()
 	engine, closer, err := state.PersistenceBootstrap(

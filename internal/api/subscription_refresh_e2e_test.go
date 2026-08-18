@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,6 +74,31 @@ func TestAPIContract_SubscriptionRefreshAction_HonorsRequestCancellation(t *test
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("refresh handler ignored the canceled request context")
 	}
+}
+
+func TestAPIContract_SubscriptionRefreshAction_ReportsFetchFailure(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	cp.Scheduler.Fetcher = func(context.Context, string) ([]byte, error) {
+		return nil, errors.New("upstream unavailable")
+	}
+
+	createRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions", map[string]any{
+		"name": "sub-refresh-failure",
+		"url":  "https://example.com/sub",
+	}, true)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create subscription status: got %d, body=%s", createRec.Code, createRec.Body.String())
+	}
+	subID, _ := decodeJSONMap(t, createRec)["id"].(string)
+	if subID == "" {
+		t.Fatal("created subscription missing id")
+	}
+
+	refreshRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions/"+subID+"/actions/refresh", nil, true)
+	if refreshRec.Code != http.StatusInternalServerError {
+		t.Fatalf("refresh failure status: got %d, want %d, body=%s", refreshRec.Code, http.StatusInternalServerError, refreshRec.Body.String())
+	}
+	assertErrorCode(t, refreshRec, "INTERNAL")
 }
 
 func TestAPIContract_SubscriptionRefreshAction_E2EHTTPSource(t *testing.T) {

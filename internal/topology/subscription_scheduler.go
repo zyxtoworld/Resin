@@ -76,7 +76,10 @@ type SubscriptionScheduler struct {
 	beforeReenabledRuntimeHook func()
 }
 
-var ErrSchedulerStopped = errors.New("subscription scheduler is stopped")
+var (
+	ErrSchedulerStopped        = errors.New("subscription scheduler is stopped")
+	ErrRefreshMutationRejected = errors.New("subscription refresh mutation rejected")
+)
 
 // SchedulerConfig configures the SubscriptionScheduler.
 type SchedulerConfig struct {
@@ -361,33 +364,51 @@ func (s *SubscriptionScheduler) runUpdatesWithWorkerLimit(subs []*subscription.S
 // (no I/O under lock) while still preventing concurrent diff/apply races.
 // It reports whether scheduler lifecycle admission accepted the refresh.
 func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscription) bool {
-	return s.UpdateSubscriptionContext(context.Background(), sub)
+	admitted, _ := s.UpdateSubscriptionContextResult(context.Background(), sub)
+	return admitted
 }
 
 // UpdateSubscriptionContext refreshes one subscription while honoring the
 // caller's cancellation. Scheduler Stop remains an independent cancellation
 // source and still waits for the admitted refresh to exit.
 func (s *SubscriptionScheduler) UpdateSubscriptionContext(ctx context.Context, sub *subscription.Subscription) bool {
+	admitted, _ := s.UpdateSubscriptionContextResult(ctx, sub)
+	return admitted
+}
+
+// UpdateSubscriptionContextResult is the synchronous control-plane variant
+// of UpdateSubscriptionContext. The bool reports scheduler lifecycle
+// admission; the error reports an admitted refresh that failed during fetch,
+// parse, or runtime persistence admission. Background refresh callers
+// intentionally keep using the bool-only API because their failure is
+// recorded on the subscription.
+func (s *SubscriptionScheduler) UpdateSubscriptionContextResult(ctx context.Context, sub *subscription.Subscription) (bool, error) {
 	if s == nil || sub == nil {
-		return false
+		return false, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return false
+		return false, err
 	}
-	return s.runTracked(func() {
-		s.updateSubscription(ctx, sub)
+	var refreshErr error
+	admitted := s.runTracked(func() {
+		refreshErr = s.updateSubscriptionResult(ctx, sub)
 	})
+	return admitted, refreshErr
 }
 
 func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *subscription.Subscription) {
+	_ = s.updateSubscriptionResult(ctx, sub)
+}
+
+func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, sub *subscription.Subscription) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return
+		return err
 	}
 	attemptSeq := sub.NextAttemptSeq()
 	if s.beforeRefreshConfigSnapshotHook != nil {
@@ -395,7 +416,7 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 	}
 	attemptConfig, snapshotErr := sub.SnapshotConfigContext(ctx)
 	if snapshotErr != nil {
-		return
+		return snapshotErr
 	}
 	attemptURL := attemptConfig.URL
 	attemptSourceType := attemptConfig.SourceType
@@ -424,12 +445,16 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 			// timeout), but never publish a result for a finished caller.
 			if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 				s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "fetch", err)
+				return err
 			}
-			return
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return
+		return err
 	}
 
 	// 2. Parse (lock-free).
@@ -439,7 +464,7 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 	parsed, err := subscription.ParseGeneralSubscription(body)
 	if err != nil {
 		s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "parse", err)
-		return
+		return err
 	}
 	if len(parsed) == 0 {
 		// A recognized payload with no supported nodes is not a trustworthy
@@ -453,7 +478,7 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 			"parse",
 			errors.New("subscription: no supported nodes found"),
 		)
-		return
+		return errors.New("subscription: no supported nodes found")
 	}
 
 	// 3. Build refreshed managed nodes map (lock-free, pure computation).
@@ -471,6 +496,7 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 
 	// 4. Diff, swap, add/remove — under lock.
 	applied := false
+	mutationAdmitted := true
 	var runtimePreparation []nodeRuntimePreparation
 	if hook := s.beforeRefreshApplyLockHook; hook != nil {
 		hook()
@@ -594,17 +620,20 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 		}
 		if s.runRefreshMutation != nil {
 			if !s.runRefreshMutation(applyMutation) {
-				return
+				mutationAdmitted = false
 			}
 		} else {
 			applyMutation(nil)
 		}
 	}); err != nil {
-		return
+		return err
+	}
+	if !mutationAdmitted {
+		return ErrRefreshMutationRejected
 	}
 	if !applied {
 		log.Printf("[scheduler] stale success ignored for %s", sub.ID)
-		return
+		return nil
 	}
 	for _, prep := range runtimePreparation {
 		s.pool.RunNodeAddedRuntime(prep.hash, prep.entry)
@@ -613,6 +642,7 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
 	}
+	return nil
 }
 
 func shouldRemoveUnhealthyNodeForIncrementalMode(entry *node.NodeEntry) bool {

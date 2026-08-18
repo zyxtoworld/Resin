@@ -719,7 +719,8 @@ func (s *ControlPlaneService) RefreshSubscriptionContext(ctx context.Context, id
 	if s.Scheduler == nil {
 		return internal("subscription runtime unavailable", errors.New("subscription scheduler is nil"))
 	}
-	if !s.Scheduler.UpdateSubscriptionContext(ctx, sub) {
+	admitted, refreshErr := s.Scheduler.UpdateSubscriptionContextResult(ctx, sub)
+	if !admitted {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -727,6 +728,9 @@ func (s *ControlPlaneService) RefreshSubscriptionContext(ctx context.Context, id
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if refreshErr != nil {
+		return internal("refresh subscription", refreshErr)
 	}
 	return nil
 }
