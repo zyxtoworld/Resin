@@ -41,6 +41,10 @@ type SubscriptionResponse struct {
 	LastError               string `json:"last_error,omitempty"`
 }
 
+const maxSubscriptionResponseAttempts = 3
+
+var errSubscriptionChangedDuringRead = errors.New("subscription changed while reading")
+
 func (s *ControlPlaneService) subToResponseSnapshot(sub *subscription.Subscription, cfg subscription.ConfigSnapshot) SubscriptionResponse {
 	if hook := s.afterSubscriptionNameReadHook; hook != nil {
 		hook()
@@ -108,49 +112,64 @@ func (s *ControlPlaneService) ListSubscriptionsContext(ctx context.Context, enab
 		return nil, err
 	}
 
-	type candidate struct {
-		id  string
-		sub *subscription.Subscription
-		cfg subscription.ConfigSnapshot
-	}
-	var candidates []candidate
-	var snapshotErr error
-	s.SubMgr.Range(func(id string, sub *subscription.Subscription) bool {
-		if err := ctx.Err(); err != nil {
-			snapshotErr = err
-			return false
+	for attempt := 0; attempt < maxSubscriptionResponseAttempts; attempt++ {
+		type candidate struct {
+			id      string
+			sub     *subscription.Subscription
+			cfg     subscription.ConfigSnapshot
+			managed *subscription.ManagedNodes
 		}
-		cfg, err := sub.SnapshotConfigContext(ctx)
-		if err != nil {
-			snapshotErr = err
-			return false
-		}
-		if enabled == nil || cfg.Enabled == *enabled {
-			candidates = append(candidates, candidate{id: id, sub: sub, cfg: cfg})
-		}
-		return true
-	})
-	if snapshotErr != nil {
-		return nil, snapshotErr
-	}
-
-	var result []SubscriptionResponse
-	if err := s.withRuntimeReadContext(ctx, func() {
-		for _, item := range candidates {
-			// A delete/re-register can occur between the config snapshot and
-			// the runtime read. Do not combine the old config with a new object.
-			if s.SubMgr.Lookup(item.id) != item.sub {
-				continue
+		var candidates []candidate
+		var snapshotErr error
+		s.SubMgr.Range(func(id string, sub *subscription.Subscription) bool {
+			if err := ctx.Err(); err != nil {
+				snapshotErr = err
+				return false
 			}
-			result = append(result, s.subToResponseSnapshot(item.sub, item.cfg))
+			cfg, err := sub.SnapshotConfigContext(ctx)
+			if err != nil {
+				snapshotErr = err
+				return false
+			}
+			if enabled == nil || cfg.Enabled == *enabled {
+				candidates = append(candidates, candidate{
+					id:      id,
+					sub:     sub,
+					cfg:     cfg,
+					managed: sub.ManagedNodes(),
+				})
+			}
+			return true
+		})
+		if snapshotErr != nil {
+			return nil, snapshotErr
 		}
-	}); err != nil {
-		return nil, err
+
+		stable := true
+		var result []SubscriptionResponse
+		if err := s.withRuntimeReadContext(ctx, func() {
+			for _, item := range candidates {
+				// A delete/re-register can occur between the config snapshot and
+				// the runtime read. Do not combine the old config with a new object.
+				if s.SubMgr.Lookup(item.id) != item.sub {
+					continue
+				}
+				result = append(result, s.subToResponseSnapshot(item.sub, item.cfg))
+				if item.sub.ManagedNodes() != item.managed {
+					stable = false
+				}
+			}
+		}); err != nil {
+			return nil, err
+		}
+		if stable {
+			if result == nil {
+				result = []SubscriptionResponse{}
+			}
+			return result, nil
+		}
 	}
-	if result == nil {
-		result = []SubscriptionResponse{}
-	}
-	return result, nil
+	return nil, internal("list subscriptions", errSubscriptionChangedDuringRead)
 }
 
 // GetSubscription returns a single subscription by ID.
@@ -167,31 +186,40 @@ func (s *ControlPlaneService) GetSubscriptionContext(ctx context.Context, id str
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	sub := s.SubMgr.Lookup(id)
-	if sub == nil {
-		return nil, notFound("subscription not found")
-	}
-	cfg, err := sub.SnapshotConfigContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var (
-		result  *SubscriptionResponse
-		readErr error
-	)
-	if err := s.withRuntimeReadContext(ctx, func() {
-		// Do not return a response for a deleted object or accidentally apply
-		// its snapshot to a replacement registered under the same ID.
-		if s.SubMgr.Lookup(id) != sub {
-			readErr = notFound("subscription not found")
-			return
+	for attempt := 0; attempt < maxSubscriptionResponseAttempts; attempt++ {
+		sub := s.SubMgr.Lookup(id)
+		if sub == nil {
+			return nil, notFound("subscription not found")
 		}
-		r := s.subToResponseSnapshot(sub, cfg)
-		result = &r
-	}); err != nil {
-		return nil, err
+		cfg, err := sub.SnapshotConfigContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		managed := sub.ManagedNodes()
+		var (
+			result  *SubscriptionResponse
+			readErr error
+		)
+		if err := s.withRuntimeReadContext(ctx, func() {
+			// Do not return a response for a deleted object or accidentally apply
+			// its snapshot to a replacement registered under the same ID.
+			if s.SubMgr.Lookup(id) != sub {
+				readErr = notFound("subscription not found")
+				return
+			}
+			r := s.subToResponseSnapshot(sub, cfg)
+			result = &r
+		}); err != nil {
+			return nil, err
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		if sub.ManagedNodes() == managed {
+			return result, nil
+		}
 	}
-	return result, readErr
+	return nil, internal("get subscription", errSubscriptionChangedDuringRead)
 }
 
 // CreateSubscriptionRequest holds create subscription parameters.
