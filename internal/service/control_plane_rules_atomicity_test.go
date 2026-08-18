@@ -421,7 +421,10 @@ func TestAccountHeaderRuleMutationContextCancellationWhileRuleMutexHeld(t *testi
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("canceled rule mutation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	// The contract is cancellation before the SQLite blocker is released;
+	// allow the full repository test run's package load to schedule the
+	// canceled snapshot reader without turning this into a latency SLA.
+	case <-time.After(5 * time.Second):
 		releaseOnce.Do(func() { close(releaseFirst) })
 		<-firstDone
 		t.Fatal("canceled rule mutation remained blocked by rule mutex")
@@ -479,9 +482,13 @@ func TestUpsertAccountHeaderRuleContextCancellationInterruptsSnapshotRead(t *tes
 		MatcherRuntime: proxy.NewAccountMatcherRuntime(nil),
 	}
 	snapshotStarted := make(chan struct{})
+	allowSnapshot := make(chan struct{})
+	var allowSnapshotOnce sync.Once
+	t.Cleanup(func() { allowSnapshotOnce.Do(func() { close(allowSnapshot) }) })
 	cp.ruleMutationHook = func(stage ruleMutationStage) {
 		if stage == ruleMutationBeforeSnapshot {
 			close(snapshotStarted)
+			<-allowSnapshot
 		}
 	}
 
@@ -498,12 +505,13 @@ func TestUpsertAccountHeaderRuleContextCancellationInterruptsSnapshotRead(t *tes
 	}
 
 	cancel()
+	allowSnapshotOnce.Do(func() { close(allowSnapshot) })
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("snapshot read cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		release()
 		<-done
 		t.Fatal("canceled rule mutation remained blocked in the snapshot read")

@@ -5,6 +5,7 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
@@ -12,7 +13,18 @@ import (
 // OpenDB opens (or creates) a SQLite database at path with recommended pragmas:
 // WAL journal mode, synchronous=NORMAL, foreign_keys=ON, busy_timeout=5000.
 func OpenDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	// _pragma is part of the driver DSN, so every connection created after a
+	// bad connection is discarded receives the normal busy timeout too. The
+	// one-time Exec below is not enough: database/sql may create a replacement
+	// connection later, which otherwise starts with SQLite's busy_timeout=0.
+	dsn := path
+	if strings.Contains(dsn, "?") {
+		dsn += "&"
+	} else {
+		dsn += "?"
+	}
+	dsn += fmt.Sprintf("_pragma=busy_timeout(%d)", DefaultSQLiteBusyTimeoutMs)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db %s: %w", path, err)
 	}

@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,17 @@ type StateRepo struct {
 	// the serialized repository write owner is acquired. Production leaves it
 	// nil.
 	beforeWriteMutexHook func()
+	// beforeContextReadPragmaHook is a package-private test seam immediately
+	// before a request-bound read connection receives its short busy timeout.
+	// Production leaves it nil.
+	beforeContextReadPragmaHook func(*sql.Conn) error
+	// beforeContextReadResetHook is a package-private test seam immediately
+	// before a request-bound read connection is reset and returned.
+	// Production leaves it nil.
+	beforeContextReadResetHook func(*sql.Conn)
+	// beforeContextReadQueryHook is a package-private test seam immediately
+	// before a request-bound SQL read starts. Production leaves it nil.
+	beforeContextReadQueryHook func(*sql.Conn)
 	// afterWriteBeginHook is package-private coordination after a write has
 	// acquired SQLite's IMMEDIATE transaction. Production leaves it nil.
 	afterWriteBeginHook func()
@@ -159,6 +171,61 @@ func (r *StateRepo) lockWriteContext(ctx context.Context) (func(), error) {
 		_, _ = r.db.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
 		r.mu.Unlock()
 	}, nil
+}
+
+// contextReadConn gives request-bound reads the same short SQLite busy
+// interval as the write owner. Without this, a snapshot read performed before
+// the write transaction can sleep in SQLite's default 5s busy handler after
+// the HTTP request has already been canceled.
+func (r *StateRepo) contextReadConn(ctx context.Context) (*sql.Conn, func(), error) {
+	if !isContextSQLiteWrite(ctx) {
+		return nil, func() {}, nil
+	}
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if hook := r.beforeContextReadPragmaHook; hook != nil {
+		if err := hook(conn); err != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			_ = conn.Close()
+			return nil, nil, err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", contextSQLiteBusyTimeoutMs)); err != nil {
+		// The driver may have applied the pragma before reporting a
+		// cancellation/error. Never return that connection to the pool with a
+		// request-sized busy timeout.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, func() {
+		if hook := r.beforeContextReadResetHook; hook != nil {
+			hook(conn)
+		}
+		if ctx.Err() != nil {
+			// A canceled read may still be unwinding under the same SQLite
+			// writer lock. Do not run a background PRAGMA here: discard the
+			// connection instead of blocking the canceled caller.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		} else if !resetStateSQLiteBusyTimeout(conn) {
+			// A failed reset must not return a connection with a request-sized
+			// busy timeout to the pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}, nil
+}
+
+func resetStateSQLiteBusyTimeout(conn *sql.Conn) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	_, err := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", DefaultSQLiteBusyTimeoutMs))
+	return err == nil
 }
 
 // withCommitTx separates SQLite write-owner admission from the irreversible
@@ -1041,11 +1108,29 @@ func (r *StateRepo) GetEndpointContext(ctx context.Context, id string) (*model.E
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	row := r.db.QueryRowContext(ctx, `
+	conn, release, err := r.contextReadConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	queryRow := func() *sql.Row {
+		if conn != nil {
+			if hook := r.beforeContextReadQueryHook; hook != nil {
+				hook(conn)
+			}
+			return conn.QueryRowContext(ctx, `
+			SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
+			       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
+			FROM endpoints WHERE id = ?
+		`, id)
+		}
+		return r.db.QueryRowContext(ctx, `
 		SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
 		       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
 		FROM endpoints WHERE id = ?
-	`, id)
+		`, id)
+	}
+	row := queryRow()
 	endpoint, err := scanEndpoint(row.Scan)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -1263,7 +1348,20 @@ func (r *StateRepo) ListAccountHeaderRulesContext(ctx context.Context) ([]model.
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := r.db.QueryContext(ctx, "SELECT url_prefix, headers_json, updated_at_ns FROM account_header_rules")
+	conn, release, err := r.contextReadConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	var rows *sql.Rows
+	if conn != nil {
+		if hook := r.beforeContextReadQueryHook; hook != nil {
+			hook(conn)
+		}
+		rows, err = conn.QueryContext(ctx, "SELECT url_prefix, headers_json, updated_at_ns FROM account_header_rules")
+	} else {
+		rows, err = r.db.QueryContext(ctx, "SELECT url_prefix, headers_json, updated_at_ns FROM account_header_rules")
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -160,6 +160,12 @@ func (s *ControlPlaneService) UpsertAccountHeaderRuleContext(ctx context.Context
 		if createdFromSnapshot {
 			candidate = append(candidate, rule)
 		}
+		// Snapshot loading is still part of the request-cancelable prepare
+		// phase. Do not enter the commit owner if cancellation raced with the
+		// final row read but had not yet propagated through the child context.
+		if err := writeCtx.Err(); err != nil {
+			return err
+		}
 		s.runRuleMutationHook(ruleMutationAfterSnapshot)
 
 		created, err = s.Engine.UpsertAccountHeaderRuleWithCreatedContext(commitCtx, rule)
@@ -226,6 +232,9 @@ func (s *ControlPlaneService) DeleteAccountHeaderRuleContext(ctx context.Context
 		}
 		if !found {
 			return notFound("rule not found")
+		}
+		if err := writeCtx.Err(); err != nil {
+			return err
 		}
 		s.runRuleMutationHook(ruleMutationAfterSnapshot)
 

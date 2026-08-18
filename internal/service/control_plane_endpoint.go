@@ -325,7 +325,11 @@ func (s *ControlPlaneService) CreateEndpointContext(ctx context.Context, req Cre
 				s.afterEndpointBeginPersistHook()
 			}
 		}
-		if err := s.Engine.InsertEndpointContext(commitCtx, endpoint); err != nil {
+		persistCtx := writeCtx
+		if runtimeStage != nil {
+			persistCtx = commitCtx
+		}
+		if err := s.Engine.InsertEndpointContext(persistCtx, endpoint); err != nil {
 			if runtimeStage != nil {
 				runtimeStage.Abort()
 			}
@@ -453,7 +457,11 @@ func (s *ControlPlaneService) UpdateEndpointContext(ctx context.Context, id stri
 				s.afterEndpointBeginPersistHook()
 			}
 		}
-		if err := s.Engine.UpdateEndpointContext(commitCtx, next); err != nil {
+		persistCtx := writeCtx
+		if runtimeStage != nil {
+			persistCtx = commitCtx
+		}
+		if err := s.Engine.UpdateEndpointContext(persistCtx, next); err != nil {
 			if runtimeStage != nil {
 				runtimeStage.Abort()
 			}

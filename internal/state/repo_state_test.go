@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -1660,6 +1661,151 @@ func TestStateRepo_AccountHeaderRuleContextWritesHonorRepositoryMutexCancellatio
 			locked = false
 			tc.assertNoChange(t, repo, rule)
 		})
+	}
+}
+
+func TestStateRepo_ContextReadSetupFailureDiscardsShortTimeoutConnection(t *testing.T) {
+	repo := newTestStateRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repo.beforeContextReadPragmaHook = func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(context.Background(), "PRAGMA busy_timeout=50"); err != nil {
+			return err
+		}
+		return errors.New("injected read pragma failure")
+	}
+
+	err := repo.withWriteContext(ctx, func(writeCtx context.Context) error {
+		_, err := repo.GetEndpointContext(writeCtx, "missing")
+		return err
+	})
+	if err == nil {
+		t.Fatal("GetEndpointContext unexpectedly succeeded after setup connection failure")
+	}
+
+	var busyTimeout int64
+	if err := repo.db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("read ordinary connection busy_timeout: %v", err)
+	}
+	if busyTimeout != DefaultSQLiteBusyTimeoutMs {
+		t.Fatalf("ordinary connection busy_timeout = %d, want %d", busyTimeout, DefaultSQLiteBusyTimeoutMs)
+	}
+}
+
+func TestStateRepo_ContextReadResetFailureDiscardsConnection(t *testing.T) {
+	repo := newTestStateRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repo.beforeContextReadResetHook = func(conn *sql.Conn) {
+		if err := conn.Raw(func(driverConn any) error {
+			closer, ok := driverConn.(interface{ Close() error })
+			if !ok {
+				return errors.New("driver connection does not expose Close")
+			}
+			return closer.Close()
+		}); err != nil {
+			t.Fatalf("close raw driver connection: %v", err)
+		}
+	}
+
+	err := repo.withWriteContext(ctx, func(writeCtx context.Context) error {
+		_, err := repo.GetEndpointContext(writeCtx, "missing")
+		return err
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetEndpointContext error = %v, want ErrNotFound", err)
+	}
+
+	var busyTimeout int64
+	if err := repo.db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("read ordinary connection busy_timeout: %v", err)
+	}
+	if busyTimeout != DefaultSQLiteBusyTimeoutMs {
+		t.Fatalf("ordinary connection busy_timeout = %d, want %d", busyTimeout, DefaultSQLiteBusyTimeoutMs)
+	}
+}
+
+func TestStateRepo_ContextReadCancellationReturnsBeforeSQLiteReaderRelease(t *testing.T) {
+	dbPath := t.TempDir() + "/state.db"
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open state db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		"PRAGMA journal_mode=DELETE",
+		"PRAGMA busy_timeout=5000",
+		`CREATE TABLE account_header_rules (
+			url_prefix TEXT PRIMARY KEY,
+			headers_json TEXT NOT NULL,
+			updated_at_ns INTEGER NOT NULL
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("initialize state db with %q: %v", statement, err)
+		}
+	}
+
+	blocker, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open blocker db: %v", err)
+	}
+	blocker.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = blocker.Close() })
+	if _, err := blocker.Exec("PRAGMA busy_timeout=0"); err != nil {
+		t.Fatalf("set blocker busy timeout: %v", err)
+	}
+	if _, err := blocker.Exec("BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("begin exclusive blocker: %v", err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		_, _ = blocker.Exec("ROLLBACK")
+	}
+	t.Cleanup(release)
+
+	repo := newStateRepo(db)
+	queryAttempted := make(chan struct{})
+	repo.beforeContextReadQueryHook = func(*sql.Conn) {
+		close(queryAttempted)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.withWriteContext(ctx, func(writeCtx context.Context) error {
+			_, err := repo.ListAccountHeaderRulesContext(writeCtx)
+			return err
+		})
+	}()
+	select {
+	case <-queryAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("context-bound read did not reach the SQLite query boundary")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("context-bound read error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		release()
+		<-done
+		t.Fatal("context-bound read remained blocked until SQLite writer release")
+	}
+	release()
+
+	if _, err := repo.UpsertAccountHeaderRuleWithCreated(model.AccountHeaderRule{
+		URLPrefix: "after-cancel.example.com", Headers: []string{"X-After-Cancel"}, UpdatedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("write after canceled read: %v", err)
 	}
 }
 
