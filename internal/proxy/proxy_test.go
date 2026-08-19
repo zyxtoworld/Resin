@@ -53,12 +53,12 @@ type mockHealthRecorder struct {
 }
 
 func (m *mockHealthRecorder) RecordResultForEntry(_ node.Hash, _ *node.NodeEntry, success bool) bool {
-	m.resultCalls.Add(1)
 	if success {
 		m.lastSuccess.Store(1)
 	} else {
 		m.lastSuccess.Store(0)
 	}
+	m.resultCalls.Add(1)
 	return true
 }
 
