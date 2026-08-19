@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -118,22 +119,9 @@ func (r *MetricsRepo) WriteBucketContext(ctx context.Context, data *BucketFlushD
 		ctx = context.Background()
 	}
 
-	conn, release, err := r.acquireContextConn(ctx)
-	if err != nil {
-		return fmt.Errorf("metrics repo acquire connection: %w", err)
-	}
-	defer release()
-
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("metrics repo begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-	if err := writeBucketExec(ctx, tx, data); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return r.withMetricsTransaction(ctx, func(tx *sql.Tx) error {
+		return writeBucketExec(ctx, tx, data)
+	})
 }
 
 // WriteNodePoolSnapshot writes a node pool snapshot for a bucket.
@@ -191,43 +179,74 @@ func (r *MetricsRepo) WritePersistTaskContext(
 		ctx = context.Background()
 	}
 
+	return r.withMetricsTransaction(ctx, func(tx *sql.Tx) error {
+		if err := writeBucketExec(ctx, tx, data); err != nil {
+			return err
+		}
+		if nodePool != nil {
+			if err := writeNodePoolExec(
+				ctx,
+				tx,
+				data.BucketStartUnix,
+				nodePool.TotalNodes,
+				nodePool.HealthyNodes,
+				nodePool.EgressIPCount,
+			); err != nil {
+				return fmt.Errorf("metrics repo upsert node pool snapshot: %w", err)
+			}
+		}
+		if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, "", globalLatency); err != nil {
+			return fmt.Errorf("metrics repo upsert global latency bucket: %w", err)
+		}
+		for platformID, buckets := range platformLatency {
+			if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, platformID, buckets); err != nil {
+				return fmt.Errorf("metrics repo upsert platform latency bucket %s: %w", platformID, err)
+			}
+		}
+		return nil
+	})
+}
+
+// withMetricsTransaction owns the complete sql.Tx lifecycle. A failed
+// rollback or COMMIT leaves the driver's transaction state unknowable, so the
+// connection is marked bad instead of being returned to database/sql's pool.
+func (r *MetricsRepo) withMetricsTransaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	conn, release, err := r.acquireContextConn(ctx)
 	if err != nil {
 		return fmt.Errorf("metrics repo acquire connection: %w", err)
 	}
-	defer release()
+	released := false
+	discard := func() {
+		if released {
+			return
+		}
+		released = true
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		_ = conn.Close()
+	}
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
+		discard()
 		return fmt.Errorf("metrics repo begin: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck
-
-	if err := writeBucketExec(ctx, tx, data); err != nil {
+	if err := fn(tx); err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			discard()
+			return errors.Join(err, fmt.Errorf("metrics repo rollback: %w", rollbackErr))
+		}
 		return err
 	}
-	if nodePool != nil {
-		if err := writeNodePoolExec(
-			ctx,
-			tx,
-			data.BucketStartUnix,
-			nodePool.TotalNodes,
-			nodePool.HealthyNodes,
-			nodePool.EgressIPCount,
-		); err != nil {
-			return fmt.Errorf("metrics repo upsert node pool snapshot: %w", err)
-		}
+	if err := tx.Commit(); err != nil {
+		discard()
+		return err
 	}
-	if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, "", globalLatency); err != nil {
-		return fmt.Errorf("metrics repo upsert global latency bucket: %w", err)
-	}
-	for platformID, buckets := range platformLatency {
-		if err := writeLatencyExec(ctx, tx, data.BucketStartUnix, platformID, buckets); err != nil {
-			return fmt.Errorf("metrics repo upsert platform latency bucket %s: %w", platformID, err)
-		}
-	}
-
-	return tx.Commit()
+	return nil
 }
 
 type metricsExecContext interface {
@@ -409,7 +428,7 @@ func (r *MetricsRepo) queryTraffic(ctx context.Context, from, to int64) ([]Traff
 	for rows.Next() {
 		var row TrafficBucketRow
 		if err := rows.Scan(&row.BucketStartUnix, &row.IngressBytes, &row.EgressBytes); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan traffic bucket: %w", err)
 		}
 		result = append(result, row)
 	}
@@ -452,7 +471,7 @@ func (r *MetricsRepo) queryRequests(ctx context.Context, from, to int64, platfor
 		var row RequestBucketRow
 		var pid sql.NullString
 		if err := rows.Scan(&row.BucketStartUnix, &pid, &row.TotalRequests, &row.SuccessRequests); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan request bucket: %w", err)
 		}
 		if pid.Valid {
 			row.PlatformID = pid.String
@@ -486,7 +505,7 @@ func (r *MetricsRepo) queryProbes(ctx context.Context, from, to int64) ([]ProbeB
 	for rows.Next() {
 		var row ProbeBucketRow
 		if err := rows.Scan(&row.BucketStartUnix, &row.TotalCount); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan probe bucket: %w", err)
 		}
 		result = append(result, row)
 	}
@@ -519,7 +538,7 @@ func (r *MetricsRepo) queryNodePool(ctx context.Context, from, to int64) ([]Node
 	for rows.Next() {
 		var row NodePoolBucketRow
 		if err := rows.Scan(&row.BucketStartUnix, &row.TotalNodes, &row.HealthyNodes, &row.EgressIPCount); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan node pool bucket: %w", err)
 		}
 		result = append(result, row)
 	}
@@ -586,7 +605,7 @@ func (r *MetricsRepo) queryAccessLatency(ctx context.Context, from, to int64, pl
 		var row AccessLatencyBucketRow
 		var pid sql.NullString
 		if err := rows.Scan(&row.BucketStartUnix, &pid, &row.BucketsJSON); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan access latency bucket: %w", err)
 		}
 		if pid.Valid {
 			row.PlatformID = pid.String
@@ -630,7 +649,7 @@ func (r *MetricsRepo) queryLeaseLifetime(ctx context.Context, from, to int64, pl
 	for rows.Next() {
 		var row LeaseLifetimeBucketRow
 		if err := rows.Scan(&row.BucketStartUnix, &row.PlatformID, &row.SampleCount, &row.P1Ms, &row.P5Ms, &row.P50Ms); err != nil {
-			continue
+			return nil, fmt.Errorf("metrics repo scan lease lifetime bucket: %w", err)
 		}
 		result = append(result, row)
 	}
