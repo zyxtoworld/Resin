@@ -243,12 +243,14 @@ func TestResponseRules_ExpiryRejectsPastAndFarFuture(t *testing.T) {
 func TestCompileResponseRules_RejectsInvalidSchemaAtomically(t *testing.T) {
 	valid := model.PlatformResponseRule{ID: "valid", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}
 	for name, rules := range map[string][]model.PlatformResponseRule{
-		"duplicate id":        {valid, valid},
-		"invalid regex":       {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "regex", Value: "("}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
-		"unknown action":      {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "unknown"}}},
-		"bad range":           {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusRange: []model.PlatformResponseStatusRange{{Min: 500, Max: 400}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
-		"invalid header name": {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Headers: []model.PlatformResponseHeaderMatch{{Name: "X Bad", Op: "exists"}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
-		"body value too long": {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "contains", Value: strings.Repeat("x", responseRuleMaxValueBytes+1)}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"duplicate id":                 {valid, valid},
+		"invalid regex":                {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "regex", Value: "("}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"unknown action":               {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}}, Action: model.PlatformResponseRuleAction{Type: "unknown"}}},
+		"bad range":                    {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusRange: []model.PlatformResponseStatusRange{{Min: 500, Max: 400}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"invalid header name":          {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Headers: []model.PlatformResponseHeaderMatch{{Name: "X Bad", Op: "exists"}}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"body value too long":          {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{403}, Body: &model.PlatformResponseBodyMatch{Op: "contains", Value: strings.Repeat("x", responseRuleMaxValueBytes+1)}}, Action: model.PlatformResponseRuleAction{Type: "passthrough"}}},
+		"invalid JSON pointer escape":  {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}}, Action: model.PlatformResponseRuleAction{Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none", ExpirySources: []model.PlatformResponseExpirySource{{Type: "json_pointer", JSONPointer: "/reset~2at", Format: "unix_seconds"}}}}},
+		"trailing JSON pointer escape": {{ID: "bad", Enabled: true, Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}}, Action: model.PlatformResponseRuleAction{Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none", ExpirySources: []model.PlatformResponseExpirySource{{Type: "json_pointer", JSONPointer: "/reset~", Format: "unix_seconds"}}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := CompileResponseRules("plat-1", rules); err == nil {
@@ -287,5 +289,47 @@ func TestCompileResponseRules_RejectsInvalidSchemaAtomically(t *testing.T) {
 	}
 	if _, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{tooManySources}); err == nil {
 		t.Fatal("too many expiry sources were accepted")
+	}
+}
+
+func TestResponseRules_JSONPointerAcceptsRFC6901Escapes(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	want := now.Add(time.Hour)
+	for name, tc := range map[string]struct {
+		pointer string
+		body    string
+	}{
+		"escaped slash": {pointer: "/reset~1at", body: `{"reset/at":` + strconv.FormatInt(want.Unix(), 10) + `}`},
+		"escaped tilde": {pointer: "/reset~0at", body: `{"reset~at":` + strconv.FormatInt(want.Unix(), 10) + `}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rules, err := CompileResponseRules("plat-1", []model.PlatformResponseRule{{
+				ID: "expiry", Enabled: true,
+				Match: model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
+				Action: model.PlatformResponseRuleAction{
+					Type: "cooldown", CooldownScope: "egress_ip", Fallback: "none",
+					ExpirySources: []model.PlatformResponseExpirySource{{Type: "json_pointer", JSONPointer: tc.pointer, Format: "unix_seconds"}},
+				},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			decision, ok := rules.Match(429, []byte(tc.body), true, nil, now)
+			if !ok || !decision.Until.Equal(want) {
+				t.Fatalf("escaped pointer did not resolve: matched=%v decision=%+v", ok, decision)
+			}
+		})
+	}
+}
+
+func TestJSONPointerScalarRejectsNonCanonicalArrayIndexes(t *testing.T) {
+	body := []byte(`{"items":["zero","one"]}`)
+	for _, pointer := range []string{"/items/01", "/items/+1", "/items/-0"} {
+		if value, ok := jsonPointerScalar(body, pointer); ok {
+			t.Fatalf("non-canonical array index %q resolved to %q", pointer, value)
+		}
+	}
+	if value, ok := jsonPointerScalar(body, "/items/1"); !ok || value != "one" {
+		t.Fatalf("canonical array index did not resolve: value=%q ok=%v", value, ok)
 	}
 }

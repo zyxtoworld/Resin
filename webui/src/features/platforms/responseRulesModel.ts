@@ -11,6 +11,17 @@ const MAX_VALUE_LENGTH = 4096;
 const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const valueSchema = z.string().max(MAX_VALUE_LENGTH, "值过长");
 
+function isValidJSONPointer(value: string): boolean {
+  if (!value.startsWith("/")) return false;
+  for (let index = 1; index < value.length; index += 1) {
+    if (value[index] !== "~") continue;
+    const escape = value[index + 1];
+    if (escape !== "0" && escape !== "1") return false;
+    index += 1;
+  }
+  return true;
+}
+
 const headerSchema = z.object({
   name: z.string().min(1, "Header 名称不能为空").max(256, "Header 名称过长").regex(headerNamePattern, "Header 名称不是合法字段名"),
   op: z.enum(["exists", "absent", "regex", "not_regex", "contains", "not_contains"]),
@@ -78,7 +89,7 @@ const expirySourceSchema = z.object({
     return;
   }
   if (source.type === "json_pointer") {
-    if (!source.json_pointer || !source.json_pointer.startsWith("/") || hasHeader || hasRegex || hasCapture || !source.format) {
+    if (!source.json_pointer || !isValidJSONPointer(source.json_pointer) || hasHeader || hasRegex || hasCapture || !source.format) {
       ctx.addIssue({ code: "custom", path: ["json_pointer"], message: "JSON Pointer 到期来源字段不完整或包含无关字段" });
     }
     return;

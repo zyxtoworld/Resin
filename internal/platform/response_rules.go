@@ -334,7 +334,7 @@ func compileResponseExpirySources(index int, raw []model.PlatformResponseExpiryS
 			}
 			source.header = name
 		case "json_pointer":
-			if item.JSONPointer == "" || len(item.JSONPointer) > responseRuleMaxValueBytes || !strings.HasPrefix(item.JSONPointer, "/") || item.Header != "" || item.Regex != "" || item.Capture != 0 || format == "" {
+			if !validResponseJSONPointer(item.JSONPointer) || item.Header != "" || item.Regex != "" || item.Capture != 0 || format == "" {
 				return nil, fmt.Errorf("response_rules[%d].action.expiry_sources[%d]: invalid json_pointer source", index, j)
 			}
 			source.pointer = item.JSONPointer
@@ -400,6 +400,22 @@ func validHTTPFieldName(name string) bool {
 		default:
 			return false
 		}
+	}
+	return true
+}
+
+func validResponseJSONPointer(pointer string) bool {
+	if pointer == "" || len(pointer) > responseRuleMaxValueBytes || pointer[0] != '/' {
+		return false
+	}
+	for i := 1; i < len(pointer); i++ {
+		if pointer[i] != '~' {
+			continue
+		}
+		if i+1 >= len(pointer) || (pointer[i+1] != '0' && pointer[i+1] != '1') {
+			return false
+		}
+		i++
 	}
 	return true
 }
@@ -685,8 +701,8 @@ func jsonPointerScalar(body []byte, pointer string) (string, bool) {
 				return "", false
 			}
 		case []any:
-			index, err := strconv.Atoi(token)
-			if err != nil || index < 0 || index >= len(current) {
+			index, ok := jsonPointerArrayIndex(token, len(current))
+			if !ok {
 				return "", false
 			}
 			value = current[index]
@@ -704,4 +720,17 @@ func jsonPointerScalar(body []byte, pointer string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func jsonPointerArrayIndex(token string, length int) (int, bool) {
+	if token == "" || (len(token) > 1 && token[0] == '0') {
+		return 0, false
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return 0, false
+		}
+	}
+	index, err := strconv.Atoi(token)
+	return index, err == nil && index < length
 }

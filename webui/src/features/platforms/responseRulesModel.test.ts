@@ -67,12 +67,29 @@ const malformedCases = [
   '[{"id":"x","enabled":true,"match":{},"action":{"type":"passthrough","fallback":"none"}}]',
   '[{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","fixed_duration":"1h"}}]',
   '[{"id":"x","enabled":true,"match":{},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"retry_after","format":"unix_seconds"}]}}]',
+  '[{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"json_pointer","json_pointer":"/reset~2at","format":"unix_seconds"}]}}]',
+  '[{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"json_pointer","json_pointer":"/reset~","format":"unix_seconds"}]}}]',
   '[{"id":"x","enabled":true,"match":{},"action":{"type":"passthrough"},"unexpected":true}]',
 ];
 for (const input of malformedCases) {
   const parsed = parseResponseRulesText(input);
   assert.equal(parsed.rules, null, `malformed rules unexpectedly accepted: ${input}`);
   assert.ok(parsed.error);
+}
+
+for (const pointer of ["/reset~1at", "/reset~0at"]) {
+  const parsed = parseResponseRulesText(JSON.stringify([{
+    id: "valid-pointer",
+    enabled: true,
+    match: { status_codes: [429] },
+    action: {
+      type: "cooldown",
+      cooldown_scope: "egress_ip",
+      fallback: "none",
+      expiry_sources: [{ type: "json_pointer", json_pointer: pointer, format: "unix_seconds" }],
+    },
+  }]));
+  assert.ok(parsed.rules, `valid JSON Pointer was rejected: ${pointer}`);
 }
 
 const roundTrip = parseResponseRulesText(formatResponseRules([validRule]));
