@@ -6,15 +6,19 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/service"
 )
 
 func validateAccountPath(r *http.Request) (string, error) {
-	account := PathParam(r, "account")
-	if strings.TrimSpace(account) == "" {
-		return "", invalidArgumentError("account: must be non-empty")
+	leaseID := PathParam(r, "account")
+	if strings.TrimSpace(leaseID) == "" {
+		return "", invalidArgumentError("lease_id: must be non-empty")
 	}
-	return account, nil
+	if !observability.IsLeaseID(leaseID) {
+		return "", invalidArgumentError("lease_id: invalid")
+	}
+	return leaseID, nil
 }
 
 func leaseSortKey(sortBy string, l service.LeaseResponse) string {
@@ -98,18 +102,9 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 		// Optional account filter.
 		if accountQuery != "" {
 			filtered := make([]service.LeaseResponse, 0, len(leases))
-			if useFuzzyAccountMatch {
-				accountLower := strings.ToLower(accountFilter)
-				for _, l := range leases {
-					if strings.Contains(strings.ToLower(l.Account), accountLower) {
-						filtered = append(filtered, l)
-					}
-				}
-			} else {
-				for _, l := range leases {
-					if l.Account == accountFilter {
-						filtered = append(filtered, l)
-					}
+			for _, l := range leases {
+				if l.MatchesAccountFilter(accountFilter, useFuzzyAccountMatch) {
+					filtered = append(filtered, l)
 				}
 			}
 			leases = filtered
@@ -132,7 +127,7 @@ func HandleGetLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeServiceError(w, err)
 			return
 		}
-		lease, err := cp.GetLeaseContext(r.Context(), platformID, account)
+		lease, err := cp.GetLeaseByIdentifierContext(r.Context(), platformID, account)
 		if err != nil {
 			writeServiceError(w, err)
 			return
@@ -153,7 +148,7 @@ func HandleDeleteLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			writeServiceError(w, err)
 			return
 		}
-		if err := cp.DeleteLeaseContext(r.Context(), platformID, account); err != nil {
+		if err := cp.DeleteLeaseByIdentifierContext(r.Context(), platformID, account); err != nil {
 			writeServiceError(w, err)
 			return
 		}

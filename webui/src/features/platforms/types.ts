@@ -86,6 +86,8 @@ export type PlatformUpdateInput = {
 export type PlatformLease = {
   platform_id: string;
   account: string;
+  account_redacted: boolean;
+  lease_id: string;
   node_hash: string;
   node_tag: string;
   egress_ip: string;

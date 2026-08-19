@@ -9,6 +9,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/metrics"
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/service"
 )
@@ -89,6 +90,15 @@ func NewServerWithAddressAndHealth(
 	metricsManager *metrics.Manager,
 	healthProvider func() HealthzStatus,
 ) *Server {
+	var projector *observability.Projector
+	if cp != nil && cp.Projector != nil {
+		projector = cp.Projector
+	} else {
+		projector = observability.NewRandomProjector()
+		if cp != nil {
+			cp.Projector = projector
+		}
+	}
 	mux := http.NewServeMux()
 
 	// Public (no auth)
@@ -161,8 +171,8 @@ func NewServerWithAddressAndHealth(
 
 	// Request log endpoints (always registered if repo is available).
 	if requestlogRepo != nil {
-		authed.Handle("GET /api/v1/request-logs", HandleListRequestLogs(requestlogRepo))
-		authed.Handle("GET /api/v1/request-logs/{log_id}", HandleGetRequestLog(requestlogRepo))
+		authed.Handle("GET /api/v1/request-logs", HandleListRequestLogs(requestlogRepo, projector))
+		authed.Handle("GET /api/v1/request-logs/{log_id}", HandleGetRequestLog(requestlogRepo, projector))
 		authed.Handle("GET /api/v1/request-logs/{log_id}/payloads", HandleGetRequestLogPayloads(requestlogRepo))
 	}
 

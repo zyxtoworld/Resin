@@ -21,6 +21,7 @@ import (
 	"github.com/Resinat/Resin/internal/metrics"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
@@ -90,6 +91,7 @@ func newControlPlaneTestServerWithBodyLimit(
 		Router:         router,
 		GeoIP:          geoSvc,
 		MatcherRuntime: proxy.NewAccountMatcherRuntime(nil),
+		Projector:      observability.NewProjector([]byte("contract-test-projector-key-a-0000")),
 		RuntimeCfg:     runtimeCfg,
 		EnvCfg: &config.EnvConfig{
 			DefaultPlatformStickyTTL:                        30 * time.Minute,
@@ -297,7 +299,7 @@ func seedObservabilityData(
 			ClientIP:             "127.0.0.1",
 			PlatformID:           platformID,
 			PlatformName:         "Platform One",
-			Account:              "acct-1",
+			Account:              "acct-1-Bearer-secret",
 			TargetHost:           "example.com",
 			TargetURL:            "https://example.com/api",
 			NodeHash:             "node-1",
@@ -441,22 +443,31 @@ func TestAPIContract_GetLease_AccountPathEncoding(t *testing.T) {
 		},
 	})
 
-	// Encode "%" as %25 in the path so one decode pass yields the literal account "team%2Fa".
-	rec := doJSONRequest(
-		t,
-		srv,
-		http.MethodGet,
-		"/api/v1/platforms/"+platformID+"/leases/team%252Fa",
-		nil,
-		true,
-	)
+	listRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases?account="+url.QueryEscape(account), nil, true)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status: got %d, want %d", listRec.Code, http.StatusOK)
+	}
+	listBody := decodeJSONMap(t, listRec)
+	items, ok := listBody["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("lease list did not return one item")
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("lease item type: got %T", items[0])
+	}
+	leaseID, ok := item["lease_id"].(string)
+	if !ok || leaseID == "" {
+		t.Fatal("lease list did not return an opaque lease ID")
+	}
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases/"+url.PathEscape(leaseID), nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
 	body := decodeJSONMap(t, rec)
-	if body["account"] != account {
-		t.Fatalf("account: got %v, want %q", body["account"], account)
+	if body["account"] == account || body["account_redacted"] != true {
+		t.Fatalf("account projection was not redacted: %#v", body["account"])
 	}
 }
 
@@ -498,14 +509,24 @@ func TestAPIContract_GetLease_IncludesNodeTag(t *testing.T) {
 		},
 	})
 
-	rec := doJSONRequest(
-		t,
-		srv,
-		http.MethodGet,
-		"/api/v1/platforms/"+platformID+"/leases/alice",
-		nil,
-		true,
-	)
+	listRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases?account=alice", nil, true)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status: got %d, want %d", listRec.Code, http.StatusOK)
+	}
+	listBody := decodeJSONMap(t, listRec)
+	items, ok := listBody["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("lease list did not return one item")
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("lease item type: got %T", items[0])
+	}
+	leaseID, ok := item["lease_id"].(string)
+	if !ok || leaseID == "" {
+		t.Fatal("lease list did not return an opaque lease ID")
+	}
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases/"+url.PathEscape(leaseID), nil, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -560,6 +581,15 @@ func TestAPIContract_ListLeases_AccountFuzzySearch(t *testing.T) {
 	if len(exactItems) != 0 {
 		t.Fatalf("exact leases items len: got %d, want 0, body=%s", len(exactItems), exactRec.Body.String())
 	}
+	rawRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases?account=alpha-user-01", nil, true)
+	if rawRec.Code != http.StatusOK {
+		t.Fatalf("raw account filter status: got %d, want %d, body=%s", rawRec.Code, http.StatusOK, rawRec.Body.String())
+	}
+	rawBody := decodeJSONMap(t, rawRec)
+	rawItems, ok := rawBody["items"].([]any)
+	if !ok || len(rawItems) != 1 {
+		t.Fatalf("raw account filter items: got %T len=%d, want 1", rawBody["items"], len(rawItems))
+	}
 
 	fuzzyRec := doJSONRequest(
 		t,
@@ -580,22 +610,40 @@ func TestAPIContract_ListLeases_AccountFuzzySearch(t *testing.T) {
 	if len(fuzzyItems) != 2 {
 		t.Fatalf("fuzzy leases items len: got %d, want 2, body=%s", len(fuzzyItems), fuzzyRec.Body.String())
 	}
-	foundAlpha := false
-	foundBeta := false
+	var projectedAccounts int
 	for _, item := range fuzzyItems {
 		row, ok := item.(map[string]any)
 		if !ok {
 			t.Fatalf("fuzzy lease item type: got %T", item)
 		}
-		switch row["account"] {
-		case "alpha-user-01":
-			foundAlpha = true
-		case "BETA-USER-02":
-			foundBeta = true
+		if row["account_redacted"] != true {
+			t.Fatal("fuzzy lease exposed an unmarked account")
 		}
+		account, ok := row["account"].(string)
+		if !ok || !strings.HasPrefix(account, "redacted-account-") || account == "" {
+			t.Fatalf("fuzzy lease account was not safely projected: %#v", row["account"])
+		}
+		projectedAccounts++
 	}
-	if !foundAlpha || !foundBeta {
-		t.Fatalf("fuzzy leases accounts missing expected items: foundAlpha=%v foundBeta=%v body=%s", foundAlpha, foundBeta, fuzzyRec.Body.String())
+	if projectedAccounts != len(fuzzyItems) {
+		t.Fatalf("fuzzy leases projected account count: got %d, want %d", projectedAccounts, len(fuzzyItems))
+	}
+	firstProjected, ok := fuzzyItems[0].(map[string]any)
+	if !ok {
+		t.Fatal("fuzzy lease first item type changed")
+	}
+	projected, ok := firstProjected["account"].(string)
+	if !ok || projected == "" {
+		t.Fatal("fuzzy lease did not return an opaque account display")
+	}
+	displayRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases?account="+url.QueryEscape(projected), nil, true)
+	if displayRec.Code != http.StatusOK {
+		t.Fatalf("opaque account filter status: got %d, want %d, body=%s", displayRec.Code, http.StatusOK, displayRec.Body.String())
+	}
+	displayBody := decodeJSONMap(t, displayRec)
+	displayItems, ok := displayBody["items"].([]any)
+	if !ok || len(displayItems) != 1 {
+		t.Fatalf("opaque account filter items: got %T len=%d, want 1", displayBody["items"], len(displayItems))
 	}
 }
 
@@ -1726,6 +1774,15 @@ func TestAPIContract_RequestLogEndpoints(t *testing.T) {
 	if firstItem["first_byte_duration_ms"] != float64(5) {
 		t.Fatalf("first_byte_duration_ms: got %v, want 5", firstItem["first_byte_duration_ms"])
 	}
+	if firstItem["account_redacted"] != true {
+		t.Fatal("request log account was not marked redacted")
+	}
+	if account, ok := firstItem["account"].(string); !ok || account == "acct-1" || account == "" {
+		t.Fatalf("request log account was not safely projected: %#v", firstItem["account"])
+	}
+	if strings.Contains(rec.Body.String(), "Bearer-secret") || strings.Contains(rec.Body.String(), "acct-1-Bearer-secret") {
+		t.Fatal("request log list exposed the raw account")
+	}
 
 	rec = doJSONRequest(
 		t,
@@ -1847,6 +1904,12 @@ func TestAPIContract_RequestLogEndpoints(t *testing.T) {
 	}
 	if row["first_byte_duration_ms"] != float64(12) {
 		t.Fatalf("detail first_byte_duration_ms: got %v, want 12", row["first_byte_duration_ms"])
+	}
+	if row["account_redacted"] != true {
+		t.Fatal("request log detail account was not marked redacted")
+	}
+	if strings.Contains(rec.Body.String(), "Bearer-secret") || strings.Contains(rec.Body.String(), "acct-1-Bearer-secret") {
+		t.Fatal("request log detail exposed the raw account")
 	}
 	if row["payload_present"] != true {
 		t.Fatalf("payload_present: got %v, want true", row["payload_present"])

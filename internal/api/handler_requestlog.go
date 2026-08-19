@@ -7,13 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/requestlog"
 )
 
 // HandleListRequestLogs handles GET /api/v1/request-logs.
 // Query params: from, to (RFC3339Nano), limit, cursor,
 // platform_id, platform_name, account, target_host, egress_ip, proxy_type, net_ok, http_status, fuzzy.
-func HandleListRequestLogs(repo *requestlog.Repo) http.Handler {
+func HandleListRequestLogs(repo *requestlog.Repo, projector *observability.Projector) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("offset") != "" {
 			writeInvalidArgument(w, "offset: not supported for request-logs; use cursor")
@@ -96,7 +97,7 @@ func HandleListRequestLogs(repo *requestlog.Repo) http.Handler {
 
 		items := make([]logListItem, 0, len(rows))
 		for _, row := range rows {
-			items = append(items, toLogListItem(row))
+			items = append(items, toLogListItem(projector, row))
 		}
 
 		resp := requestLogPageResponse{
@@ -171,7 +172,7 @@ type requestLogPageResponse struct {
 }
 
 // HandleGetRequestLog handles GET /api/v1/request-logs/{log_id}.
-func HandleGetRequestLog(repo *requestlog.Repo) http.Handler {
+func HandleGetRequestLog(repo *requestlog.Repo, projector *observability.Projector) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logID := r.PathValue("log_id")
 		if logID == "" {
@@ -189,7 +190,7 @@ func HandleGetRequestLog(repo *requestlog.Repo) http.Handler {
 			return
 		}
 
-		WriteJSON(w, http.StatusOK, toLogListItem(*row))
+		WriteJSON(w, http.StatusOK, toLogListItem(projector, *row))
 	})
 }
 
@@ -286,6 +287,7 @@ type logListItem struct {
 	PlatformID           string `json:"platform_id"`
 	PlatformName         string `json:"platform_name"`
 	Account              string `json:"account"`
+	AccountRedacted      bool   `json:"account_redacted"`
 	TargetHost           string `json:"target_host"`
 	TargetURL            string `json:"target_url"`
 	NodeHash             string `json:"node_hash"`
@@ -314,7 +316,7 @@ type logListItem struct {
 	RespBodyTruncated    bool   `json:"resp_body_truncated"`
 }
 
-func toLogListItem(s requestlog.LogSummary) logListItem {
+func toLogListItem(projector *observability.Projector, s requestlog.LogSummary) logListItem {
 	return logListItem{
 		ID:                   s.ID,
 		Ts:                   time.Unix(0, s.TsNs).UTC().Format(time.RFC3339Nano),
@@ -322,7 +324,8 @@ func toLogListItem(s requestlog.LogSummary) logListItem {
 		ClientIP:             s.ClientIP,
 		PlatformID:           s.PlatformID,
 		PlatformName:         s.PlatformName,
-		Account:              s.Account,
+		Account:              projector.RedactAccount(s.PlatformID, s.Account),
+		AccountRedacted:      s.Account != "",
 		TargetHost:           s.TargetHost,
 		TargetURL:            s.TargetURL,
 		NodeHash:             s.NodeHash,

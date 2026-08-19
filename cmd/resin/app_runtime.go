@@ -21,6 +21,7 @@ import (
 	"github.com/Resinat/Resin/internal/metrics"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/routing"
@@ -511,6 +512,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		ProbeMgr:       a.topoRuntime.probeMgr,
 		GeoIP:          a.geoSvc,
 		MatcherRuntime: a.accountMatcher,
+		Projector:      observability.NewRandomProjector(),
 	}
 
 	apiSrv := api.NewServerWithAddressAndHealth(

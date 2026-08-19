@@ -8,6 +8,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/state"
 )
@@ -18,13 +19,16 @@ import (
 
 // LeaseResponse is the API response for a lease.
 type LeaseResponse struct {
-	PlatformID   string `json:"platform_id"`
-	Account      string `json:"account"`
-	NodeHash     string `json:"node_hash"`
-	NodeTag      string `json:"node_tag"`
-	EgressIP     string `json:"egress_ip"`
-	Expiry       string `json:"expiry"`
-	LastAccessed string `json:"last_accessed"`
+	PlatformID      string `json:"platform_id"`
+	Account         string `json:"account"`
+	AccountRedacted bool   `json:"account_redacted"`
+	LeaseID         string `json:"lease_id"`
+	NodeHash        string `json:"node_hash"`
+	NodeTag         string `json:"node_tag"`
+	EgressIP        string `json:"egress_ip"`
+	Expiry          string `json:"expiry"`
+	LastAccessed    string `json:"last_accessed"`
+	accountKey      string
 }
 
 // withLeaseMutationContext keeps the state-write admission open through a
@@ -51,16 +55,43 @@ func (s *ControlPlaneService) withLeaseMutationContext(ctx context.Context, fn f
 	return nil
 }
 
-func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
+func leaseToResponse(projector *observability.Projector, lease model.Lease, nodeTag string) LeaseResponse {
 	return LeaseResponse{
-		PlatformID:   lease.PlatformID,
-		Account:      lease.Account,
-		NodeHash:     lease.NodeHash,
-		NodeTag:      nodeTag,
-		EgressIP:     lease.EgressIP,
-		Expiry:       time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
-		LastAccessed: time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
+		PlatformID:      lease.PlatformID,
+		Account:         projector.RedactAccount(lease.PlatformID, lease.Account),
+		AccountRedacted: lease.Account != "",
+		LeaseID:         projector.LeaseID(lease.PlatformID, lease.Account),
+		NodeHash:        lease.NodeHash,
+		NodeTag:         nodeTag,
+		EgressIP:        lease.EgressIP,
+		Expiry:          time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
+		LastAccessed:    time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
+		accountKey:      lease.Account,
 	}
+}
+
+var fallbackProjector = observability.NewRandomProjector()
+
+func (s *ControlPlaneService) projector() *observability.Projector {
+	if s != nil && s.Projector != nil {
+		return s.Projector
+	}
+	return fallbackProjector
+}
+
+// MatchesAccountFilter keeps the original account inside the service boundary
+// for server-side filtering while the response itself only contains its safe
+// display projection.
+func (l LeaseResponse) MatchesAccountFilter(query string, fuzzy bool) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return true
+	}
+	if fuzzy {
+		needle := strings.ToLower(query)
+		return strings.Contains(strings.ToLower(l.accountKey), needle) || strings.Contains(strings.ToLower(l.Account), needle)
+	}
+	return l.accountKey == query || l.Account == query
 }
 
 func (s *ControlPlaneService) resolveLeaseNodeTag(hash node.Hash) string {
@@ -97,6 +128,7 @@ func (s *ControlPlaneService) ListLeasesContext(ctx context.Context, platformID 
 	}
 	var result []LeaseResponse
 	var resultErr error
+	projector := s.projector()
 	if err := s.withRuntimeReadContext(ctx, func() {
 		leases, exists, err := s.Router.ListLeasesForPlatformContext(ctx, platformID)
 		if err != nil {
@@ -109,7 +141,7 @@ func (s *ControlPlaneService) ListLeasesContext(ctx context.Context, platformID 
 		}
 		result = make([]LeaseResponse, 0, len(leases))
 		for _, lease := range leases {
-			result = append(result, leaseToResponse(lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
+			result = append(result, leaseToResponse(projector, lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
 		}
 	}); err != nil {
 		return nil, err
@@ -136,6 +168,7 @@ func (s *ControlPlaneService) GetLeaseContext(ctx context.Context, platformID, a
 	}
 	var result *LeaseResponse
 	var resultErr error
+	projector := s.projector()
 	if err := s.withRuntimeReadContext(ctx, func() {
 		ml, exists, err := s.Router.ReadLeaseForPlatformContext(ctx, model.LeaseKey{PlatformID: platformID, Account: account})
 		if err != nil {
@@ -150,7 +183,7 @@ func (s *ControlPlaneService) GetLeaseContext(ctx context.Context, platformID, a
 			resultErr = notFound("lease not found")
 			return
 		}
-		resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
+		resp := leaseToResponse(projector, *ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
 		result = &resp
 	}); err != nil {
 		return nil, err
@@ -159,6 +192,53 @@ func (s *ControlPlaneService) GetLeaseContext(ctx context.Context, platformID, a
 		return nil, resultErr
 	}
 	return result, nil
+}
+
+// resolveLeaseIdentifierContext resolves only opaque lease IDs. Raw account
+// paths are rejected at the administrative API boundary. Opaque IDs are
+// process-generation bound to the random observability key; after restart or
+// key rotation they fail closed as not found.
+func (s *ControlPlaneService) resolveLeaseIdentifierContext(ctx context.Context, platformID, identifier string) (string, error) {
+	if !observability.IsLeaseID(identifier) {
+		return "", invalidArg("lease_id: invalid")
+	}
+	var account string
+	var resultErr error
+	projector := s.projector()
+	if err := s.withRuntimeReadContext(ctx, func() {
+		leases, exists, err := s.Router.ListLeasesForPlatformContext(ctx, platformID)
+		if err != nil {
+			resultErr = err
+			return
+		}
+		if !exists {
+			resultErr = notFound("platform not found")
+			return
+		}
+		for _, lease := range leases {
+			if projector.MatchesLeaseID(platformID, lease.Account, identifier) {
+				account = lease.Account
+				return
+			}
+		}
+	}); err != nil {
+		return "", err
+	}
+	if resultErr != nil {
+		return "", resultErr
+	}
+	if account == "" {
+		return "", notFound("lease not found")
+	}
+	return account, nil
+}
+
+func (s *ControlPlaneService) GetLeaseByIdentifierContext(ctx context.Context, platformID, identifier string) (*LeaseResponse, error) {
+	account, err := s.resolveLeaseIdentifierContext(ctx, platformID, identifier)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetLeaseContext(ctx, platformID, account)
 }
 
 // InheritLeaseByPlatformName copies a valid parent lease onto newAccount.
@@ -258,6 +338,14 @@ func (s *ControlPlaneService) DeleteLeaseContext(ctx context.Context, platformID
 		}
 		return nil
 	})
+}
+
+func (s *ControlPlaneService) DeleteLeaseByIdentifierContext(ctx context.Context, platformID, identifier string) error {
+	account, err := s.resolveLeaseIdentifierContext(ctx, platformID, identifier)
+	if err != nil {
+		return err
+	}
+	return s.DeleteLeaseContext(ctx, platformID, account)
 }
 
 // DeleteAllLeases removes all leases for a platform.

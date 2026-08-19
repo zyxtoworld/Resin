@@ -138,6 +138,7 @@ Note: Once enabled, requests without authentication information are rejected ins
   "响应": "Response",
   "平台": "Platform",
   "账号": "Account",
+  "账号（已脱敏）": "Account (redacted)",
   "代理": "Proxy",
   "代理类型": "Proxy Type",
   "网络": "Network",

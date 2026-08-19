@@ -92,6 +92,7 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 
 	var result *PlatformRouteStateResponse
 	var resultErr error
+	projector := s.projector()
 	if err := s.withRuntimeReadContext(ctx, func() {
 		observedAt := time.Now().UTC()
 		nodes, err := s.listNodes(NodeFilters{PlatformID: &platformID})
@@ -157,7 +158,7 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 				ExpiryNs:       item.Lease.ExpiryNs,
 				LastAccessedNs: item.Lease.LastAccessedNs,
 			}
-			leaseResponses.Items = append(leaseResponses.Items, leaseToResponse(lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
+			leaseResponses.Items = append(leaseResponses.Items, leaseToResponse(projector, lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash)))
 		}
 
 		cooldownResponses := make([]PlatformCooldownSnapshot, 0, len(cooldowns))

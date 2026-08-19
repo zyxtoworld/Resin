@@ -260,7 +260,7 @@ export function PlatformDetailPage() {
       if (!platform) {
         throw new Error("平台不存在或已被删除");
       }
-      await deletePlatformLease(platform.id, lease.account);
+      await deletePlatformLease(platform.id, lease.lease_id);
       return lease;
     },
     onSuccess: async (lease) => {
@@ -359,7 +359,7 @@ export function PlatformDetailPage() {
   const leaseColumns: ColumnDef<PlatformLease>[] = [
     {
       accessorKey: "account",
-      header: t("账号"),
+      header: t("账号（已脱敏）"),
       cell: ({ row }) => (
         <span className="lease-account-cell" title={row.original.account}>
           {row.original.account || "-"}
@@ -399,7 +399,7 @@ export function PlatformDetailPage() {
       header: t("操作"),
       cell: ({ row }) => {
         const lease = row.original;
-        const releasing = releaseLeaseMutation.isPending && releaseLeaseMutation.variables?.account === lease.account;
+        const releasing = releaseLeaseMutation.isPending && releaseLeaseMutation.variables?.lease_id === lease.lease_id;
         return (
           <div className="lease-row-actions" onClick={(event) => event.stopPropagation()}>
             <Button
@@ -822,7 +822,7 @@ export function PlatformDetailPage() {
                   {routeStateQuery.isLoading || isLeasePageTransitioning ? <p className="muted">{t("正在加载租约数据...")}</p> : null}
                   {routeStateQuery.isError ? <div className="callout callout-error"><AlertTriangle size={14} /><span>{formatApiErrorMessage(routeStateQuery.error, t)}</span></div> : null}
                   {!routeStateQuery.isLoading && !routeStateQuery.isError && !isLeasePageTransitioning && !visibleLeases.length ? <div className="empty-box"><Sparkles size={16} /><p>{debouncedLeaseSearch ? t("没有匹配的租约") : t("当前平台暂无租约")}</p></div> : null}
-                  {visibleLeases.length ? <DataTable data={visibleLeases} columns={leaseColumns} getRowId={(lease) => lease.account} className="data-table-leases" wrapClassName="platform-lease-table-wrap" /> : null}
+                  {visibleLeases.length ? <DataTable data={visibleLeases} columns={leaseColumns} getRowId={(lease) => lease.lease_id} className="data-table-leases" wrapClassName="platform-lease-table-wrap" /> : null}
                   <CursorPagination
                     pageIndex={leasePage}
                     hasMore={Boolean(leasesPage.has_more && leasesPage.next_cursor)}

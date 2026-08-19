@@ -14,6 +14,7 @@ import (
 	"github.com/Resinat/Resin/internal/geoip"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/observability"
 	"github.com/Resinat/Resin/internal/probe"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/routing"
@@ -242,6 +243,7 @@ type ControlPlaneService struct {
 	GeoIP           *geoip.Service
 	ProbeMgr        *probe.ProbeManager
 	MatcherRuntime  *proxy.AccountMatcherRuntime
+	Projector       *observability.Projector
 	RuntimeCfg      *atomic.Pointer[config.RuntimeConfig]
 	EnvCfg          *config.EnvConfig
 	EndpointRuntime EndpointRuntime
