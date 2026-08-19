@@ -1320,6 +1320,668 @@ func TestPool_ReplacePlatform_RebuildsViewBeforePublish(t *testing.T) {
 	}
 }
 
+func TestPool_ReplacePlatformDoesNotPublishStaleSameHashEntry(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-replace-entry-generation", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entryA, ok := pool.GetEntry(h)
+	if !ok || entryA == nil {
+		t.Fatal("initial node entry not found")
+	}
+	entryA.CircuitOpenSince.Store(0)
+	outboundA := testutil.NewNoopOutbound()
+	entryA.Outbound.Store(&outboundA)
+	entryA.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryA.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	oldPlat := platform.NewPlatform("p-replace-entry-generation", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	pool.NotifyNodeDirty(h)
+	if !oldPlat.View().Contains(h) {
+		t.Fatal("initial platform view should contain entry A")
+	}
+
+	nextPlat := platform.NewPlatform(
+		oldPlat.ID,
+		"New",
+		nil,
+		[]string{"us"},
+	)
+	rebuildEntered := make(chan struct{})
+	allowRebuild := make(chan struct{})
+	var releaseRebuildOnce sync.Once
+	releaseRebuild := func() { releaseRebuildOnce.Do(func() { close(allowRebuild) }) }
+	defer releaseRebuild()
+	var rebuildOnce sync.Once
+	pool.geoLookup = func(netip.Addr) string {
+		rebuildOnce.Do(func() {
+			close(rebuildEntered)
+			<-allowRebuild
+		})
+		return "us"
+	}
+
+	removed := make(chan struct{})
+	var removedOnce sync.Once
+	pool.afterNodeDeleteComputeHook = func(hash node.Hash, _ *node.NodeEntry) {
+		if hash == h {
+			removedOnce.Do(func() { close(removed) })
+		}
+	}
+	mutationNotifications := atomic.Int32{}
+	mutationsReady := make(chan struct{})
+	var mutationsReadyOnce sync.Once
+	pool.beforePlatformNotifyLockHook = func() {
+		if mutationNotifications.Add(1) == 2 {
+			mutationsReadyOnce.Do(func() { close(mutationsReady) })
+		}
+	}
+
+	nextNotifyEntered := make(chan struct{})
+	allowNextNotify := make(chan struct{})
+	var releaseNextNotifyOnce sync.Once
+	releaseNextNotify := func() { releaseNextNotifyOnce.Do(func() { close(allowNextNotify) }) }
+	defer releaseNextNotify()
+	var nextNotifyOnce sync.Once
+	pool.beforePlatformNotifyHook = func(plat *platform.Platform) {
+		if plat != nextPlat {
+			return
+		}
+		nextNotifyOnce.Do(func() {
+			close(nextNotifyEntered)
+			<-allowNextNotify
+		})
+	}
+	defer func() {
+		pool.geoLookup = func(netip.Addr) string { return "us" }
+		pool.afterNodeDeleteComputeHook = nil
+		pool.beforePlatformNotifyLockHook = nil
+		pool.beforePlatformNotifyHook = nil
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	select {
+	case <-rebuildEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement rebuild did not evaluate the captured entry")
+	}
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(h, sub.ID)
+		close(removeDone)
+	}()
+	select {
+	case <-removed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node removal did not publish its delete")
+	}
+
+	addDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(h, raw, sub.ID)
+		close(addDone)
+	}()
+	select {
+	case <-mutationsReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node replacement did not reach both notification admissions")
+	}
+	entryB, ok := pool.GetEntry(h)
+	if !ok || entryB == nil || entryB == entryA {
+		t.Fatalf("same-hash replacement did not publish a new entry: got=%p old=%p ok=%v", entryB, entryA, ok)
+	}
+	entryB.CircuitOpenSince.Store(0)
+	outboundB := testutil.NewNoopOutbound()
+	entryB.Outbound.Store(&outboundB)
+	entryB.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryB.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	releaseRebuild()
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not publish after rebuild release")
+	}
+	select {
+	case <-nextNotifyEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement notifications did not reach the new platform")
+	}
+
+	foundB := false
+	for _, published := range nextPlat.SnapshotViewEntries() {
+		if published.Hash != h {
+			continue
+		}
+		if published.Entry == entryA {
+			t.Fatalf("new platform published stale same-hash entry A after entry B replaced it")
+		}
+		if published.Entry != entryB {
+			t.Fatalf("new platform published unexpected same-hash entry %p, want current entry B %p", published.Entry, entryB)
+		}
+		foundB = true
+	}
+	if !foundB {
+		t.Fatal("new platform did not publish current same-hash entry B")
+	}
+
+	releaseNextNotify()
+	select {
+	case <-removeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node removal notification did not finish")
+	}
+	select {
+	case <-addDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("node add notification did not finish")
+	}
+}
+
+func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-replace-entry-stale", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entryA, ok := pool.GetEntry(h)
+	if !ok || entryA == nil {
+		t.Fatal("initial node entry not found")
+	}
+	entryA.CircuitOpenSince.Store(0)
+	outboundA := testutil.NewNoopOutbound()
+	entryA.Outbound.Store(&outboundA)
+	entryA.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryA.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
+
+	oldPlat := platform.NewPlatform("p-replace-entry-stale", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	pool.NotifyNodeDirty(h)
+	if !oldPlat.View().Contains(h) {
+		t.Fatal("initial platform view should contain entry A")
+	}
+
+	nextPlat := platform.NewPlatform(oldPlat.ID, "New", nil, []string{"us"})
+	firstRebuildEntered := make(chan struct{})
+	allowFirstRebuild := make(chan struct{})
+	secondRebuildEntered := make(chan struct{})
+	allowSecondRebuild := make(chan struct{})
+	var geoCalls atomic.Int32
+	pool.geoLookup = func(netip.Addr) string {
+		switch geoCalls.Add(1) {
+		case 1:
+			close(firstRebuildEntered)
+			<-allowFirstRebuild
+		case 2:
+			close(secondRebuildEntered)
+			<-allowSecondRebuild
+		}
+		return "us"
+	}
+	defer func() { pool.geoLookup = func(netip.Addr) string { return "us" } }()
+	deleted := make(chan struct{}, 2)
+	pool.afterNodeDeleteComputeHook = func(hash node.Hash, _ *node.NodeEntry) {
+		if hash == h {
+			deleted <- struct{}{}
+		}
+	}
+	added := make(chan struct{}, 2)
+	pool.onNodeAdded = func(hash node.Hash) {
+		if hash == h {
+			added <- struct{}{}
+		}
+	}
+	defer func() {
+		pool.afterNodeDeleteComputeHook = nil
+		pool.onNodeAdded = nil
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	select {
+	case <-firstRebuildEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first replacement rebuild did not enter")
+	}
+
+	firstRemoveDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(h, sub.ID)
+		close(firstRemoveDone)
+	}()
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first node deletion did not reach its linearization hook")
+	}
+	firstAddDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(h, raw, sub.ID)
+		close(firstAddDone)
+	}()
+	select {
+	case <-added:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first node add did not publish entry B")
+	}
+	entryB, ok := pool.GetEntry(h)
+	if !ok || entryB == nil || entryB == entryA {
+		t.Fatal("first same-hash replacement did not publish entry B")
+	}
+	entryB.CircuitOpenSince.Store(0)
+	outboundB := testutil.NewNoopOutbound()
+	entryB.Outbound.Store(&outboundB)
+	entryB.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryB.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
+	close(allowFirstRebuild)
+
+	select {
+	case <-secondRebuildEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second replacement rebuild did not enter")
+	}
+	secondRemoveDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(h, sub.ID)
+		close(secondRemoveDone)
+	}()
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second node deletion did not reach its linearization hook")
+	}
+	secondAddDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(h, raw, sub.ID)
+		close(secondAddDone)
+	}()
+	select {
+	case <-added:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second node add did not publish entry C")
+	}
+	entryC, ok := pool.GetEntry(h)
+	if !ok || entryC == nil || entryC == entryB {
+		t.Fatal("second same-hash replacement did not publish entry C")
+	}
+	entryC.CircuitOpenSince.Store(0)
+	outboundC := testutil.NewNoopOutbound()
+	entryC.Outbound.Store(&outboundC)
+	entryC.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryC.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
+	close(allowSecondRebuild)
+
+	select {
+	case err := <-replaceDone:
+		if !errors.Is(err, ErrPlatformRebuildStale) {
+			t.Fatalf("ReplacePlatform error = %v, want ErrPlatformRebuildStale", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not fail closed after repeated node changes")
+	}
+	for _, published := range oldPlat.SnapshotViewEntries() {
+		if published.Hash == h && published.Entry != entryA {
+			t.Fatalf("failed replacement changed old platform view to unverified entry %p", published.Entry)
+		}
+	}
+	if oldPlat.View().Contains(h) == false {
+		t.Fatal("failed replacement must preserve the last verified old view")
+	}
+	select {
+	case <-firstRemoveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first deletion notification did not finish")
+	}
+	select {
+	case <-secondRemoveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second deletion notification did not finish")
+	}
+	select {
+	case <-firstAddDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first node add notification did not finish")
+	}
+	select {
+	case <-secondAddDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second node add notification did not finish")
+	}
+
+	if err := pool.RebuildPlatform(oldPlat); err != nil {
+		t.Fatalf("rebuild after stabilization: %v", err)
+	}
+	entries := oldPlat.SnapshotViewEntries()
+	if len(entries) != 1 || entries[0].Hash != h || entries[0].Entry != entryC {
+		t.Fatalf("recovery published %+v, want current entry C", entries)
+	}
+}
+
+func TestPool_StructuralChangeTailNotifyDoesNotCreateSecondGeneration(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-structural-generation-once", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entryA, ok := pool.GetEntry(h)
+	if !ok || entryA == nil {
+		t.Fatal("initial node entry not found")
+	}
+	entryA.CircuitOpenSince.Store(0)
+	outboundA := testutil.NewNoopOutbound()
+	entryA.Outbound.Store(&outboundA)
+	entryA.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryA.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	oldPlat := platform.NewPlatform("p-structural-generation-once", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	nextPlat := platform.NewPlatform(oldPlat.ID, "New", nil, []string{"us"})
+
+	firstEvaluation := make(chan struct{})
+	allowFirstEvaluation := make(chan struct{})
+	secondEvaluation := make(chan struct{})
+	allowSecondEvaluation := make(chan struct{})
+	var geoCalls atomic.Int32
+	pool.geoLookup = func(netip.Addr) string {
+		switch geoCalls.Add(1) {
+		case 1:
+			close(firstEvaluation)
+			<-allowFirstEvaluation
+		case 2:
+			close(secondEvaluation)
+			<-allowSecondEvaluation
+		}
+		return "us"
+	}
+
+	removeNotifyEntered := make(chan struct{})
+	addNotifyEntered := make(chan struct{})
+	allowRemoveNotify := make(chan struct{})
+	allowAddNotify := make(chan struct{})
+	var notifyCalls atomic.Int32
+	pool.beforePlatformNotifyLockHook = func() {
+		switch notifyCalls.Add(1) {
+		case 1:
+			close(removeNotifyEntered)
+			<-allowRemoveNotify
+		case 2:
+			close(addNotifyEntered)
+			<-allowAddNotify
+		}
+	}
+
+	addedRuntimeEntered := make(chan struct{})
+	allowAddedRuntime := make(chan struct{})
+	pool.SetOnNodeAddedRuntime(func(hash node.Hash, _ *node.NodeEntry) {
+		if hash != h {
+			return
+		}
+		close(addedRuntimeEntered)
+		<-allowAddedRuntime
+	})
+	defer func() {
+		pool.geoLookup = func(netip.Addr) string { return "us" }
+		pool.beforePlatformNotifyLockHook = nil
+		pool.SetOnNodeAddedRuntime(nil)
+		select {
+		case <-allowFirstEvaluation:
+		default:
+			close(allowFirstEvaluation)
+		}
+		select {
+		case <-allowSecondEvaluation:
+		default:
+			close(allowSecondEvaluation)
+		}
+		select {
+		case <-allowRemoveNotify:
+		default:
+			close(allowRemoveNotify)
+		}
+		select {
+		case <-allowAddNotify:
+		default:
+			close(allowAddNotify)
+		}
+		select {
+		case <-allowAddedRuntime:
+		default:
+			close(allowAddedRuntime)
+		}
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	select {
+	case <-firstEvaluation:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not reach first evaluation")
+	}
+
+	removeDone := make(chan struct{})
+	go func() {
+		pool.RemoveNodeFromSub(h, sub.ID)
+		close(removeDone)
+	}()
+	select {
+	case <-removeNotifyEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remove tail notification did not reach its barrier")
+	}
+
+	addDone := make(chan struct{})
+	go func() {
+		pool.AddNodeFromSub(h, raw, sub.ID)
+		close(addDone)
+	}()
+	select {
+	case <-addedRuntimeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement add did not reach runtime preparation")
+	}
+	entryB, ok := pool.GetEntry(h)
+	if !ok || entryB == nil || entryB == entryA {
+		t.Fatalf("same-hash replacement did not publish entry B: got=%p old=%p ok=%v", entryB, entryA, ok)
+	}
+	entryB.CircuitOpenSince.Store(0)
+	outboundB := testutil.NewNoopOutbound()
+	entryB.Outbound.Store(&outboundB)
+	entryB.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entryB.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma:        100 * time.Millisecond,
+		LastUpdated: time.Now(),
+	})
+
+	close(allowFirstEvaluation)
+	select {
+	case <-secondEvaluation:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry rebuild did not capture entry B")
+	}
+
+	// The add has already advanced the structural generation. Its runtime
+	// callback is deliberately held between that linearization point and the
+	// tail notification, so the retry can capture B before the tail runs.
+	close(allowAddedRuntime)
+	select {
+	case <-addNotifyEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("add tail notification did not reach its barrier")
+	}
+	close(allowSecondEvaluation)
+
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform returned %v after one structural change", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not finish")
+	}
+
+	if !nextPlat.View().Contains(h) {
+		t.Fatal("replacement did not publish the current same-hash entry")
+	}
+	published := nextPlat.SnapshotViewEntries()
+	for _, candidate := range published {
+		if candidate.Hash == h && candidate.Entry != entryB {
+			t.Fatalf("replacement published stale entry %p, want current entry B %p", candidate.Entry, entryB)
+		}
+	}
+
+	close(allowRemoveNotify)
+	close(allowAddNotify)
+	select {
+	case <-removeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remove tail notification did not finish")
+	}
+	select {
+	case <-addDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("add tail notification did not finish")
+	}
+}
+
+func TestPool_ReplacePlatformDoesNotPublishStaleHealthDecision(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s-replace-health-generation", "Provider", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr)
+	raw := json.RawMessage(`{"type":"ss","server":"1.1.1.1"}`)
+	h := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"node"}})
+	pool.AddNodeFromSub(h, raw, sub.ID)
+	entry, ok := pool.GetEntry(h)
+	if !ok || entry == nil {
+		t.Fatal("node entry not found")
+	}
+	entry.CircuitOpenSince.Store(0)
+	outbound := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&outbound)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
+
+	oldPlat := platform.NewPlatform("p-replace-health-generation", "Old", nil, nil)
+	if err := pool.RegisterPlatform(oldPlat); err != nil {
+		t.Fatalf("RegisterPlatform old: %v", err)
+	}
+	pool.NotifyNodeDirty(h)
+	if !oldPlat.View().Contains(h) {
+		t.Fatal("initial platform view should contain the healthy entry")
+	}
+
+	nextPlat := platform.NewPlatform(oldPlat.ID, "New", nil, []string{"us"})
+	evaluationEntered := make(chan struct{})
+	allowEvaluation := make(chan struct{})
+	var geoOnce sync.Once
+	pool.geoLookup = func(netip.Addr) string {
+		geoOnce.Do(func() {
+			close(evaluationEntered)
+			<-allowEvaluation
+		})
+		return "us"
+	}
+	defer func() { pool.geoLookup = func(netip.Addr) string { return "us" } }()
+
+	notifyAttempted := make(chan struct{})
+	allowNotify := make(chan struct{})
+	var notifyOnce sync.Once
+	pool.beforePlatformNotifyLockHook = func() {
+		notifyOnce.Do(func() {
+			close(notifyAttempted)
+			<-allowNotify
+		})
+	}
+	defer func() {
+		pool.beforePlatformNotifyLockHook = nil
+		select {
+		case <-allowNotify:
+		default:
+			close(allowNotify)
+		}
+	}()
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
+	select {
+	case <-evaluationEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement rebuild did not evaluate the entry")
+	}
+
+	// The rebuild has already passed the entry health check and is blocked in
+	// GeoIP evaluation. The real outbound health path now makes the same entry
+	// non-routable and enters NotifyNodeDirty, but is held before notification
+	// admission so the replacement cannot rely on that later callback.
+	entry.Outbound.Store(nil)
+	notifyDone := make(chan struct{})
+	go func() {
+		pool.NotifyNodeDirty(h)
+		close(notifyDone)
+	}()
+	select {
+	case <-notifyAttempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health notification did not reach its admission boundary")
+	}
+	close(allowEvaluation)
+
+	select {
+	case err := <-replaceDone:
+		if err != nil {
+			t.Fatalf("ReplacePlatform: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not complete while health notification was held")
+	}
+	if nextPlat.View().Contains(h) {
+		t.Fatal("replacement published stale routable decision before NotifyNodeDirty completed")
+	}
+
+	close(allowNotify)
+	select {
+	case <-notifyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health notification did not finish after admission release")
+	}
+}
+
 func TestPool_ReplacePlatform_SerializesNodeNotificationWithPublish(t *testing.T) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s-replace-race", "Provider", "url", true, false)

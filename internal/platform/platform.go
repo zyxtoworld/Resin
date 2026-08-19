@@ -22,6 +22,11 @@ type GeoLookupFunc func(netip.Addr) string
 // PoolRangeFunc iterates all nodes in the global pool.
 type PoolRangeFunc func(fn func(node.Hash, *node.NodeEntry) bool)
 
+// RebuildPublishGuard owns the final publication of a rebuild candidate.
+// The guard may validate the candidate against the source pool and must call
+// publish while that validation remains linearized.
+type RebuildPublishGuard func([]RoutableViewEntry, func() error) error
+
 // GetEntryFunc retrieves a node entry from the global pool by hash.
 type GetEntryFunc func(node.Hash) (*node.NodeEntry, bool)
 
@@ -191,6 +196,28 @@ func (p *Platform) FullRebuildContext(
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
 ) error {
+	return p.fullRebuildContext(ctx, poolRange, subLookup, geoLookup, nil)
+}
+
+// FullRebuildContextWithPublishGuard builds one candidate and lets the pool
+// owner linearize its publication against concurrent source mutations.
+func (p *Platform) FullRebuildContextWithPublishGuard(
+	ctx context.Context,
+	poolRange PoolRangeFunc,
+	subLookup node.SubLookupFunc,
+	geoLookup GeoLookupFunc,
+	guard RebuildPublishGuard,
+) error {
+	return p.fullRebuildContext(ctx, poolRange, subLookup, geoLookup, guard)
+}
+
+func (p *Platform) fullRebuildContext(
+	ctx context.Context,
+	poolRange PoolRangeFunc,
+	subLookup node.SubLookupFunc,
+	geoLookup GeoLookupFunc,
+	guard RebuildPublishGuard,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -226,14 +253,24 @@ func (p *Platform) FullRebuildContext(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	p.viewMu.Lock()
-	defer p.viewMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
+	publish := func() error {
+		p.viewMu.Lock()
+		defer p.viewMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.viewEntries = nextEntries
+		p.view.Store(nextView)
+		return nil
 	}
-	p.viewEntries = nextEntries
-	p.view.Store(nextView)
-	return nil
+	if guard == nil {
+		return publish()
+	}
+	candidates := make([]RoutableViewEntry, 0, len(nextEntries))
+	for hash, entry := range nextEntries {
+		candidates = append(candidates, RoutableViewEntry{Hash: hash, Entry: entry})
+	}
+	return guard(candidates, publish)
 }
 
 // NotifyDirty re-evaluates a single node and adds/removes it from the view.

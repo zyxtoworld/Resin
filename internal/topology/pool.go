@@ -37,6 +37,10 @@ type GlobalNodePool struct {
 	// entry for the same hash can be created while the old callback is still
 	// closing/evicting resources, so cleanup can hit the replacement.
 	nodeLifecycleMu sync.Mutex
+	// nodeGeneration changes for every pool membership mutation. Rebuilds use
+	// it at their final publication point so a slow candidate cannot publish a
+	// view built from an older same-hash entry generation.
+	nodeGeneration atomic.Uint64
 
 	// Platform references for dirty-notify.
 	// platformBatchMu is the cancellation-aware admission owner for platform
@@ -191,6 +195,9 @@ var (
 	// ErrRuntimeGenerationBusy means a complete runtime generation is being
 	// published and a non-blocking data-plane read was rejected.
 	ErrRuntimeGenerationBusy = errors.New("runtime generation busy")
+	// ErrPlatformRebuildStale means a full view candidate changed while it was
+	// being built and was therefore rejected before publication.
+	ErrPlatformRebuildStale = errors.New("platform rebuild source generation changed")
 )
 
 // NewGlobalNodePool creates a new GlobalNodePool.
@@ -292,6 +299,7 @@ func (p *GlobalNodePool) addNodeFromSub(
 	} else if p.onSubNodeChanged != nil {
 		p.onSubNodeChanged(subID, hash, true)
 	}
+	p.nodeGeneration.Add(1)
 	p.nodeLifecycleMu.Unlock()
 	if isNew && runRuntime {
 		p.runNodeAddedRuntime(hash, runtimeEntry)
@@ -388,6 +396,9 @@ func (p *GlobalNodePool) removeNodeFromSub(
 	}
 	if wasDeleted && p.onNodeRemoved != nil {
 		p.onNodeRemoved(hash, deletedEntry)
+	}
+	if loaded {
+		p.nodeGeneration.Add(1)
 	}
 	if healthEventLocked {
 		entry.UnlockHealthEvent()
@@ -507,6 +518,7 @@ func (p *GlobalNodePool) TryWithRuntimeRead(fn func()) bool {
 // No dirty-marks, no platform notifications.
 func (p *GlobalNodePool) LoadNodeFromBootstrap(entry *node.NodeEntry) {
 	p.nodes.Store(entry.Hash, entry)
+	p.nodeGeneration.Add(1)
 }
 
 // WithPlatformMutationContext admits one exclusive platform publication
@@ -600,7 +612,9 @@ func (m *platformMutation) RegisterPlatform(plat *platform.Platform) error {
 		// index. The platform mutation owner prevents another map writer from
 		// overtaking this candidate, while readers continue to see the existing
 		// platform indexes during the slow scan.
-		p.RebuildPlatform(plat)
+		if err := p.RebuildPlatform(plat); err != nil {
+			return err
+		}
 
 		p.platMu.Lock()
 		defer p.platMu.Unlock()
@@ -691,7 +705,9 @@ func (m *platformMutation) ReplacePlatform(next *platform.Platform) error {
 		// Construct the complete replacement view while the old platform stays
 		// published. Route readers therefore continue using the old complete
 		// generation instead of waiting for slow GeoIP/health evaluation.
-		p.RebuildPlatform(next)
+		if err := p.RebuildPlatform(next); err != nil {
+			return err
+		}
 		if hook := p.afterPlatformRebuildHook; hook != nil {
 			hook()
 		}
@@ -1007,7 +1023,20 @@ func (p *GlobalNodePool) MakeHealthyAndEnabledEvaluator() func(entry *node.NodeE
 	}
 }
 
+// markViewSourceDirtyAndNotify invalidates rebuild candidates for an in-place
+// node-state change, then publishes the dirty notification under its normal
+// owner. Structural add/remove paths increment nodeGeneration at their own
+// lifecycle linearization point and must call notifyAllPlatformsDirty directly
+// so one logical mutation produces exactly one source-generation increment.
+func (p *GlobalNodePool) markViewSourceDirtyAndNotify(hash node.Hash) {
+	p.nodeGeneration.Add(1)
+	p.notifyAllPlatformsDirty(hash)
+}
+
 // notifyAllPlatformsDirty tells every registered platform to re-evaluate a node.
+// The caller owns source-generation invalidation: structural mutations already
+// increment at their linearization point, while in-place state changes use
+// markViewSourceDirtyAndNotify above.
 func (p *GlobalNodePool) notifyAllPlatformsDirty(hash node.Hash) {
 	// Platform replacement builds its candidate outside platMu so route readers
 	// stay available. Keep dirty notification in the platform publication owner
@@ -1101,16 +1130,37 @@ func (p *GlobalNodePool) RebuildAllPlatforms() {
 }
 
 // RebuildPlatform triggers a full rebuild on a specific platform.
-func (p *GlobalNodePool) RebuildPlatform(plat *platform.Platform) {
-	_ = p.rebuildPlatformContext(context.Background(), plat)
+func (p *GlobalNodePool) RebuildPlatform(plat *platform.Platform) error {
+	return p.rebuildPlatformContext(context.Background(), plat)
 }
 
 func (p *GlobalNodePool) rebuildPlatformContext(ctx context.Context, plat *platform.Platform) error {
-	subLookup := p.MakeSubLookup()
-	poolRange := func(fn func(node.Hash, *node.NodeEntry) bool) {
-		p.nodes.Range(fn)
+	for attempt := 0; attempt < 2; attempt++ {
+		generation := p.nodeGeneration.Load()
+		subLookup := p.MakeSubLookup()
+		poolRange := func(fn func(node.Hash, *node.NodeEntry) bool) {
+			p.nodes.Range(fn)
+		}
+		publishGuard := func(candidates []platform.RoutableViewEntry, publish func() error) error {
+			p.nodeLifecycleMu.Lock()
+			defer p.nodeLifecycleMu.Unlock()
+			if p.nodeGeneration.Load() != generation {
+				return ErrPlatformRebuildStale
+			}
+			for _, candidate := range candidates {
+				current, ok := p.nodes.Load(candidate.Hash)
+				if !ok || current != candidate.Entry {
+					return ErrPlatformRebuildStale
+				}
+			}
+			return publish()
+		}
+		err := plat.FullRebuildContextWithPublishGuard(ctx, poolRange, subLookup, p.geoLookup, publishGuard)
+		if !errors.Is(err, ErrPlatformRebuildStale) || attempt == 1 {
+			return err
+		}
 	}
-	return plat.FullRebuildContext(ctx, poolRange, subLookup, p.geoLookup)
+	return ErrPlatformRebuildStale
 }
 
 // RebuildPlatformIfCurrent rebuilds the platform only while its exact object
@@ -1217,7 +1267,7 @@ func (p *GlobalNodePool) SetOnNodeRemoved(fn func(hash node.Hash, entry *node.No
 // NotifyNodeDirty triggers platform re-evaluation for a single node.
 // Used by OutboundManager after outbound creation to update routable views.
 func (p *GlobalNodePool) NotifyNodeDirty(hash node.Hash) {
-	p.notifyAllPlatformsDirty(hash)
+	p.markViewSourceDirtyAndNotify(hash)
 }
 
 // RangeNodes iterates over all nodes in the pool.
@@ -1377,7 +1427,7 @@ func (p *GlobalNodePool) RecordResultForEntry(hash node.Hash, expected *node.Nod
 	}
 
 	if circuitStateChanged {
-		p.notifyAllPlatformsDirty(hash)
+		p.markViewSourceDirtyAndNotify(hash)
 	}
 	if dynamicChanged && p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)
@@ -1514,7 +1564,7 @@ func (p *GlobalNodePool) RecordLatencyForEntry(
 	// If the table transitioned from empty to non-empty, the node might
 	// now satisfy the HasLatency filter — notify platforms.
 	if wasEmpty {
-		p.notifyAllPlatformsDirty(hash)
+		p.markViewSourceDirtyAndNotify(hash)
 	}
 
 	if p.onNodeLatencyChanged != nil {
@@ -1599,7 +1649,7 @@ func (p *GlobalNodePool) UpdateNodeEgressIPForEntry(
 	}
 
 	if ipChanged || regionChanged {
-		p.notifyAllPlatformsDirty(hash)
+		p.markViewSourceDirtyAndNotify(hash)
 	}
 	if p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)
