@@ -1531,6 +1531,10 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 	allowFirstRebuild := make(chan struct{})
 	secondRebuildEntered := make(chan struct{})
 	allowSecondRebuild := make(chan struct{})
+	var releaseFirstRebuildOnce sync.Once
+	releaseFirstRebuild := func() { releaseFirstRebuildOnce.Do(func() { close(allowFirstRebuild) }) }
+	var releaseSecondRebuildOnce sync.Once
+	releaseSecondRebuild := func() { releaseSecondRebuildOnce.Do(func() { close(allowSecondRebuild) }) }
 	var geoCalls atomic.Int32
 	pool.geoLookup = func(netip.Addr) string {
 		switch geoCalls.Add(1) {
@@ -1543,7 +1547,6 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 		}
 		return "us"
 	}
-	defer func() { pool.geoLookup = func(netip.Addr) string { return "us" } }()
 	deleted := make(chan struct{}, 2)
 	pool.afterNodeDeleteComputeHook = func(hash node.Hash, _ *node.NodeEntry) {
 		if hash == h {
@@ -1556,20 +1559,77 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 			added <- struct{}{}
 		}
 	}
-	defer func() {
+	var notificationsCrossed atomic.Int32
+	pool.beforePlatformNotifyHook = func(_ *platform.Platform) {
+		notificationsCrossed.Add(1)
+	}
+	replaceDone := make(chan error, 1)
+	firstRemoveDone := make(chan struct{})
+	firstAddDone := make(chan struct{})
+	secondRemoveDone := make(chan struct{})
+	secondAddDone := make(chan struct{})
+	replaceStarted := false
+	firstRemoveStarted := false
+	firstAddStarted := false
+	secondRemoveStarted := false
+	secondAddStarted := false
+	replaceFinished := false
+	firstRemoveFinished := false
+	firstAddFinished := false
+	secondRemoveFinished := false
+	secondAddFinished := false
+	t.Cleanup(func() {
+		releaseFirstRebuild()
+		releaseSecondRebuild()
+		joined := true
+		waitResult := func(name string, started, finished *bool, done <-chan error) {
+			if !*started || *finished {
+				return
+			}
+			select {
+			case <-done:
+				*finished = true
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s goroutine did not finish during cleanup", name)
+				joined = false
+			}
+		}
+		waitDone := func(name string, started, finished *bool, done <-chan struct{}) {
+			if !*started || *finished {
+				return
+			}
+			select {
+			case <-done:
+				*finished = true
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s goroutine did not finish during cleanup", name)
+				joined = false
+			}
+		}
+		waitResult("ReplacePlatform", &replaceStarted, &replaceFinished, replaceDone)
+		waitDone("first remove", &firstRemoveStarted, &firstRemoveFinished, firstRemoveDone)
+		waitDone("first add", &firstAddStarted, &firstAddFinished, firstAddDone)
+		waitDone("second remove", &secondRemoveStarted, &secondRemoveFinished, secondRemoveDone)
+		waitDone("second add", &secondAddStarted, &secondAddFinished, secondAddDone)
+		if !joined {
+			return
+		}
+		pool.geoLookup = func(netip.Addr) string { return "us" }
 		pool.afterNodeDeleteComputeHook = nil
 		pool.onNodeAdded = nil
-	}()
+		pool.beforePlatformNotifyHook = nil
+	})
 
-	replaceDone := make(chan error, 1)
+	replaceStarted = true
 	go func() { replaceDone <- pool.ReplacePlatform(nextPlat) }()
 	select {
 	case <-firstRebuildEntered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("first replacement rebuild did not enter")
+		t.Errorf("first replacement rebuild did not enter")
+		return
 	}
 
-	firstRemoveDone := make(chan struct{})
+	firstRemoveStarted = true
 	go func() {
 		pool.RemoveNodeFromSub(h, sub.ID)
 		close(firstRemoveDone)
@@ -1577,9 +1637,10 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 	select {
 	case <-deleted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("first node deletion did not reach its linearization hook")
+		t.Errorf("first node deletion did not reach its linearization hook")
+		return
 	}
-	firstAddDone := make(chan struct{})
+	firstAddStarted = true
 	go func() {
 		pool.AddNodeFromSub(h, raw, sub.ID)
 		close(firstAddDone)
@@ -1587,25 +1648,32 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 	select {
 	case <-added:
 	case <-time.After(2 * time.Second):
-		t.Fatal("first node add did not publish entry B")
+		t.Errorf("first node add did not publish entry B")
+		return
 	}
 	entryB, ok := pool.GetEntry(h)
 	if !ok || entryB == nil || entryB == entryA {
-		t.Fatal("first same-hash replacement did not publish entry B")
+		t.Errorf("first same-hash replacement did not publish entry B")
+		return
 	}
 	entryB.CircuitOpenSince.Store(0)
 	outboundB := testutil.NewNoopOutbound()
 	entryB.Outbound.Store(&outboundB)
 	entryB.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
 	entryB.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
-	close(allowFirstRebuild)
+	if got := notificationsCrossed.Load(); got != 0 {
+		t.Errorf("dirty notification crossed platform writer before first rebuild release: %d", got)
+		return
+	}
+	releaseFirstRebuild()
 
 	select {
 	case <-secondRebuildEntered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second replacement rebuild did not enter")
+		t.Errorf("second replacement rebuild did not enter")
+		return
 	}
-	secondRemoveDone := make(chan struct{})
+	secondRemoveStarted = true
 	go func() {
 		pool.RemoveNodeFromSub(h, sub.ID)
 		close(secondRemoveDone)
@@ -1613,9 +1681,10 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 	select {
 	case <-deleted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second node deletion did not reach its linearization hook")
+		t.Errorf("second node deletion did not reach its linearization hook")
+		return
 	}
-	secondAddDone := make(chan struct{})
+	secondAddStarted = true
 	go func() {
 		pool.AddNodeFromSub(h, raw, sub.ID)
 		close(secondAddDone)
@@ -1623,54 +1692,82 @@ func TestPool_ReplacePlatformRepeatedNodeChangesFailClosedAndRecover(t *testing.
 	select {
 	case <-added:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second node add did not publish entry C")
+		t.Errorf("second node add did not publish entry C")
+		return
 	}
 	entryC, ok := pool.GetEntry(h)
 	if !ok || entryC == nil || entryC == entryB {
-		t.Fatal("second same-hash replacement did not publish entry C")
+		t.Errorf("second same-hash replacement did not publish entry C")
+		return
 	}
 	entryC.CircuitOpenSince.Store(0)
 	outboundC := testutil.NewNoopOutbound()
 	entryC.Outbound.Store(&outboundC)
 	entryC.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
 	entryC.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{Ewma: 100 * time.Millisecond, LastUpdated: time.Now()})
-	close(allowSecondRebuild)
+	if got := notificationsCrossed.Load(); got != 0 {
+		t.Errorf("dirty notification crossed platform writer before second rebuild release: %d", got)
+		return
+	}
+	releaseSecondRebuild()
 
 	select {
 	case err := <-replaceDone:
+		replaceFinished = true
 		if !errors.Is(err, ErrPlatformRebuildStale) {
-			t.Fatalf("ReplacePlatform error = %v, want ErrPlatformRebuildStale", err)
+			t.Errorf("ReplacePlatform error = %v, want ErrPlatformRebuildStale", err)
+			return
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("replacement did not fail closed after repeated node changes")
+		t.Errorf("replacement did not fail closed after repeated node changes")
+		return
 	}
-	for _, published := range oldPlat.SnapshotViewEntries() {
-		if published.Hash == h && published.Entry != entryA {
-			t.Fatalf("failed replacement changed old platform view to unverified entry %p", published.Entry)
-		}
-	}
-	if oldPlat.View().Contains(h) == false {
-		t.Fatal("failed replacement must preserve the last verified old view")
-	}
+	// The mutation owner is still unwinding when ReplacePlatform reports its
+	// result. Join every structural mutation (including its queued notification)
+	// before inspecting the old platform; otherwise the test races the owner's
+	// final unlock and can mistake a legitimate update to entry C for a failed
+	// replacement publishing its unverified candidate.
 	select {
 	case <-firstRemoveDone:
+		firstRemoveFinished = true
 	case <-time.After(2 * time.Second):
-		t.Fatal("first deletion notification did not finish")
+		t.Errorf("first deletion notification did not finish")
+		return
 	}
 	select {
 	case <-secondRemoveDone:
+		secondRemoveFinished = true
 	case <-time.After(2 * time.Second):
-		t.Fatal("second deletion notification did not finish")
+		t.Errorf("second deletion notification did not finish")
+		return
 	}
 	select {
 	case <-firstAddDone:
+		firstAddFinished = true
 	case <-time.After(2 * time.Second):
-		t.Fatal("first node add notification did not finish")
+		t.Errorf("first node add notification did not finish")
+		return
 	}
 	select {
 	case <-secondAddDone:
+		secondAddFinished = true
 	case <-time.After(2 * time.Second):
-		t.Fatal("second node add notification did not finish")
+		t.Errorf("second node add notification did not finish")
+		return
+	}
+	if got := notificationsCrossed.Load(); got != 4 {
+		t.Errorf("joined dirty notifications = %d, want 4", got)
+		return
+	}
+	currentPlat, ok := pool.GetPlatform(oldPlat.ID)
+	if !ok || currentPlat != oldPlat {
+		t.Errorf("failed replacement swapped the published platform object: got=%p want=%p", currentPlat, oldPlat)
+		return
+	}
+	entriesAfterFailure := oldPlat.SnapshotViewEntries()
+	if len(entriesAfterFailure) != 1 || entriesAfterFailure[0].Hash != h || entriesAfterFailure[0].Entry != entryC {
+		t.Errorf("failed replacement left old view %+v, want current entry C %p after joined notifications", entriesAfterFailure, entryC)
+		return
 	}
 
 	if err := pool.RebuildPlatform(oldPlat); err != nil {
