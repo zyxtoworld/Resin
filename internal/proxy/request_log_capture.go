@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 )
 
 // captureRequestHeaders serializes headers to canonical wire format for
@@ -111,7 +112,7 @@ func (c *payloadCaptureReadCloser) Truncated() bool {
 // countingReadCloser wraps a body stream and records total read bytes.
 type countingReadCloser struct {
 	rc    io.ReadCloser
-	total int64
+	total atomic.Int64
 }
 
 func newCountingReadCloser(rc io.ReadCloser) *countingReadCloser {
@@ -121,7 +122,7 @@ func newCountingReadCloser(rc io.ReadCloser) *countingReadCloser {
 func (c *countingReadCloser) Read(p []byte) (int, error) {
 	n, err := c.rc.Read(p)
 	if n > 0 {
-		c.total += int64(n)
+		c.total.Add(int64(n))
 	}
 	return n, err
 }
@@ -131,7 +132,10 @@ func (c *countingReadCloser) Close() error {
 }
 
 func (c *countingReadCloser) Total() int64 {
-	return c.total
+	if c == nil {
+		return 0
+	}
+	return c.total.Load()
 }
 
 // countingReadWriteCloser wraps a bidirectional stream and records

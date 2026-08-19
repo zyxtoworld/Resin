@@ -141,6 +141,55 @@ func TestReverseRetryRoundTripper_LatencyReporterUsesCurrentAttemptEntry(t *test
 	}
 }
 
+func TestReverseRetryRoundTripper_SuccessResponseWithoutHTTPTraceCommitsOnce(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/no-trace")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	entry := initial.SelectedEntry()
+	if entry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	var commits atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: entry},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			// Deliberately do not attach the attempt trace. This transport returns
+			// a successful response without emitting any httptrace callbacks.
+			return req, newUpstreamRequestTrace().newAttempt()
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+		onAttemptEgress: func(_, _ int64) {
+			commits.Add(1)
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/no-trace", nil))
+	if err != nil {
+		t.Fatalf("retry RoundTrip: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := commits.Load(); got != 1 {
+		t.Fatalf("egress commits: got %d, want 1", got)
+	}
+}
+
 func TestReverseRetryRoundTripper_CancelAfterResponseBodyDoesNotReplay(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")

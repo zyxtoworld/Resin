@@ -67,7 +67,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			outReq.Body = bodyCounter
 		}
 		resp, err := t.transportFor(current).RoundTrip(outReq)
-		if attemptTrace != nil && attemptTrace.shouldCommitEgress() && t.onAttemptEgress != nil {
+		if attemptTrace != nil && attemptTrace.commitEgress(resp != nil && err == nil, err) && t.onAttemptEgress != nil {
 			bodyBytes := int64(0)
 			if bodyCounter != nil {
 				bodyBytes = bodyCounter.Total()

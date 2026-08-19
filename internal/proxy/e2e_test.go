@@ -2119,6 +2119,72 @@ func TestReverseProxy_E2EHTTPBypassDialsDirect(t *testing.T) {
 	}
 }
 
+func TestReverseProxy_E2EDirectWrittenRequestErrorCountsEgress(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	defer listener.Close()
+
+	requestRead := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			requestRead <- acceptErr
+			return
+		}
+		defer conn.Close()
+		incoming, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			requestRead <- readErr
+			return
+		}
+		_, bodyErr := io.Copy(io.Discard, incoming.Body)
+		_ = incoming.Body.Close()
+		requestRead <- bodyErr
+	}()
+
+	emitter := newMockEventEmitter()
+	host := listener.Addr().String()
+	rp := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken:       "tok",
+		Events:           emitter,
+		ProxyBypassRules: []string{"127.*"},
+	})
+	payload := "written-before-response-error"
+	req := httptest.NewRequest(http.MethodPost, "/tok/plat:acct/http/"+host+"/broken", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	rp.ServeHTTP(w, req)
+	if w.Code == http.StatusOK {
+		t.Fatal("written request with upstream response error must not return a successful response")
+	}
+
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatalf("upstream request read: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not observe the complete request")
+	}
+	select {
+	case logEv := <-emitter.logCh:
+		if logEv.EgressBytes < int64(len(payload)) {
+			t.Fatalf("EgressBytes: got %d, want >= %d after written response error", logEv.EgressBytes, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected reverse log event")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("upstream handler did not finish")
+	}
+}
+
 func TestReverseProxy_E2EDialTimeout_ZeroEgress(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	emitter := newMockEventEmitter()

@@ -321,6 +321,8 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var transport http.RoundTripper
 	var retryTransport *reverseRetryRoundTripper
 	var directAttemptTrace *upstreamRequestAttemptTrace
+	var directResponseReceived bool
+	var directRoundTripErr error
 	domain := netutil.ExtractDomain(parsed.Host)
 	resolve := func(plat *platform.Platform, generationBound bool) {
 		account, _, extractionFailed = p.resolveReverseProxyAccount(parsed, r, plat)
@@ -424,6 +426,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		Transport: transport,
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			if retryTransport == nil {
+				directRoundTripErr = err
+			}
 			proxyErr := classifyUpstreamError(err)
 			if proxyErr == nil {
 				// context.Canceled — no health recording, silently close.
@@ -442,6 +447,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeProxyError(rw, proxyErr)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			if retryTransport == nil {
+				directResponseReceived = resp != nil
+			}
 			lifecycle.setHTTPStatus(resp.StatusCode)
 			lifecycle.addIngressBytes(headerWireLen(resp.Header))
 			if resp.StatusCode == http.StatusSwitchingProtocols {
@@ -503,7 +511,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, r)
-	if retryTransport == nil && directAttemptTrace != nil && directAttemptTrace.shouldCommitEgress() {
+	if retryTransport == nil && directAttemptTrace != nil && directAttemptTrace.commitEgress(directResponseReceived, directRoundTripErr) {
 		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 		if egressBodyCounter != nil {
 			lifecycle.addEgressBytes(egressBodyCounter.Total())

@@ -408,7 +408,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// any response bytes are written to the downstream client.
 		var roundTripErr error
 		resp, roundTripErr = transport.RoundTrip(outReq)
-		if upstreamAttemptTrace.shouldCommitEgress() {
+		if upstreamAttemptTrace.commitEgress(resp != nil && roundTripErr == nil, roundTripErr) {
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 			if egressBodyCounter != nil {
 				lifecycle.addEgressBytes(egressBodyCounter.Total())
