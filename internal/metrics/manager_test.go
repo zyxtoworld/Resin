@@ -52,7 +52,9 @@ func (p managerTestRuntimeStats) LeaseCountsByPlatform() map[string]int {
 	return out
 }
 
-func (managerTestRuntimeStats) RoutableNodeCount(string) (int, bool) { return 0, false }
+func (managerTestRuntimeStats) RoutableNodeCountContext(context.Context, string) (int, bool, error) {
+	return 0, false, nil
+}
 func (managerTestRuntimeStats) PlatformEgressIPCount(string) (int, bool) {
 	return 0, false
 }

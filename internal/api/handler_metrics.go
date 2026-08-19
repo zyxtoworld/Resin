@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -42,13 +43,18 @@ func parseMetricsTimeRange(w http.ResponseWriter, r *http.Request) (from, to tim
 	return from, to, true
 }
 
-func ensureMetricsPlatformExists(mgr *metrics.Manager, w http.ResponseWriter, platformID string) bool {
+func ensureMetricsPlatformExists(ctx context.Context, mgr *metrics.Manager, w http.ResponseWriter, platformID string) bool {
 	stats := mgr.RuntimeStats()
 	if stats == nil {
 		WriteError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "platform stats not available")
 		return false
 	}
-	if _, ok := stats.RoutableNodeCount(platformID); !ok {
+	_, ok, err := stats.RoutableNodeCountContext(ctx, platformID)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "INTERNAL", "internal server error")
+		return false
+	}
+	if !ok {
 		WriteError(w, http.StatusNotFound, "NOT_FOUND", "platform not found")
 		return false
 	}
@@ -95,7 +101,7 @@ func requiredPlatformID(mgr *metrics.Manager, w http.ResponseWriter, r *http.Req
 		WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "platform_id is required")
 		return "", false
 	}
-	if !ensureMetricsPlatformExists(mgr, w, platformID) {
+	if !ensureMetricsPlatformExists(r.Context(), mgr, w, platformID) {
 		return "", false
 	}
 	return platformID, true
@@ -200,7 +206,7 @@ func HandleRealtimeConnections(mgr *metrics.Manager) http.Handler {
 func HandleRealtimeLeases(mgr *metrics.Manager) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		platformID := r.URL.Query().Get("platform_id")
-		if platformID != "" && !ensureMetricsPlatformExists(mgr, w, platformID) {
+		if platformID != "" && !ensureMetricsPlatformExists(r.Context(), mgr, w, platformID) {
 			return
 		}
 		scopeGlobal := platformID == ""
@@ -276,7 +282,7 @@ func HandleHistoryRequests(mgr *metrics.Manager) http.Handler {
 			return
 		}
 		platformID := r.URL.Query().Get("platform_id")
-		if platformID != "" && !ensureMetricsPlatformExists(mgr, w, platformID) {
+		if platformID != "" && !ensureMetricsPlatformExists(r.Context(), mgr, w, platformID) {
 			return
 		}
 
@@ -315,7 +321,7 @@ func HandleHistoryAccessLatency(mgr *metrics.Manager) http.Handler {
 			return
 		}
 		platformID := r.URL.Query().Get("platform_id")
-		if platformID != "" && !ensureMetricsPlatformExists(mgr, w, platformID) {
+		if platformID != "" && !ensureMetricsPlatformExists(r.Context(), mgr, w, platformID) {
 			return
 		}
 
@@ -515,7 +521,7 @@ func HandleSnapshotNodeLatencyDistribution(mgr *metrics.Manager) http.Handler {
 		scope := "global"
 		if platformID != "" {
 			scope = "platform"
-			if !ensureMetricsPlatformExists(mgr, w, platformID) {
+			if !ensureMetricsPlatformExists(r.Context(), mgr, w, platformID) {
 				return
 			}
 		}

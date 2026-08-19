@@ -200,11 +200,11 @@ func (s contractRuntimeStats) LeaseCountsByPlatform() map[string]int {
 	return map[string]int{s.platformID: 0}
 }
 
-func (s contractRuntimeStats) RoutableNodeCount(platformID string) (int, bool) {
+func (s contractRuntimeStats) RoutableNodeCountContext(_ context.Context, platformID string) (int, bool, error) {
 	if platformID != s.platformID {
-		return 0, false
+		return 0, false, nil
 	}
-	return 8, true
+	return 8, true, nil
 }
 
 func (s contractRuntimeStats) PlatformEgressIPCount(platformID string) (int, bool) {

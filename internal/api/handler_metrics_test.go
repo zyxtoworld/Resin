@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -88,7 +89,9 @@ func (s *interleavedNodePoolStats) currentHealthyEgressIPCount() int {
 }
 
 func (s *interleavedNodePoolStats) LeaseCountsByPlatform() map[string]int { return nil }
-func (s *interleavedNodePoolStats) RoutableNodeCount(string) (int, bool)  { return 0, false }
+func (s *interleavedNodePoolStats) RoutableNodeCountContext(context.Context, string) (int, bool, error) {
+	return 0, false, nil
+}
 func (s *interleavedNodePoolStats) PlatformEgressIPCount(string) (int, bool) {
 	return 0, false
 }
@@ -110,9 +113,9 @@ func (s testPlatformStats) NodePoolSnapshot() (int, int, int, int) {
 
 func (s testPlatformStats) LeaseCountsByPlatform() map[string]int { return nil }
 
-func (s testPlatformStats) RoutableNodeCount(platformID string) (int, bool) {
+func (s testPlatformStats) RoutableNodeCountContext(_ context.Context, platformID string) (int, bool, error) {
 	_, ok := s.platforms[platformID]
-	return 0, ok
+	return 0, ok, nil
 }
 
 func (s testPlatformStats) PlatformEgressIPCount(platformID string) (int, bool) {
@@ -121,7 +124,7 @@ func (s testPlatformStats) PlatformEgressIPCount(platformID string) (int, bool) 
 }
 
 func (s testPlatformStats) PlatformNodePoolSnapshot(platformID string) (int, int, bool) {
-	routable, ok := s.RoutableNodeCount(platformID)
+	routable, ok, _ := s.RoutableNodeCountContext(context.Background(), platformID)
 	egress, _ := s.PlatformEgressIPCount(platformID)
 	return routable, egress, ok
 }

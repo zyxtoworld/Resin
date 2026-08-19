@@ -125,6 +125,92 @@ func TestPlatformNodePoolSnapshotDoesNotMixRuntimeGenerations(t *testing.T) {
 	}
 }
 
+func TestMetricsPlatformReadStopsWaitingWhenRequestIsCanceled(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	var releaseWriterOnce sync.Once
+	release := func() { releaseWriterOnce.Do(func() { close(releaseWriter) }) }
+	t.Cleanup(release)
+	go func() {
+		pool.WithRuntimeMutation(func() {
+			close(writerEntered)
+			<-releaseWriter
+		})
+		close(writerDone)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime writer did not acquire the generation owner")
+	}
+
+	readAttempted := make(chan struct{})
+	var readAttemptedOnce sync.Once
+	adapter := &runtimeStatsAdapter{
+		pool: pool,
+		beforeRoutableNodeCountReadHook: func() {
+			readAttemptedOnce.Do(func() { close(readAttempted) })
+		},
+	}
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  1,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 1,
+		ConnectionsIntervalSec:  1,
+		LeasesRetentionSec:      1,
+		LeasesIntervalSec:       1,
+		RuntimeStats:            adapter,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/realtime/leases?platform_id=blocked-platform", nil).
+		WithContext(requestCtx)
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		api.HandleRealtimeLeases(mgr).ServeHTTP(rec, req)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-readAttempted:
+	case <-time.After(2 * time.Second):
+		release()
+		t.Fatal("metrics handler did not reach runtime read admission")
+	}
+	cancel()
+
+	returnedBeforeWriterRelease := false
+	select {
+	case <-handlerDone:
+		returnedBeforeWriterRelease = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime writer did not exit")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("metrics handler did not exit after runtime writer released")
+	}
+	if !returnedBeforeWriterRelease {
+		t.Fatal("canceled metrics request remained blocked behind runtime writer")
+	}
+}
+
 func TestNodePoolStatsAdapter_HealthyNodesRequiresOutbound(t *testing.T) {
 	subMgr, pool := newBootstrapTestRuntime(config.NewDefaultRuntimeConfig())
 	adapter := &runtimeStatsAdapter{pool: pool}

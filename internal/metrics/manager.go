@@ -25,7 +25,7 @@ type RuntimeStatsProvider interface {
 	UniqueHealthyEgressIPCount() int
 	NodePoolSnapshot() (totalNodes, healthyNodes, egressIPCount, healthyEgressIPCount int)
 	LeaseCountsByPlatform() map[string]int
-	RoutableNodeCount(platformID string) (int, bool)
+	RoutableNodeCountContext(ctx context.Context, platformID string) (int, bool, error)
 	PlatformEgressIPCount(platformID string) (int, bool)
 	PlatformNodePoolSnapshot(platformID string) (routableNodeCount int, egressIPCount int, ok bool)
 	CollectNodeEWMAs(platformID string) []float64

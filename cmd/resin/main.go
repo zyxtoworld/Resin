@@ -678,6 +678,9 @@ type runtimeStatsAdapter struct {
 	// for starting a runtime mutation while the snapshot read owner is held.
 	// Production leaves it nil.
 	platformNodePoolSnapshotHook func()
+	// beforeRoutableNodeCountReadHook is a package-private deterministic test
+	// seam immediately before runtime read admission. Production leaves it nil.
+	beforeRoutableNodeCountReadHook func()
 }
 
 func (a *runtimeStatsAdapter) TotalNodes() (count int) {
@@ -775,10 +778,13 @@ func (a *runtimeStatsAdapter) LeaseCountsByPlatform() map[string]int {
 	return result
 }
 
-func (a *runtimeStatsAdapter) RoutableNodeCount(platformID string) (int, bool) {
+func (a *runtimeStatsAdapter) RoutableNodeCountContext(ctx context.Context, platformID string) (int, bool, error) {
 	count := 0
 	ok := false
-	a.pool.WithRuntimeRead(func() {
+	if hook := a.beforeRoutableNodeCountReadHook; hook != nil {
+		hook()
+	}
+	err := a.pool.WithRuntimeReadContext(ctx, func() {
 		entries, found := a.pool.SnapshotPlatformViewEntries(platformID)
 		if !found {
 			return
@@ -791,7 +797,7 @@ func (a *runtimeStatsAdapter) RoutableNodeCount(platformID string) (int, bool) {
 			}
 		}
 	})
-	return count, ok
+	return count, ok, err
 }
 
 func (a *runtimeStatsAdapter) PlatformEgressIPCount(platformID string) (int, bool) {
