@@ -3380,7 +3380,7 @@ a {
 
 @media (max-width: 1120px) {
   .app-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .sidebar {
