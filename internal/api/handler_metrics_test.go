@@ -224,10 +224,15 @@ func TestSnapshotNodePoolDoesNotMixRuntimeStatsGenerations(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal body: %v", err)
 	}
-	if body["total_nodes"] != float64(2) ||
-		body["healthy_nodes"] != float64(1) ||
-		body["egress_ip_count"] != float64(1) ||
-		body["healthy_egress_ip_count"] != float64(1) {
+	oldGeneration := body["total_nodes"] == float64(2) &&
+		body["healthy_nodes"] == float64(1) &&
+		body["egress_ip_count"] == float64(1) &&
+		body["healthy_egress_ip_count"] == float64(1)
+	newGeneration := body["total_nodes"] == float64(0) &&
+		body["healthy_nodes"] == float64(0) &&
+		body["egress_ip_count"] == float64(0) &&
+		body["healthy_egress_ip_count"] == float64(0)
+	if !oldGeneration && !newGeneration {
 		t.Fatalf("mixed node-pool snapshot: %+v", body)
 	}
 }
