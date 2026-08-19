@@ -2,9 +2,11 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/service"
 )
 
@@ -28,6 +30,7 @@ type systemEnvConfigResponse struct {
 	ProbeTimeout                                    config.Duration `json:"probe_timeout"`
 	ResourceFetchTimeout                            config.Duration `json:"resource_fetch_timeout"`
 	NodeDNSUpstreams                                []string        `json:"node_dns_upstreams"`
+	NodeDNSUpstreamsRedacted                        []bool          `json:"node_dns_upstreams_redacted"`
 	ProxyTransportMaxIdleConns                      int             `json:"proxy_transport_max_idle_conns"`
 	ProxyTransportMaxIdleConnsPerHost               int             `json:"proxy_transport_max_idle_conns_per_host"`
 	ProxyTransportIdleConnTimeout                   config.Duration `json:"proxy_transport_idle_conn_timeout"`
@@ -107,6 +110,7 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 	}
 	adminTokenSet := envCfg.AdminToken != ""
 	proxyTokenSet := envCfg.ProxyToken != ""
+	nodeDNSUpstreams, nodeDNSUpstreamsRedacted := redactNodeDNSUpstreams(envCfg.NodeDNSUpstreams)
 	return &systemEnvConfigResponse{
 		CacheDir:                              envCfg.CacheDir,
 		StateDir:                              envCfg.StateDir,
@@ -126,7 +130,8 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 		DefaultPlatformAllocationPolicy:                 envCfg.DefaultPlatformAllocationPolicy,
 		ProbeTimeout:                                    config.Duration(envCfg.ProbeTimeout),
 		ResourceFetchTimeout:                            config.Duration(envCfg.ResourceFetchTimeout),
-		NodeDNSUpstreams:                                append([]string(nil), envCfg.NodeDNSUpstreams...),
+		NodeDNSUpstreams:                                nodeDNSUpstreams,
+		NodeDNSUpstreamsRedacted:                        nodeDNSUpstreamsRedacted,
 		ProxyTransportMaxIdleConns:                      envCfg.ProxyTransportMaxIdleConns,
 		ProxyTransportMaxIdleConnsPerHost:               envCfg.ProxyTransportMaxIdleConnsPerHost,
 		ProxyTransportIdleConnTimeout:                   config.Duration(envCfg.ProxyTransportIdleConnTimeout),
@@ -151,4 +156,22 @@ func systemEnvConfigSnapshot(envCfg *config.EnvConfig) *systemEnvConfigResponse 
 		ProxyTokenWeak:                                  proxyTokenSet && config.IsWeakToken(envCfg.ProxyToken),
 		AuthVersion:                                     string(envCfg.AuthVersion),
 	}
+}
+
+func redactNodeDNSUpstreams(upstreams []string) ([]string, []bool) {
+	if upstreams == nil {
+		return nil, nil
+	}
+	redacted := make([]string, len(upstreams))
+	redactionFlags := make([]bool, len(upstreams))
+	for i, raw := range upstreams {
+		trimmed := strings.TrimSpace(raw)
+		if strings.EqualFold(trimmed, "local") {
+			redacted[i] = "local"
+			continue
+		}
+		redacted[i] = netutil.RedactURLCredentials(trimmed)
+		redactionFlags[i] = redacted[i] != trimmed
+	}
+	return redacted, redactionFlags
 }

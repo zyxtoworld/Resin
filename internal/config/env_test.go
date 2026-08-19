@@ -244,6 +244,22 @@ func TestLoadEnvConfig_NodeDNSUpstreamsRejectsObjectFormat(t *testing.T) {
 	assertContains(t, err.Error(), "RESIN_NODE_DNS_UPSTREAMS: invalid JSON string array")
 }
 
+func TestLoadEnvConfig_InvalidStringSliceDoesNotExposeRawValue(t *testing.T) {
+	envs := requiredEnvs()
+	const secret = "dns-env-secret-7f4d2e"
+	envs["RESIN_NODE_DNS_UPSTREAMS"] = `{"token":"` + secret + `"}`
+	setEnvs(t, envs)
+
+	_, err := LoadEnvConfig()
+	if err == nil {
+		t.Fatal("expected invalid RESIN_NODE_DNS_UPSTREAMS error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("environment parse error exposed raw secret: %v", err)
+	}
+	assertContains(t, err.Error(), "RESIN_NODE_DNS_UPSTREAMS: invalid JSON string array")
+}
+
 func TestLoadEnvConfig_MissingAdminToken(t *testing.T) {
 	t.Setenv("RESIN_AUTH_VERSION", "V1")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")

@@ -12,6 +12,7 @@ import { useToast } from "../../hooks/useToast";
 import i18next, { useI18n } from "../../i18n";
 import { formatApiErrorMessage } from "../../lib/error-message";
 import { getEnvConfig, patchSystemConfig, getSystemConfig, getDefaultSystemConfig } from "./api";
+import { formatNodeDNSUpstreamsForDisplay } from "./types";
 import type { RuntimeConfig, RuntimeConfigPatch } from "./types";
 
 type RuntimeConfigForm = {
@@ -258,6 +259,10 @@ export function SystemConfigPage() {
   const baseline = configQuery.data ?? null;
   const defaultBaseline = defaultConfigQuery.data ?? null;
   const envBaseline = envConfigQuery.data ?? null;
+  const nodeDNSUpstreamsDisplay = formatNodeDNSUpstreamsForDisplay(
+    envBaseline?.node_dns_upstreams ?? null,
+    envBaseline?.node_dns_upstreams_redacted ?? null,
+  );
 
   const form = useMemo(() => {
     if (!baseline) {
@@ -783,13 +788,18 @@ export function SystemConfigPage() {
                       <Input readOnly disabled value={envBaseline.resource_fetch_timeout} />
                     </div>
                     <div className="field-group field-span-2">
-                      <label className="field-label" style={{ margin: 0 }}>{t("节点 DNS 上游")}</label>
+                      <label className="field-label" style={{ margin: 0 }}>{t("节点 DNS 上游（只读摘要）")}</label>
                       <Textarea
                         readOnly
                         disabled
                         rows={3}
-                        value={envBaseline.node_dns_upstreams?.join("\n") || t("无")}
+                        value={nodeDNSUpstreamsDisplay.lines.join("\n") || t("无")}
                       />
+                      {nodeDNSUpstreamsDisplay.hasRedacted ? (
+                        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "6px 0 0" }}>
+                          {t("部分 DNS 上游仅显示源站，敏感部分已隐藏；此处不可用于回填配置。")}
+                        </p>
+                      ) : null}
                     </div>
                     <div className="field-group">
                       <label className="field-label" style={{ margin: 0 }}>{t("GeoIP 更新计划")}</label>

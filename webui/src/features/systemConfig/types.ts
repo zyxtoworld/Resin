@@ -37,6 +37,7 @@ export type EnvConfig = {
   probe_timeout: string;
   resource_fetch_timeout: string;
   node_dns_upstreams: string[] | null;
+  node_dns_upstreams_redacted: boolean[] | null;
   proxy_transport_max_idle_conns: number;
   proxy_transport_max_idle_conns_per_host: number;
   proxy_transport_idle_conn_timeout: string;
@@ -63,3 +64,21 @@ export type EnvConfig = {
 };
 
 export type RuntimeConfigPatch = Partial<RuntimeConfig>;
+
+export function formatNodeDNSUpstreamsForDisplay(
+  values: string[] | null,
+  redacted: boolean[] | null,
+): { lines: string[]; hasRedacted: boolean } {
+  const lines = values ?? [];
+  const metadataMatches = Array.isArray(redacted)
+    && redacted.length === lines.length
+    && redacted.every((flag) => typeof flag === "boolean");
+  return {
+    lines,
+    // Missing or misaligned metadata is unsafe to interpret as "not
+    // redacted". Keep the display read-only and warn instead.
+    hasRedacted: metadataMatches
+      ? lines.some((_value, index) => redacted[index] === true)
+      : lines.length > 0,
+  };
+}

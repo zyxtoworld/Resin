@@ -608,6 +608,9 @@ Note: Once enabled, requests without authentication information are rejected ins
   "状态存储目录": "State storage directory",
   "资源获取超时时间": "Resource fetch timeout",
   "节点 DNS 上游": "Node DNS upstreams",
+  "节点 DNS 上游（只读摘要）": "Node DNS upstreams (read-only summary)",
+  "部分 DNS 上游仅显示源站，敏感部分已隐藏；此处不可用于回填配置。":
+    "Some DNS upstreams show only their origin; sensitive parts are hidden and this summary must not be used to repopulate configuration.",
   "总请求数 / 成功请求数": "Total requests / successful requests",
   "租期保留时间": "Lease retention window",
   "租期抽样间隔": "Lease sampling interval",

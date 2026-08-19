@@ -55,15 +55,19 @@ func (e *downloadRequestError) Error() string {
 
 func (e *downloadRequestError) Unwrap() error { return e.err }
 
-func redactURLCredentials(raw string) string {
+// RedactURLCredentials keeps only a URL origin. Paths, queries, fragments,
+// and userinfo are not safe to expose because resource and DNS URLs may carry
+// credentials or access tokens there.
+func RedactURLCredentials(raw string) string {
 	u, err := neturl.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "[redacted-url]"
 	}
-	// Subscription URLs are secrets as a whole: credentials may be in
-	// userinfo, query parameters, or path tokens. Keep only the origin for
-	// useful status diagnostics and never echo the rest.
 	return u.Scheme + "://" + u.Host
+}
+
+func redactURLCredentials(raw string) string {
+	return RedactURLCredentials(raw)
 }
 
 // unwrapURLRequestError removes net/url's error wrapper because its Error

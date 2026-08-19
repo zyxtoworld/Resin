@@ -433,7 +433,10 @@ func envStringSlice(key string, defaultVal []string, errs *[]string) []string {
 	}
 	var out []string
 	if err := json.Unmarshal([]byte(v), &out); err != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: invalid JSON string array %q", key, v))
+		// The value may be a URL-bearing setting such as
+		// RESIN_NODE_DNS_UPSTREAMS. Keep startup diagnostics useful without
+		// copying credentials or access tokens from the environment.
+		*errs = append(*errs, fmt.Sprintf("%s: invalid JSON string array", key))
 		return defaultVal
 	}
 	if out == nil {

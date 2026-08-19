@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -74,7 +75,7 @@ func customSecureDNSTransportSpecs(upstreams []string) ([]secureDNSTransportSpec
 
 		spec, needsLocal, err := parseCustomDNSUpstream(raw, customDNSUpstreamTransportTag(i))
 		if err != nil {
-			return nil, fmt.Errorf("DNS upstream %d %q: %w", i+1, raw, err)
+			return nil, fmt.Errorf("DNS upstream %d %s: %w", i+1, netutil.RedactURLCredentials(raw), err)
 		}
 		if needsLocal {
 			localNeeded = true
@@ -117,7 +118,7 @@ func secureDNSFailoverTransportSpec(upstreams []string) secureDNSTransportSpec {
 func parseCustomDNSUpstream(raw string, tag string) (secureDNSTransportSpec, bool, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return secureDNSTransportSpec{}, false, err
+		return secureDNSTransportSpec{}, false, fmt.Errorf("invalid URI")
 	}
 	if u.Scheme == "" {
 		return secureDNSTransportSpec{}, false, fmt.Errorf("missing scheme")
@@ -142,7 +143,7 @@ func parseCustomDNSUpstream(raw string, tag string) (secureDNSTransportSpec, boo
 	sni := firstNonEmptyQuery(query, "sni", "servername", "server_name")
 	bootstrap := strings.TrimSpace(query.Get("bootstrap"))
 	if bootstrap != "" && !strings.EqualFold(bootstrap, localDNSTransportTag) {
-		return secureDNSTransportSpec{}, false, fmt.Errorf("unsupported bootstrap %q", bootstrap)
+		return secureDNSTransportSpec{}, false, fmt.Errorf("unsupported bootstrap value")
 	}
 
 	needsLocalResolver := strings.EqualFold(bootstrap, localDNSTransportTag) || dnsUpstreamHostNeedsBootstrap(host)
