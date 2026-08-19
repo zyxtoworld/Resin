@@ -23,6 +23,7 @@ type RuntimeStatsProvider interface {
 	HealthyNodes() int
 	EgressIPCount() int
 	UniqueHealthyEgressIPCount() int
+	NodePoolSnapshot() (totalNodes, healthyNodes, egressIPCount, healthyEgressIPCount int)
 	LeaseCountsByPlatform() map[string]int
 	RoutableNodeCount(platformID string) (int, bool)
 	PlatformEgressIPCount(platformID string) (int, bool)
@@ -691,7 +692,8 @@ func (m *Manager) SnapshotCurrentNodePoolBucket() (bucketStartUnix int64, totalN
 	if m.runtimeStats == nil {
 		return bucketStartUnix, 0, 0, 0, false
 	}
-	return bucketStartUnix, m.runtimeStats.TotalNodes(), m.runtimeStats.HealthyNodes(), m.runtimeStats.EgressIPCount(), true
+	totalNodes, healthyNodes, egressIPCount, _ = m.runtimeStats.NodePoolSnapshot()
+	return bucketStartUnix, totalNodes, healthyNodes, egressIPCount, true
 }
 
 // SnapshotCurrentLeaseLifetimeBucket returns lease lifetime percentiles for the
@@ -1020,10 +1022,11 @@ func (m *Manager) buildPersistTask(data *BucketFlushData) *persistTask {
 		PlatformLatency: m.collector.platformSwapAllUnlocked(),
 	}
 	if m.runtimeStats != nil {
+		totalNodes, healthyNodes, egressIPCount, _ := m.runtimeStats.NodePoolSnapshot()
 		task.NodePool = &nodePoolSnapshot{
-			TotalNodes:    m.runtimeStats.TotalNodes(),
-			HealthyNodes:  m.runtimeStats.HealthyNodes(),
-			EgressIPCount: m.runtimeStats.EgressIPCount(),
+			TotalNodes:    totalNodes,
+			HealthyNodes:  healthyNodes,
+			EgressIPCount: egressIPCount,
 		}
 	}
 	return task

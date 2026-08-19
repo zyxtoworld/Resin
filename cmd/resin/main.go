@@ -731,6 +731,32 @@ func (a *runtimeStatsAdapter) UniqueHealthyEgressIPCount() int {
 	return len(seen)
 }
 
+// NodePoolSnapshot reads all global node-pool counters under one runtime
+// generation owner. Callers publish these fields together, so independent
+// reads could otherwise combine adjacent refresh generations.
+func (a *runtimeStatsAdapter) NodePoolSnapshot() (totalNodes, healthyNodes, egressIPCount, healthyEgressIPCount int) {
+	seen := make(map[netip.Addr]struct{})
+	healthySeen := make(map[netip.Addr]struct{})
+	_ = a.pool.WithRuntimeReadContext(context.Background(), func() {
+		totalNodes = a.pool.Size()
+		isHealthyAndEnabled := a.pool.MakeHealthyAndEnabledEvaluator()
+		a.pool.RangeNodes(func(_ node.Hash, entry *node.NodeEntry) bool {
+			ip := entry.GetEgressIP()
+			if ip.IsValid() {
+				seen[ip] = struct{}{}
+			}
+			if isHealthyAndEnabled(entry) {
+				healthyNodes++
+				if ip.IsValid() {
+					healthySeen[ip] = struct{}{}
+				}
+			}
+			return true
+		})
+	})
+	return totalNodes, healthyNodes, len(seen), len(healthySeen)
+}
+
 func (a *runtimeStatsAdapter) LeaseCountsByPlatform() map[string]int {
 	result := make(map[string]int)
 	a.pool.WithRuntimeRead(func() {

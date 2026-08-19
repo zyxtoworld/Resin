@@ -19,11 +19,29 @@ type managerTestRuntimeStats struct {
 	counts map[string]int
 }
 
+type generationAwareRuntimeStats struct {
+	managerTestRuntimeStats
+	snapshotCalls atomic.Int32
+}
+
+func (s *generationAwareRuntimeStats) TotalNodes() int                 { return 101 }
+func (s *generationAwareRuntimeStats) HealthyNodes() int               { return 102 }
+func (s *generationAwareRuntimeStats) EgressIPCount() int              { return 103 }
+func (s *generationAwareRuntimeStats) UniqueHealthyEgressIPCount() int { return 104 }
+func (s *generationAwareRuntimeStats) NodePoolSnapshot() (int, int, int, int) {
+	s.snapshotCalls.Add(1)
+	return 9, 7, 3, 2
+}
+
 func (managerTestRuntimeStats) TotalNodes() int    { return 9 }
 func (managerTestRuntimeStats) HealthyNodes() int  { return 7 }
 func (managerTestRuntimeStats) EgressIPCount() int { return 3 }
 func (managerTestRuntimeStats) UniqueHealthyEgressIPCount() int {
 	return 2
+}
+
+func (managerTestRuntimeStats) NodePoolSnapshot() (int, int, int, int) {
+	return 9, 7, 3, 2
 }
 
 func (p managerTestRuntimeStats) LeaseCountsByPlatform() map[string]int {
@@ -51,6 +69,31 @@ func mustNewManager(t *testing.T, cfg ManagerConfig) *Manager {
 		t.Fatalf("NewManager: %v", err)
 	}
 	return mgr
+}
+
+func TestBuildPersistTaskUsesOneNodePoolSnapshot(t *testing.T) {
+	stats := &generationAwareRuntimeStats{}
+	mgr := mustNewManager(t, ManagerConfig{
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  8,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 8,
+		ConnectionsIntervalSec:  1,
+		LeasesRetentionSec:      8,
+		LeasesIntervalSec:       1,
+		RuntimeStats:            stats,
+	})
+
+	task := mgr.buildPersistTask(&BucketFlushData{BucketStartUnix: 42})
+	if task == nil || task.NodePool == nil {
+		t.Fatal("buildPersistTask did not include node-pool snapshot")
+	}
+	if got := *task.NodePool; got != (nodePoolSnapshot{TotalNodes: 9, HealthyNodes: 7, EgressIPCount: 3}) {
+		t.Fatalf("node-pool persistence snapshot = %+v, want one-generation values", got)
+	}
+	if got := stats.snapshotCalls.Load(); got != 1 {
+		t.Fatalf("NodePoolSnapshot calls = %d, want 1", got)
+	}
 }
 
 func TestTakeSample_NormalizesThroughputToBPS(t *testing.T) {

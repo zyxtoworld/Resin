@@ -265,9 +265,7 @@ func (m *Manager) QueryHistoryNodePoolContext(ctx context.Context, fromUnix, toU
 
 	currentBucketStart := m.bucket.CurrentBucketStartUnix()
 	if m.runtimeStats != nil && bucketInRangeUnix(currentBucketStart, fromUnix, toUnix) {
-		totalNodes := m.runtimeStats.TotalNodes()
-		healthyNodes := m.runtimeStats.HealthyNodes()
-		egressIPCount := m.runtimeStats.EgressIPCount()
+		totalNodes, healthyNodes, egressIPCount, _ := m.runtimeStats.NodePoolSnapshot()
 		merged := false
 		for i := range rows {
 			if rows[i].BucketStartUnix != currentBucketStart {

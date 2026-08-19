@@ -192,6 +192,10 @@ func (contractRuntimeStats) UniqueHealthyEgressIPCount() int {
 	return 4
 }
 
+func (contractRuntimeStats) NodePoolSnapshot() (int, int, int, int) {
+	return 20, 15, 6, 4
+}
+
 func (s contractRuntimeStats) LeaseCountsByPlatform() map[string]int {
 	return map[string]int{s.platformID: 0}
 }

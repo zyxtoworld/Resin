@@ -468,12 +468,13 @@ func HandleSnapshotNodePool(mgr *metrics.Manager) http.Handler {
 			WriteError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "node pool stats not available")
 			return
 		}
+		totalNodes, healthyNodes, egressIPCount, healthyEgressIPCount := stats.NodePoolSnapshot()
 		WriteJSON(w, http.StatusOK, map[string]any{
 			"generated_at":            formatTimestamp(time.Now()),
-			"total_nodes":             stats.TotalNodes(),
-			"healthy_nodes":           stats.HealthyNodes(),
-			"egress_ip_count":         stats.EgressIPCount(),
-			"healthy_egress_ip_count": stats.UniqueHealthyEgressIPCount(),
+			"total_nodes":             totalNodes,
+			"healthy_nodes":           healthyNodes,
+			"egress_ip_count":         egressIPCount,
+			"healthy_egress_ip_count": healthyEgressIPCount,
 		})
 	})
 }

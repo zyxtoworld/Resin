@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,11 +22,90 @@ type testPlatformStats struct {
 	healthyEgressIPCount int
 }
 
+type interleavedNodePoolStats struct {
+	mu            sync.Mutex
+	generation    int
+	firstCall     chan struct{}
+	allowNextCall chan struct{}
+	firstCallOnce sync.Once
+}
+
+func (s *interleavedNodePoolStats) TotalNodes() int {
+	s.firstCallOnce.Do(func() { close(s.firstCall) })
+	return 2
+}
+
+func (s *interleavedNodePoolStats) HealthyNodes() int {
+	<-s.allowNextCall
+	return s.currentHealthyNodes()
+}
+
+func (s *interleavedNodePoolStats) EgressIPCount() int {
+	<-s.allowNextCall
+	return s.currentEgressIPCount()
+}
+
+func (s *interleavedNodePoolStats) UniqueHealthyEgressIPCount() int {
+	<-s.allowNextCall
+	return s.currentHealthyEgressIPCount()
+}
+
+func (s *interleavedNodePoolStats) NodePoolSnapshot() (int, int, int, int) {
+	s.firstCallOnce.Do(func() { close(s.firstCall) })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation == 2 {
+		return 0, 0, 0, 0
+	}
+	return 2, 1, 1, 1
+}
+
+func (s *interleavedNodePoolStats) currentHealthyNodes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation == 2 {
+		return 0
+	}
+	return 1
+}
+
+func (s *interleavedNodePoolStats) currentEgressIPCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation == 2 {
+		return 0
+	}
+	return 1
+}
+
+func (s *interleavedNodePoolStats) currentHealthyEgressIPCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation == 2 {
+		return 0
+	}
+	return 1
+}
+
+func (s *interleavedNodePoolStats) LeaseCountsByPlatform() map[string]int { return nil }
+func (s *interleavedNodePoolStats) RoutableNodeCount(string) (int, bool)  { return 0, false }
+func (s *interleavedNodePoolStats) PlatformEgressIPCount(string) (int, bool) {
+	return 0, false
+}
+func (s *interleavedNodePoolStats) PlatformNodePoolSnapshot(string) (int, int, bool) {
+	return 0, 0, false
+}
+func (s *interleavedNodePoolStats) CollectNodeEWMAs(string) []float64 { return nil }
+
 func (s testPlatformStats) TotalNodes() int    { return s.totalNodes }
 func (s testPlatformStats) HealthyNodes() int  { return s.healthyNodes }
 func (s testPlatformStats) EgressIPCount() int { return s.egressIPCount }
 func (s testPlatformStats) UniqueHealthyEgressIPCount() int {
 	return s.healthyEgressIPCount
+}
+
+func (s testPlatformStats) NodePoolSnapshot() (int, int, int, int) {
+	return s.totalNodes, s.healthyNodes, s.egressIPCount, s.healthyEgressIPCount
 }
 
 func (s testPlatformStats) LeaseCountsByPlatform() map[string]int { return nil }
@@ -103,6 +183,53 @@ func newTestMetricsManagerWithNodeLatency(
 		t.Fatalf("NewManager: %v", err)
 	}
 	return mgr
+}
+
+func TestSnapshotNodePoolDoesNotMixRuntimeStatsGenerations(t *testing.T) {
+	stats := &interleavedNodePoolStats{
+		firstCall:     make(chan struct{}),
+		allowNextCall: make(chan struct{}),
+	}
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    nil,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  1,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 1,
+		ConnectionsIntervalSec:  1,
+		LeasesRetentionSec:      1,
+		LeasesIntervalSec:       1,
+		RuntimeStats:            stats,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	go func() {
+		<-stats.firstCall
+		stats.mu.Lock()
+		stats.generation = 2
+		stats.mu.Unlock()
+		close(stats.allowNextCall)
+	}()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/snapshots/node-pool", nil)
+	HandleSnapshotNodePool(mgr).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if body["total_nodes"] != float64(2) ||
+		body["healthy_nodes"] != float64(1) ||
+		body["egress_ip_count"] != float64(1) ||
+		body["healthy_egress_ip_count"] != float64(1) {
+		t.Fatalf("mixed node-pool snapshot: %+v", body)
+	}
 }
 
 type testRuntimeStatsProvider struct {
