@@ -40,6 +40,12 @@ func (s testPlatformStats) PlatformEgressIPCount(platformID string) (int, bool) 
 	return 0, ok
 }
 
+func (s testPlatformStats) PlatformNodePoolSnapshot(platformID string) (int, int, bool) {
+	routable, ok := s.RoutableNodeCount(platformID)
+	egress, _ := s.PlatformEgressIPCount(platformID)
+	return routable, egress, ok
+}
+
 type testNodeLatencyProvider struct {
 	global   []float64
 	platform map[string][]float64

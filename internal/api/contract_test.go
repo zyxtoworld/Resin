@@ -210,6 +210,13 @@ func (s contractRuntimeStats) PlatformEgressIPCount(platformID string) (int, boo
 	return 3, true
 }
 
+func (s contractRuntimeStats) PlatformNodePoolSnapshot(platformID string) (int, int, bool) {
+	if platformID != s.platformID {
+		return 0, 0, false
+	}
+	return 8, 3, true
+}
+
 func (p contractRuntimeStats) CollectNodeEWMAs(platformID string) []float64 {
 	if platformID == "" {
 		return []float64{50, 150, 280}

@@ -674,6 +674,10 @@ type runtimeStatsAdapter struct {
 	// test seam after capturing a platform view and before reading pool entries.
 	// Production leaves it nil.
 	beforePlatformStatsViewSnapshotHook func()
+	// platformNodePoolSnapshotHook is a package-private deterministic test seam
+	// for starting a runtime mutation while the snapshot read owner is held.
+	// Production leaves it nil.
+	platformNodePoolSnapshotHook func()
 }
 
 func (a *runtimeStatsAdapter) TotalNodes() (count int) {
@@ -787,6 +791,36 @@ func (a *runtimeStatsAdapter) PlatformEgressIPCount(platformID string) (int, boo
 		}
 	})
 	return len(seen), ok
+}
+
+// PlatformNodePoolSnapshot reads both platform counters while one runtime
+// generation read owner is held. The API publishes these fields together, so
+// splitting them into two independent reads would allow a refresh to produce
+// a mixed-generation response.
+func (a *runtimeStatsAdapter) PlatformNodePoolSnapshot(platformID string) (routableNodeCount int, egressIPCount int, ok bool) {
+	seen := make(map[netip.Addr]struct{})
+	_ = a.pool.WithRuntimeReadContext(context.Background(), func() {
+		viewEntries, found := a.pool.SnapshotPlatformViewEntries(platformID)
+		if !found {
+			return
+		}
+		ok = true
+		if hook := a.platformNodePoolSnapshotHook; hook != nil {
+			hook()
+		}
+		for _, viewEntry := range viewEntries {
+			entry, found := a.pool.GetEntry(viewEntry.Hash)
+			if !found || entry != viewEntry.Entry {
+				continue
+			}
+			routableNodeCount++
+			if ip := entry.GetEgressIP(); ip.IsValid() {
+				seen[ip] = struct{}{}
+			}
+		}
+		egressIPCount = len(seen)
+	})
+	return routableNodeCount, egressIPCount, ok
 }
 
 func (a *runtimeStatsAdapter) CollectNodeEWMAs(platformID string) []float64 {

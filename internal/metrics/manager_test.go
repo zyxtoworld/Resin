@@ -38,6 +38,10 @@ func (managerTestRuntimeStats) RoutableNodeCount(string) (int, bool) { return 0,
 func (managerTestRuntimeStats) PlatformEgressIPCount(string) (int, bool) {
 	return 0, false
 }
+
+func (managerTestRuntimeStats) PlatformNodePoolSnapshot(string) (int, int, bool) {
+	return 0, 0, false
+}
 func (managerTestRuntimeStats) CollectNodeEWMAs(string) []float64 { return nil }
 
 func mustNewManager(t *testing.T, cfg ManagerConfig) *Manager {

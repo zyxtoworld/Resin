@@ -26,6 +26,7 @@ type RuntimeStatsProvider interface {
 	LeaseCountsByPlatform() map[string]int
 	RoutableNodeCount(platformID string) (int, bool)
 	PlatformEgressIPCount(platformID string) (int, bool)
+	PlatformNodePoolSnapshot(platformID string) (routableNodeCount int, egressIPCount int, ok bool)
 	CollectNodeEWMAs(platformID string) []float64
 }
 

@@ -2,19 +2,128 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/api"
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/metrics"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
 )
+
+func TestPlatformNodePoolSnapshotDoesNotMixRuntimeGenerations(t *testing.T) {
+	subMgr, pool := newBootstrapTestRuntime(config.NewDefaultRuntimeConfig())
+	sub := subscription.NewSubscription("platform-stats-sub", "Platform stats", "https://example.com/stats", true, false)
+	subMgr.Register(sub)
+
+	addNode := func(raw string, ip string) node.Hash {
+		hash := node.HashFromRawOptions([]byte(raw))
+		sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"platform-stats"}})
+		pool.AddNodeFromSub(hash, []byte(raw), sub.ID)
+		entry, ok := pool.GetEntry(hash)
+		if !ok {
+			t.Fatalf("node %s was not added", raw)
+		}
+		entry.CircuitOpenSince.Store(0)
+		outbound := testutil.NewNoopOutbound()
+		entry.Outbound.Store(&outbound)
+		entry.SetEgressIP(netip.MustParseAddr(ip))
+		entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+			Ewma:        25 * time.Millisecond,
+			LastUpdated: time.Now(),
+		})
+		return hash
+	}
+
+	firstHash := addNode(`{"type":"direct","server":"198.51.100.60","port":443}`, "203.0.113.60")
+	secondHash := addNode(`{"type":"direct","server":"198.51.100.61","port":443}`, "203.0.113.61")
+
+	const platformID = "platform-stats-snapshot"
+	plat := platform.NewPlatform(
+		platformID,
+		"Platform stats snapshot",
+		[]*regexp.Regexp{regexp.MustCompile("platform-stats")},
+		nil,
+	)
+	if err := pool.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+	if !plat.View().Contains(firstHash) || !plat.View().Contains(secondHash) {
+		t.Fatal("initial platform view must contain both nodes")
+	}
+
+	adapter := &runtimeStatsAdapter{pool: pool}
+	removeStarted := make(chan struct{})
+	removeDone := make(chan struct{})
+	var removeOnce sync.Once
+	adapter.platformNodePoolSnapshotHook = func() {
+		removeOnce.Do(func() {
+			go func() {
+				close(removeStarted)
+				pool.RemoveNodeFromSub(secondHash, sub.ID)
+				close(removeDone)
+			}()
+		})
+	}
+
+	repo, err := metrics.NewMetricsRepo(filepath.Join(t.TempDir(), "metrics.db"))
+	if err != nil {
+		t.Fatalf("NewMetricsRepo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	mgr, err := metrics.NewManager(metrics.ManagerConfig{
+		Repo:                    repo,
+		BucketSeconds:           300,
+		ThroughputRetentionSec:  1,
+		ThroughputIntervalSec:   1,
+		ConnectionsRetentionSec: 1,
+		ConnectionsIntervalSec:  1,
+		LeasesRetentionSec:      1,
+		LeasesIntervalSec:       1,
+		RuntimeStats:            adapter,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/snapshots/platform-node-pool?platform_id="+platformID, nil)
+	rec := httptest.NewRecorder()
+	api.HandleSnapshotPlatformNodePool(mgr).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	select {
+	case <-removeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not start")
+	}
+	if body["routable_node_count"] != float64(2) || body["egress_ip_count"] != float64(2) {
+		t.Fatalf("mixed platform node-pool snapshot: %+v", body)
+	}
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime mutation did not complete after snapshot")
+	}
+	if plat.View().Contains(secondHash) {
+		t.Fatal("runtime mutation did not remove the second node from the platform view")
+	}
+}
 
 func TestNodePoolStatsAdapter_HealthyNodesRequiresOutbound(t *testing.T) {
 	subMgr, pool := newBootstrapTestRuntime(config.NewDefaultRuntimeConfig())

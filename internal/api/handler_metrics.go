@@ -491,12 +491,11 @@ func HandleSnapshotPlatformNodePool(mgr *metrics.Manager) http.Handler {
 			WriteError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "platform stats not available")
 			return
 		}
-		routable, ok := stats.RoutableNodeCount(platformID)
+		routable, egressCount, ok := stats.PlatformNodePoolSnapshot(platformID)
 		if !ok {
 			WriteError(w, http.StatusNotFound, "NOT_FOUND", "platform not found")
 			return
 		}
-		egressCount, _ := stats.PlatformEgressIPCount(platformID)
 		WriteJSON(w, http.StatusOK, map[string]any{
 			"generated_at":        formatTimestamp(time.Now()),
 			"platform_id":         platformID,
