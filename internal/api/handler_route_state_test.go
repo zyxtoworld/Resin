@@ -299,3 +299,60 @@ func TestPlatformRouteStateHandlerReturnsBoundedGenerationSnapshot(t *testing.T)
 		}
 	}
 }
+
+func TestPlatformRouteStateHandlerFiltersOpaqueAccountDisplay(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "route-state-opaque-filter")
+	const rawAccount = "route-state-opaque-account"
+	now := time.Now().UnixNano()
+	if err := cp.Router.UpsertLease(model.Lease{
+		PlatformID:     platformID,
+		Account:        rawAccount,
+		NodeHash:       node.HashFromRawOptions([]byte(`{"type":"route-state-opaque-filter"}`)).Hex(),
+		EgressIP:       "198.51.100.94",
+		CreatedAtNs:    now,
+		ExpiryNs:       now + int64(time.Hour),
+		LastAccessedNs: now,
+	}); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	initial := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=1", nil, true)
+	if initial.Code != http.StatusOK {
+		t.Fatalf("initial route state status: got %d, body=%s", initial.Code, initial.Body.String())
+	}
+	initialBody := decodeJSONMap(t, initial)
+	initialLeases, ok := initialBody["leases"].(map[string]any)
+	if !ok {
+		t.Fatalf("initial leases shape: %#v", initialBody["leases"])
+	}
+	initialItems, ok := initialLeases["items"].([]any)
+	if !ok || len(initialItems) != 1 {
+		t.Fatalf("initial lease items: %#v", initialLeases["items"])
+	}
+	initialItem, ok := initialItems[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initial lease item shape: %#v", initialItems[0])
+	}
+	displayAccount, ok := initialItem["account"].(string)
+	if !ok || displayAccount == "" || displayAccount == rawAccount {
+		t.Fatalf("initial account was not safely projected: %#v", initialItem["account"])
+	}
+
+	filtered := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=1&fuzzy=true&account="+url.QueryEscape(displayAccount), nil, true)
+	if filtered.Code != http.StatusOK {
+		t.Fatalf("opaque route-state filter status: got %d, body=%s", filtered.Code, filtered.Body.String())
+	}
+	filteredBody := decodeJSONMap(t, filtered)
+	filteredLeases, ok := filteredBody["leases"].(map[string]any)
+	if !ok || filteredLeases["total"] != float64(1) {
+		t.Fatalf("opaque route-state filter total: %#v", filteredBody["leases"])
+	}
+	filteredItems, ok := filteredLeases["items"].([]any)
+	if !ok || len(filteredItems) != 1 {
+		t.Fatalf("opaque route-state filter items: %#v", filteredLeases["items"])
+	}
+	if strings.Contains(filtered.Body.String(), rawAccount) {
+		t.Fatal("opaque route-state filter response exposed the raw account")
+	}
+}

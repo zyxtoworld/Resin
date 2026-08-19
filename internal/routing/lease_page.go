@@ -44,10 +44,14 @@ type LeasePageQuery struct {
 	platformID string
 	Account    string
 	Fuzzy      bool
-	Limit      int
-	SortBy     string
-	Desc       bool
-	Cursor     string
+	// AccountMatcher is an optional in-memory matcher supplied by a caller
+	// that owns a safe projection of the raw account. It is used only for
+	// filtering; raw account values never leave the Router/service boundary.
+	AccountMatcher func(rawAccount string) bool
+	Limit          int
+	SortBy         string
+	Desc           bool
+	Cursor         string
 }
 
 type LeasePageItem struct {
@@ -229,6 +233,9 @@ func decodeLeasePageCursor(raw string, query LeasePageQuery) (LeasePageItem, uin
 }
 
 func leaseMatchesQuery(account string, query LeasePageQuery) bool {
+	if query.AccountMatcher != nil {
+		return query.AccountMatcher(account)
+	}
 	needle := strings.TrimSpace(query.Account)
 	if needle == "" {
 		return true

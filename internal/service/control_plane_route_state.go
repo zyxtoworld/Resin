@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -103,14 +104,20 @@ func (s *ControlPlaneService) GetPlatformRouteStateContext(ctx context.Context, 
 		if hook := s.afterRouteStateNodesHook; hook != nil {
 			hook()
 		}
-		leasePage, exists, err := s.Router.SnapshotLeasePageForPlatformContext(ctx, platformID, routing.LeasePageQuery{
+		leaseQuery := routing.LeasePageQuery{
 			Account: query.LeaseAccount,
 			Fuzzy:   query.LeaseFuzzy,
 			Limit:   limit,
 			Cursor:  query.LeaseCursor,
 			SortBy:  query.LeaseSortBy,
 			Desc:    query.LeaseOrder == "desc",
-		})
+		}
+		if strings.TrimSpace(query.LeaseAccount) != "" {
+			leaseQuery.AccountMatcher = func(rawAccount string) bool {
+				return matchesAccountFilter(rawAccount, projector.RedactAccount(platformID, rawAccount), query.LeaseAccount, query.LeaseFuzzy)
+			}
+		}
+		leasePage, exists, err := s.Router.SnapshotLeasePageForPlatformContext(ctx, platformID, leaseQuery)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				resultErr = err

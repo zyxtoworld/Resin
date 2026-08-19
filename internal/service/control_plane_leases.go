@@ -83,15 +83,19 @@ func (s *ControlPlaneService) projector() *observability.Projector {
 // for server-side filtering while the response itself only contains its safe
 // display projection.
 func (l LeaseResponse) MatchesAccountFilter(query string, fuzzy bool) bool {
+	return matchesAccountFilter(l.accountKey, l.Account, query, fuzzy)
+}
+
+func matchesAccountFilter(rawAccount, displayAccount, query string, fuzzy bool) bool {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return true
 	}
 	if fuzzy {
 		needle := strings.ToLower(query)
-		return strings.Contains(strings.ToLower(l.accountKey), needle) || strings.Contains(strings.ToLower(l.Account), needle)
+		return strings.Contains(strings.ToLower(rawAccount), needle) || strings.Contains(strings.ToLower(displayAccount), needle)
 	}
-	return l.accountKey == query || l.Account == query
+	return rawAccount == query || displayAccount == query
 }
 
 func (s *ControlPlaneService) resolveLeaseNodeTag(hash node.Hash) string {
