@@ -153,7 +153,15 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 		if ob != nil {
 			closeOutbound(ob)
 		}
-		entry.SetLastError("outbound build: " + err.Error())
+		// Serialize the status write with successful publication. A concurrent
+		// build may already have installed a usable outbound; that result owns
+		// the recovery state and a late failed attempt must not make the live
+		// entry look broken again.
+		m.lifecycleMu.Lock()
+		if entry.Outbound.Load() == nil {
+			entry.SetLastError("outbound build: " + err.Error())
+		}
+		m.lifecycleMu.Unlock()
 		return
 	}
 
@@ -168,16 +176,18 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 		return
 	}
 	installed := entry.InstallOutboundIfAbsent(ob)
+	if installed {
+		// Keep the recovery state update in the same lifecycle commit as the
+		// outbound publication, so a concurrent failed build cannot overwrite
+		// it after this clear.
+		entry.SetLastError("")
+	}
 	m.lifecycleMu.Unlock()
 	if !installed {
 		// Another goroutine won the race. Close the losing build result.
 		closeOutbound(ob)
 		return
 	}
-	// A later successful build is the recovery boundary for a prior
-	// node-local outbound error.
-	entry.SetLastError("")
-
 	// Retire-and-close if the node disappeared/replaced right after install.
 	if !m.isLiveEntry(hash, entry) {
 		m.trackRetirement(entry)

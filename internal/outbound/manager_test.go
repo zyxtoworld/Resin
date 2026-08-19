@@ -43,6 +43,34 @@ func (b *countingBuilder) Count() int {
 	return b.count
 }
 
+type concurrentSuccessFailureBuilder struct {
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+	allowFirst    chan struct{}
+	allowSecond   chan struct{}
+	mu            sync.Mutex
+	calls         int
+}
+
+func (b *concurrentSuccessFailureBuilder) Build(_ json.RawMessage) (adapter.Outbound, error) {
+	b.mu.Lock()
+	b.calls++
+	call := b.calls
+	b.mu.Unlock()
+	switch call {
+	case 1:
+		close(b.firstStarted)
+		<-b.allowFirst
+		return testutil.NewNoopOutbound(), nil
+	case 2:
+		close(b.secondStarted)
+		<-b.allowSecond
+		return nil, errors.New("deterministic concurrent build failure")
+	default:
+		return nil, errors.New("unexpected extra build")
+	}
+}
+
 // failBuilder always fails.
 type failBuilder struct{}
 
@@ -357,6 +385,69 @@ func TestEnsureNodeOutbound_ConcurrentIdempotent(t *testing.T) {
 	// the fast-path check simultaneously, but the final stored value
 	// is set by exactly one CAS winner.
 	t.Logf("Build called %d times (expected 1-N due to race window)", builder.Count())
+}
+
+func TestEnsureNodeOutbound_SuccessWinsConcurrentFailureWithoutLastError(t *testing.T) {
+	entry := newTestEntry(`{"type":"concurrent-success-failure"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	builder := &concurrentSuccessFailureBuilder{
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+		allowFirst:    make(chan struct{}),
+		allowSecond:   make(chan struct{}),
+	}
+	mgr := NewOutboundManager(pool, builder)
+	t.Cleanup(mgr.RetireAllOutboundsAndWait)
+	var allowFirstOnce, allowSecondOnce sync.Once
+	allowFirst := func() { allowFirstOnce.Do(func() { close(builder.allowFirst) }) }
+	allowSecond := func() { allowSecondOnce.Do(func() { close(builder.allowSecond) }) }
+	t.Cleanup(func() {
+		allowFirst()
+		allowSecond()
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		mgr.EnsureNodeOutbound(entry.Hash)
+		close(firstDone)
+	}()
+	select {
+	case <-builder.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first concurrent build did not start")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		mgr.EnsureNodeOutbound(entry.Hash)
+		close(secondDone)
+	}()
+	select {
+	case <-builder.secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second concurrent build did not start")
+	}
+
+	allowFirst()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("successful build did not publish")
+	}
+	allowSecond()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("failed concurrent build did not finish")
+	}
+
+	if !entry.HasOutbound() {
+		t.Fatal("successful build did not remain published")
+	}
+	if got := entry.GetLastError(); got != "" {
+		t.Fatalf("published outbound retained a stale concurrent build error: %q", got)
+	}
 }
 
 func TestEnsureNodeOutbound_NodeRemovedDuringBuild_DropsAndCloses(t *testing.T) {
