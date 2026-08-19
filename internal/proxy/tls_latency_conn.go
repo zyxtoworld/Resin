@@ -53,8 +53,10 @@ func (c *tlsLatencyConn) Read(b []byte) (int, error) {
 
 	n, err := c.Conn.Read(b)
 
-	// Capture first read (Server Hello) — stop timer.
-	if n > 0 && err == nil {
+	// Capture first read (Server Hello) — stop timer. A net.Conn may return
+	// useful bytes together with io.EOF or another terminal error; the bytes
+	// still prove that the server response arrived.
+	if n > 0 {
 		if atomic.CompareAndSwapUint32(&c.state, 1, 2) {
 			startNano := atomic.LoadInt64(&c.startTime)
 			if startNano > 0 {
