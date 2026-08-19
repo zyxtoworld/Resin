@@ -105,6 +105,8 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		return
 	}
 	handshakePhase.Stop()
+	replyPhase := startSocks5HandshakePhase(baseCtx, conn)
+	defer replyPhase.Stop()
 
 	lifecycle := newRequestLifecycleFromMetadata(
 		s.events,
@@ -151,6 +153,7 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 	if prepare.route.PlatformID != "" {
 		s.tunnel.router.CommitRouteForAccount(prepare.route, handshake.account)
 	}
+	replyPhase.Stop()
 
 	relay := pumpPreparedTunnel(conn, reader, prepare.session, tunnelPumpOptions{
 		ctx:                baseCtx,
