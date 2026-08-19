@@ -190,6 +190,141 @@ func TestReverseRetryRoundTripper_SuccessResponseWithoutHTTPTraceCommitsOnce(t *
 	}
 }
 
+func TestReverseRetryRoundTripper_WaitsForRequestBodyCompletionBeforeEgressCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		responseOK  bool
+		wantErr     bool
+		wantBodyLen int64
+	}{
+		{name: "successful response", responseOK: true},
+		{name: "written request response error", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			initial, err := env.router.RouteRequest("plat", "account", "https://example.com/body-completion")
+			if err != nil {
+				t.Fatalf("initial route: %v", err)
+			}
+			entry := initial.SelectedEntry()
+			if entry == nil {
+				t.Fatal("initial route did not expose selected entry")
+			}
+
+			const payload = "request-body-must-finish"
+			allowBody := make(chan struct{})
+			roundTripReturned := make(chan struct{})
+			bodyRead := make(chan int64, 1)
+			committed := make(chan int64, 1)
+
+			traceOwner := newUpstreamRequestTrace()
+			retry := &reverseRetryRoundTripper{
+				router:  env.router,
+				pool:    env.pool,
+				initial: routedOutbound{Route: initial, Entry: entry},
+				decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+					attempt := traceOwner.newAttempt()
+					return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+				},
+				transportFor: func(routedOutbound) http.RoundTripper {
+					return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+						trace := httptrace.ContextClientTrace(req.Context())
+						closeBody := &traceOnCloseBody{inner: req.Body, trace: trace}
+						req.Body = closeBody
+						go func() {
+							<-allowBody
+							body, readErr := io.ReadAll(req.Body)
+							closeErr := req.Body.Close()
+							if readErr != nil {
+								t.Errorf("request body read: %v", readErr)
+							}
+							if closeErr != nil {
+								t.Errorf("request body close: %v", closeErr)
+							}
+							bodyRead <- int64(len(body))
+						}()
+						close(roundTripReturned)
+						if tc.responseOK {
+							return &http.Response{
+								StatusCode: http.StatusOK,
+								Header:     make(http.Header),
+								Body:       io.NopCloser(strings.NewReader("ok")),
+							}, nil
+						}
+						return nil, errors.New("response read failed")
+					})
+				},
+				onAttemptEgress: func(_, bodyBytes int64) {
+					committed <- bodyBytes
+				},
+			}
+
+			result := make(chan struct {
+				resp *http.Response
+				err  error
+			}, 1)
+			go func() {
+				resp, roundTripErr := retry.RoundTrip(httptest.NewRequest(
+					http.MethodPost,
+					"https://example.com/body-completion",
+					strings.NewReader(payload),
+				))
+				result <- struct {
+					resp *http.Response
+					err  error
+				}{resp: resp, err: roundTripErr}
+			}()
+
+			select {
+			case <-roundTripReturned:
+			case <-time.After(time.Second):
+				t.Fatal("transport did not return a response/error")
+			}
+			select {
+			case got := <-committed:
+				t.Fatalf("egress committed before request body completion: body bytes=%d", got)
+			default:
+			}
+
+			close(allowBody)
+			select {
+			case got := <-bodyRead:
+				if got != int64(len(payload)) {
+					t.Fatalf("request body bytes read: got %d, want %d", got, len(payload))
+				}
+			case <-time.After(time.Second):
+				t.Fatal("request body did not finish")
+			}
+			select {
+			case got := <-committed:
+				if got != int64(len(payload)) {
+					t.Fatalf("egress body bytes: got %d, want %d", got, len(payload))
+				}
+			case <-time.After(time.Second):
+				t.Fatal("egress was not committed after request body completion")
+			}
+
+			outcome := <-result
+			if tc.wantErr {
+				if outcome.err == nil {
+					t.Fatal("RoundTrip error: got nil, want response read error")
+				}
+				if outcome.resp != nil {
+					t.Fatalf("RoundTrip response: got %#v with error", outcome.resp)
+				}
+			} else {
+				if outcome.err != nil {
+					t.Fatalf("RoundTrip: %v", outcome.err)
+				}
+				if outcome.resp == nil || outcome.resp.StatusCode != http.StatusOK {
+					t.Fatalf("RoundTrip response: %#v, want 200", outcome.resp)
+				}
+				_ = outcome.resp.Body.Close()
+			}
+		})
+	}
+}
+
 func TestReverseRetryRoundTripper_CancelAfterResponseBodyDoesNotReplay(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
@@ -225,6 +360,7 @@ func TestReverseRetryRoundTripper_CancelAfterResponseBodyDoesNotReplay(t *testin
 		transportFor: func(routedOutbound) http.RoundTripper {
 			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 				_, _ = io.ReadAll(req.Body)
+				_ = req.Body.Close()
 				calls.Add(1)
 				return &http.Response{
 					StatusCode: http.StatusBadGateway,
@@ -280,6 +416,7 @@ func TestReverseRetryRoundTripper_OversizedRequestBodyDoesNotReplay(t *testing.T
 		transportFor: func(routedOutbound) http.RoundTripper {
 			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 				_, _ = io.ReadAll(req.Body)
+				_ = req.Body.Close()
 				calls.Add(1)
 				return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: responseBody}, nil
 			})

@@ -236,12 +236,14 @@ const responseRuleRetryBodyLimit = 8 << 20
 // consumes it. A retry is allowed only when the entire body was read without
 // an error and stayed within the bounded memory limit.
 type replayBodyCapture struct {
-	src      io.ReadCloser
-	data     bytes.Buffer
-	limit    int
-	overflow bool
-	complete bool
-	failed   bool
+	src       io.ReadCloser
+	data      bytes.Buffer
+	limit     int
+	mu        sync.Mutex
+	abandoned bool
+	overflow  bool
+	complete  bool
+	failed    bool
 }
 
 func newReplayBodyCapture(src io.ReadCloser) *replayBodyCapture {
@@ -249,7 +251,21 @@ func newReplayBodyCapture(src io.ReadCloser) *replayBodyCapture {
 }
 
 func (c *replayBodyCapture) Read(p []byte) (int, error) {
+	if c == nil || c.src == nil {
+		return 0, io.EOF
+	}
+	c.mu.Lock()
+	if c.abandoned {
+		c.mu.Unlock()
+		return 0, io.EOF
+	}
+	c.mu.Unlock()
 	n, err := c.src.Read(p)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.abandoned {
+		return n, err
+	}
 	if n > 0 && !c.overflow {
 		remaining := c.limit - c.data.Len()
 		if n > remaining {
@@ -278,12 +294,33 @@ func (c *replayBodyCapture) Close() error {
 	return c.src.Close()
 }
 
+func (c *replayBodyCapture) abandon() {
+	if c != nil {
+		c.mu.Lock()
+		c.abandoned = true
+		c.mu.Unlock()
+	}
+}
+
 func (c *replayBodyCapture) Replayable() bool {
-	return c != nil && c.complete && !c.failed && !c.overflow
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.abandoned {
+		return false
+	}
+	return c.complete && !c.failed && !c.overflow
 }
 
 func (c *replayBodyCapture) Bytes() []byte {
 	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.abandoned {
 		return nil
 	}
 	return append([]byte(nil), c.data.Bytes()...)
@@ -340,6 +377,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var routeEntry *node.NodeEntry
 	var hasRoute bool
 	var resp *http.Response
+	var roundTripErr error
 	retryBudget := 1
 	attemptedIPs := make(map[string]struct{})
 	attemptedEntries := make(map[*node.NodeEntry]struct{})
@@ -398,21 +436,20 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamAttemptTrace.clientTrace()))
 		pendingEgressHeaderBytes := headerWireLen(outReq.Header)
-		var egressBodyCounter *countingReadCloser
-		if outReq.Body != nil && outReq.Body != http.NoBody {
-			egressBodyCounter = newCountingReadCloser(outReq.Body)
-			outReq.Body = egressBodyCounter
-		}
 
 		// Forward the request. A response-rule retry is considered only before
 		// any response bytes are written to the downstream client.
-		var roundTripErr error
-		resp, roundTripErr = transport.RoundTrip(outReq)
-		if upstreamAttemptTrace.commitEgress(resp != nil && roundTripErr == nil, roundTripErr) {
+		var bodyBytes int64
+		var bodyComplete bool
+		resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
+			r.Context(), transport, outReq,
+		)
+		if !bodyComplete {
+			resp = nil
+		}
+		if bodyComplete && upstreamAttemptTrace.commitEgress(resp != nil && roundTripErr == nil, roundTripErr) {
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
-			if egressBodyCounter != nil {
-				lifecycle.addEgressBytes(egressBodyCounter.Total())
-			}
+			lifecycle.addEgressBytes(bodyBytes)
 		}
 		if roundTripErr != nil {
 			proxyErr := classifyUpstreamError(roundTripErr)

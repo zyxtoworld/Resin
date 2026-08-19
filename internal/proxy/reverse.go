@@ -287,8 +287,6 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lifecycle := newRequestLifecycle(p.events, r, ProxyTypeReverse, false)
 	lifecycle.setTarget(parsed.Host, "")
 	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
-	var pendingEgressHeaderBytes int64
-	var egressBodyCounter *countingReadCloser
 	var ingressBodyCounter *countingReadCloser
 	var upgradedStreamCounter *countingReadWriteCloser
 	if detailCfg.Enabled {
@@ -302,8 +300,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body = reqBodyCapture
 			lifecycle.setReqBodyCapture(reqBodyCapture)
 		}
-		egressBodyCounter = newCountingReadCloser(body)
-		r.Body = egressBodyCounter
+		r.Body = body
 	}
 	defer lifecycle.finish()
 
@@ -321,6 +318,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var transport http.RoundTripper
 	var retryTransport *reverseRetryRoundTripper
 	var directAttemptTrace *upstreamRequestAttemptTrace
+	var directBodyState *attemptRoundTripState
 	var directResponseReceived bool
 	var directRoundTripErr error
 	domain := netutil.ExtractDomain(parsed.Host)
@@ -379,6 +377,8 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
+		directBodyState = &attemptRoundTripState{}
+		transport = bodyCompletionRoundTripper{next: transport, state: directBodyState}
 	} else {
 		transport = p.outboundHTTPTransport(routed)
 		retryTransport = &reverseRetryRoundTripper{
@@ -409,8 +409,6 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.URL = target
 			req.Host = parsed.Host
 			stripForwardingIdentityHeaders(req.Header)
-			pendingEgressHeaderBytes = headerWireLen(req.Header)
-
 			reqCtx := req.Context()
 			if retryTransport == nil {
 				// Retry transport owns per-attempt tracing. Bypass/direct requests
@@ -511,11 +509,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, r)
-	if retryTransport == nil && directAttemptTrace != nil && directAttemptTrace.commitEgress(directResponseReceived, directRoundTripErr) {
-		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
-		if egressBodyCounter != nil {
-			lifecycle.addEgressBytes(egressBodyCounter.Total())
-		}
+	if retryTransport == nil && directAttemptTrace != nil && directBodyState != nil &&
+		directBodyState.complete && directAttemptTrace.commitEgress(directResponseReceived, directRoundTripErr) {
+		lifecycle.addEgressBytes(directBodyState.headerBytes)
+		lifecycle.addEgressBytes(directBodyState.bodyBytes)
 	}
 	if ingressBodyCounter != nil {
 		lifecycle.addIngressBytes(ingressBodyCounter.Total())

@@ -61,17 +61,14 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			outReq, attemptTrace = t.decorateAttempt(outReq, current)
 		}
 		pendingHeaderBytes := headerWireLen(outReq.Header)
-		var bodyCounter *countingReadCloser
-		if outReq.Body != nil && outReq.Body != http.NoBody {
-			bodyCounter = newCountingReadCloser(outReq.Body)
-			outReq.Body = bodyCounter
+		resp, err, bodyBytes, bodyComplete := roundTripWithBodyCompletion(
+			req.Context(), t.transportFor(current), outReq,
+		)
+		if !bodyComplete {
+			t.promotable = false
+			return nil, err
 		}
-		resp, err := t.transportFor(current).RoundTrip(outReq)
 		if attemptTrace != nil && attemptTrace.commitEgress(resp != nil && err == nil, err) && t.onAttemptEgress != nil {
-			bodyBytes := int64(0)
-			if bodyCounter != nil {
-				bodyBytes = bodyCounter.Total()
-			}
 			t.onAttemptEgress(pendingHeaderBytes, bodyBytes)
 		}
 		if err != nil {

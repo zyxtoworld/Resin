@@ -70,9 +70,11 @@ func newRequestLifecycle(
 
 func (l *requestLifecycle) finish() {
 	if l.reqBodyCapture != nil {
-		l.log.ReqBody = l.reqBodyCapture.Payload()
-		l.log.ReqBodyLen = l.reqBodyCapture.TotalLen()
-		l.log.ReqBodyTruncated = l.reqBodyCapture.Truncated()
+		if payload, totalLen, truncated, ok := l.reqBodyCapture.Snapshot(); ok {
+			l.log.ReqBody = payload
+			l.log.ReqBodyLen = totalLen
+			l.log.ReqBodyTruncated = truncated
+		}
 	}
 	if l.respBodyCapture != nil {
 		l.log.RespBody = l.respBodyCapture.Payload()
