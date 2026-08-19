@@ -710,6 +710,7 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 	var continuations shutdownContinuations
 	var topologyReady <-chan struct{}
 	var topologySinksReady <-chan struct{}
+	var healthReady <-chan struct{}
 	if err, continuation := closeEndpointForShutdown(ctx, a.endpointManager); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 		if continuation != nil {
@@ -729,8 +730,15 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		log.Println("Outbound transport pool closed")
 	}
 	if a.healthWriteOwner != nil {
-		a.healthWriteOwner.CloseAndWait()
-		log.Println("Proxy health writes stopped")
+		if err, continuation := closeHealthWriteOwnerForShutdown(ctx, a.healthWriteOwner); err != nil {
+			log.Printf("Proxy health shutdown error: %v", err)
+			if continuation != nil {
+				continuations.health, healthReady = trackShutdownContinuation(continuation)
+				log.Println("Proxy health writes continue in shutdown owner")
+			}
+		} else {
+			log.Println("Proxy health writes stopped")
+		}
 	}
 
 	// Stop internal event sources before the normal sink shutdown. Callbacks that
@@ -767,13 +775,13 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 	// Keep dirty admission open until that owner has delivered its callback; the
 	// cache stop owner is the later barrier that rejects genuinely late writes.
 	var dirtyAdmission dirtyWriteAdmissionWaiter
-	if topologyReady == nil {
+	if topologyReady == nil && healthReady == nil {
 		dirtyAdmission = a.flushWorker
 	}
 	drainStateEngine := a.stateEngine
-	if topologyReady != nil {
+	if topologyReady != nil || healthReady != nil {
 		// A lease callback may still be inside the real state/metrics wiring. Its
-		// topology continuation is the owner that must close those sinks.
+		// topology/health continuation is the owner that must close those sinks.
 		drainStateEngine = nil
 	}
 	httpDrainErr := drainHTTPHandlersBeforePersistence(ctx, a.endpointManager, dirtyAdmission, drainStateEngine)
@@ -822,7 +830,7 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		return true, nil
 	}
 	stateWritesDrained := a.stateEngine == nil
-	if topologyReady == nil {
+	if topologyReady == nil && healthReady == nil {
 		stateWritesDrained, _ = closeStateWrites(ctx)
 	} else {
 		// Router's synchronous lease callback is a dependency of both state and
@@ -830,7 +838,12 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		// shutdown cannot close either sink while that callback is still running.
 		topologySinks := make(chan error, 1)
 		go func() {
-			<-topologyReady
+			if topologyReady != nil {
+				<-topologyReady
+			}
+			if healthReady != nil {
+				<-healthReady
+			}
 			var errs []error
 			if a.endpointManager != nil {
 				if err := a.endpointManager.WaitForHTTPHandlers(context.Background()); err != nil {
@@ -943,7 +956,7 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 		log.Println("Request log repo closed")
 	}
 
-	if topologyReady == nil {
+	if topologyReady == nil && healthReady == nil {
 		if a.metricsManager != nil {
 			err, continuation := closeMetricsManagerForShutdown(ctx, a.metricsManager)
 			if err != nil {
@@ -965,14 +978,16 @@ func (a *resinApp) shutdown(ctx context.Context) shutdownContinuations {
 	// immediately on the normal path, or after its continuation owner retires
 	// admitted builds/leases on a caller timeout.
 
-	if topologyReady != nil {
+	if topologyReady != nil || healthReady != nil {
 		continuation := make(chan error, 1)
 		continuations.cacheFlush = continuation
 		go func() {
 			if topologySinksReady != nil {
 				<-topologySinksReady
-			} else {
+			} else if topologyReady != nil {
 				<-topologyReady
+			} else if healthReady != nil {
+				<-healthReady
 			}
 			cacheErr, ownerContinuation := closeCacheFlushWorkerForShutdown(context.Background(), a.flushWorker)
 			if ownerContinuation != nil {
@@ -1126,6 +1141,7 @@ type shutdownContinuations struct {
 	endpoint      <-chan error
 	directProxy   <-chan error
 	geoIP         <-chan error
+	health        <-chan error
 	topology      <-chan error
 	topologySinks <-chan error
 	outbound      <-chan error
@@ -1139,7 +1155,7 @@ type shutdownContinuations struct {
 // joined so the process cannot return and kill tracked goroutines.
 func (c shutdownContinuations) wait() error {
 	var errs []error
-	for _, continuation := range []<-chan error{c.endpoint, c.directProxy, c.geoIP, c.topology, c.topologySinks, c.outbound, c.cacheFlush, c.requestLog, c.metrics} {
+	for _, continuation := range []<-chan error{c.endpoint, c.directProxy, c.geoIP, c.health, c.topology, c.topologySinks, c.outbound, c.cacheFlush, c.requestLog, c.metrics} {
 		if continuation == nil {
 			continue
 		}
@@ -1191,6 +1207,37 @@ func closeGeoIPForShutdown(ctx context.Context, service *geoip.Service) (error, 
 		continuation <- service.StopContext(context.Background())
 	}()
 	return err, continuation
+}
+
+// closeHealthWriteOwnerForShutdown closes health-write admission in one owner.
+// The caller's context only bounds its wait; an already-admitted write may
+// still be inside platform filtering and must finish before state/metrics
+// sinks close.
+func closeHealthWriteOwnerForShutdown(
+	ctx context.Context,
+	owner *proxy.HealthWriteOwner,
+) (error, <-chan error) {
+	if owner == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan error, 1)
+	go func() {
+		owner.CloseAndWait()
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		return err, nil
+	case <-ctx.Done():
+		continuation := make(chan error, 1)
+		go func() {
+			continuation <- <-done
+		}()
+		return ctx.Err(), continuation
+	}
 }
 
 // closeOutboundForShutdown keeps builder ownership with the outbound
