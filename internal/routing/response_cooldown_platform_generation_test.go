@@ -122,6 +122,94 @@ func TestRouter_LateResponseAfterRealPlatformReplaceCannotCoolNewGeneration(t *t
 	}
 }
 
+func TestQuarantineRouteRejectsChangedEgressIPBeforeCooldown(t *testing.T) {
+	subManager := topology.NewSubscriptionManager()
+	sub := subscription.NewSubscription(
+		"quarantine-egress-generation-sub",
+		"Quarantine Egress Generation",
+		"https://example.invalid/subscription",
+		true,
+		false,
+	)
+	subManager.Register(sub)
+	p := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subManager.Lookup,
+		GeoLookup:              func(netip.Addr) string { return "us" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	plat := platform.NewPlatform("quarantine-egress-generation", "Quarantine Egress Generation", nil, nil)
+
+	const raw = `{"id":"quarantine-egress-generation"}`
+	rawOptions := json.RawMessage(raw)
+	hash := node.HashFromRawOptions(rawOptions)
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{})
+	p.AddNodeFromSub(hash, rawOptions, sub.ID)
+	entry, ok := p.GetEntry(hash)
+	if !ok || entry == nil {
+		t.Fatal("setup: node entry was not added")
+	}
+	entry.CircuitOpenSince.Store(0)
+	entry.SetEgressIP(netip.MustParseAddr("198.51.100.250"))
+	entry.LatencyTable.Update("example.com", 50*time.Millisecond, time.Minute)
+	noop := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&noop)
+	if err := p.RegisterPlatform(plat); err != nil {
+		t.Fatalf("RegisterPlatform: %v", err)
+	}
+
+	router := newTestRouter(p, nil)
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	router.clock = func() time.Time { return now }
+	route, err := router.RouteRequest(plat.Name, "account", "https://example.com")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	oldIP := route.EgressIP
+	newIP := netip.MustParseAddr("198.51.100.251")
+
+	checked := make(chan struct{})
+	allowMark := make(chan struct{})
+	router.beforeResponseCooldownMarkHook = func() {
+		close(checked)
+		<-allowMark
+	}
+	defer func() { router.beforeResponseCooldownMarkHook = nil }()
+
+	quarantineDone := make(chan struct{})
+	go func() {
+		router.QuarantineRoute(route, platform.ResponseRuleScopeEgressIP, now.Add(time.Minute))
+		close(quarantineDone)
+	}()
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		close(allowMark)
+		t.Fatal("quarantine did not reach the post-check barrier")
+	}
+
+	if !p.UpdateNodeEgressIPForEntry(hash, entry, &newIP, nil) {
+		t.Fatal("production egress update rejected the current entry")
+	}
+	close(allowMark)
+	select {
+	case <-quarantineDone:
+	case <-time.After(time.Second):
+		t.Fatal("quarantine did not finish after egress replacement")
+	}
+
+	cooldowns := router.ensurePlatformState(plat.ID).ResponseCooldowns
+	if cooldowns.IsCoolingForEntry(hash, entry, oldIP, now) {
+		t.Fatalf("stale response cooled obsolete egress IP %s", oldIP)
+	}
+	if cooldowns.IsCoolingForEntry(hash, entry, newIP, now) {
+		t.Fatalf("stale response cooled replacement egress IP %s", newIP)
+	}
+	if snapshot := cooldowns.Snapshot(now); len(snapshot) != 0 {
+		t.Fatalf("stale response published a cooldown snapshot: %#v", snapshot)
+	}
+}
+
 func TestCommitRouteForAccount_RejectsPlatformReplacementBetweenValidationAndLeaseWrite(t *testing.T) {
 	subManager := topology.NewSubscriptionManager()
 	sub := subscription.NewSubscription(

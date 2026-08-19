@@ -1198,6 +1198,9 @@ func (r *Router) QuarantineRoute(route RouteResult, scope platform.ResponseRuleS
 		hook()
 	}
 	mark := func() {
+		if route.selectedEntry.GetEgressIP() != route.EgressIP {
+			return
+		}
 		r.responseCooldowns(route.PlatformID).markForEntry(scope, route.NodeHash, route.selectedEntry, route.EgressIP, until, r.now())
 	}
 	markCurrentEntry := func() {

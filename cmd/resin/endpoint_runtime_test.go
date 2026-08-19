@@ -718,6 +718,84 @@ func TestEndpointRuntimeManager_FatalOldRuntimeReleasesPortBeforePendingCommit(t
 	}
 }
 
+func TestEndpointRuntimeManager_LateRetiredDefaultErrorDoesNotSignalProcessFailure(t *testing.T) {
+	ports := reserveTestPorts(t, 2)
+	manager := newEndpointRuntimeManager("127.0.0.1", "", nil, nil, nil, nil, nil, nil)
+	endpoint := model.Endpoint{ID: service.DefaultEndpointID, Port: ports[0], Enabled: true}
+	initial, err := manager.PrepareEndpoint(endpoint)
+	if err != nil {
+		t.Fatalf("prepare initial endpoint: %v", err)
+	}
+	initial.Commit()
+	old := manager.runtimes[endpoint.ID]
+	if old == nil {
+		t.Fatal("initial runtime was not published")
+	}
+
+	gated := &gatedCloseListener{
+		Listener: old.listener,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	old.listener = gated
+
+	replacement := endpoint
+	replacement.Port = ports[1]
+	stage, err := manager.PrepareEndpoint(replacement)
+	if err != nil {
+		t.Fatalf("prepare replacement endpoint: %v", err)
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gated.release) }) }
+	t.Cleanup(func() {
+		release()
+		stage.Abort()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = manager.Shutdown(ctx)
+	})
+
+	commitDone := make(chan struct{})
+	go func() {
+		stage.Commit()
+		close(commitDone)
+	}()
+	select {
+	case <-gated.entered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not reach old listener retirement")
+	}
+	manager.mu.Lock()
+	current := manager.runtimes[endpoint.ID]
+	manager.mu.Unlock()
+	if current == nil || current == old || current.current().Port != replacement.Port {
+		t.Fatalf("replacement was not published before old retirement: %+v", current)
+	}
+
+	errorDone := make(chan struct{})
+	go func() {
+		manager.handleRuntimeError(old, errors.New("late retired listener failure"))
+		close(errorDone)
+	}()
+	release()
+	select {
+	case <-commitDone:
+	case <-time.After(time.Second):
+		t.Fatal("replacement commit did not finish after listener release")
+	}
+	select {
+	case <-errorDone:
+	case <-time.After(time.Second):
+		t.Fatal("late retired runtime error did not finish")
+	}
+
+	select {
+	case err := <-manager.serverErrCh:
+		t.Fatalf("late retired runtime signaled process failure: %v", err)
+	default:
+	}
+}
+
 func TestEndpointRuntimeManager_FatalRuntimeWithConfigStageClosesActiveConnections(t *testing.T) {
 	port := reserveTestPorts(t, 1)[0]
 	manager := newEndpointRuntimeManager("127.0.0.1", "", nil, nil, nil, nil, nil, nil)

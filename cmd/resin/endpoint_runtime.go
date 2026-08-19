@@ -468,7 +468,8 @@ func (m *endpointRuntimeManager) handleRuntimeError(runtime *managedEndpointRunt
 	endpoint := runtime.current()
 	m.mu.Lock()
 	m.registerRuntimeRetirementLocked(runtime, asyncRuntimeRetirement(runtime))
-	if m.runtimes[endpoint.ID] == runtime {
+	isCurrent := m.runtimes[endpoint.ID] == runtime
+	if isCurrent {
 		delete(m.runtimes, endpoint.ID)
 		m.statuses[endpoint.ID] = service.EndpointRuntimeStatus{State: "error", LastError: err.Error()}
 	}
@@ -479,7 +480,7 @@ func (m *endpointRuntimeManager) handleRuntimeError(runtime *managedEndpointRunt
 	// it synchronously after leaving manager.mu so a fatal runtime cannot keep
 	// the old port occupied while its worker drains.
 	runtime.closeListener()
-	if !stopping && endpoint.ID == service.DefaultEndpointID {
+	if !stopping && isCurrent && endpoint.ID == service.DefaultEndpointID {
 		select {
 		case m.serverErrCh <- fmt.Errorf("default endpoint: %w", err):
 		default:
