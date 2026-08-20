@@ -237,8 +237,11 @@ func (r *RetryDownloader) attemptBudget(ctx context.Context, slots int) time.Dur
 		return 0
 	}
 	budget := remaining / time.Duration(slots)
-	if r.AttemptTimeoutCap > 0 && budget > r.AttemptTimeoutCap {
-		budget = r.AttemptTimeoutCap
+	if r.AttemptTimeoutCap > 0 {
+		budget = remaining
+		if budget > r.AttemptTimeoutCap {
+			budget = r.AttemptTimeoutCap
+		}
 	}
 	return budget
 }

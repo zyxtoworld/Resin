@@ -215,10 +215,11 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 	// NodePicker/ProxyFetch are nil initially; set after Pool + OutboundManager creation.
 	direct := newDirectDownloader(a.envCfg)
 	retryDL := &netutil.RetryDownloader{
-		Direct:           direct,
-		TotalTimeout:     a.envCfg.ResourceFetchTimeout,
-		MaxProxyAttempts: 4,
-		PlatformID:       platform.DefaultPlatformID,
+		Direct:            direct,
+		TotalTimeout:      a.envCfg.ResourceFetchTimeout,
+		AttemptTimeoutCap: a.envCfg.ResourceFetchTimeout / 2,
+		MaxProxyAttempts:  4,
+		PlatformID:        platform.DefaultPlatformID,
 		AttemptObserver: func(event netutil.AttemptEvent) {
 			log.Printf(
 				"resource_attempt request_id=%d platform_id=%s attempt=%d kind=%s node_id=%s phase=%s elapsed_ms=%d result=%s",

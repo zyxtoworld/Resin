@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -404,6 +405,87 @@ func TestRetryDownloader_AttemptTimeoutCapStillApplies(t *testing.T) {
 	}
 	if pickerCalls != 2 || proxyCalls != 2 {
 		t.Fatalf("expected two timed attempts, got picker=%d proxy=%d", pickerCalls, proxyCalls)
+	}
+}
+
+func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testing.T) {
+	const (
+		totalBudget = 120 * time.Millisecond
+		attemptCap  = 60 * time.Millisecond
+	)
+
+	selection := NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"delayed-status-node"}`))}
+	directEntered := make(chan time.Duration, 1)
+	releaseDirect := make(chan struct{})
+	var directReturnedStatus atomic.Bool
+
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(ctx context.Context, _ string) ([]byte, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return nil, errors.New("direct attempt has no deadline")
+			}
+			remaining := time.Until(deadline)
+			directEntered <- remaining
+			if remaining < 45*time.Millisecond {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			<-releaseDirect
+			directReturnedStatus.Store(true)
+			return nil, &HTTPStatusError{StatusCode: 500, URL: "https://example.com"}
+		}),
+		TotalTimeout:      totalBudget,
+		AttemptTimeoutCap: attemptCap,
+		MaxProxyAttempts:  3,
+		NodePicker: func(context.Context, string, []NodeSelection) (NodeSelection, error) {
+			if !directReturnedStatus.Load() {
+				return NodeSelection{}, errors.New("direct response did not reach retryable status")
+			}
+			return selection, nil
+		},
+		ProxyFetch: func(context.Context, NodeSelection, string) ([]byte, error) {
+			return []byte("proxy-after-delayed-status"), nil
+		},
+	}
+
+	result := make(chan struct {
+		body []byte
+		err  error
+	}, 1)
+	go func() {
+		body, err := r.Download(context.Background(), "https://example.com")
+		result <- struct {
+			body []byte
+			err  error
+		}{body: body, err: err}
+	}()
+
+	select {
+	case remaining := <-directEntered:
+		if remaining < 45*time.Millisecond {
+			select {
+			case got := <-result:
+				t.Fatalf("direct budget was pre-divided before retryable response: err=%v body=%q", got.err, got.body)
+			case <-time.After(time.Second):
+				t.Fatal("old direct attempt did not finish within watchdog")
+			}
+		}
+		close(releaseDirect)
+	case <-time.After(time.Second):
+		t.Fatal("direct attempt did not start")
+	}
+
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("download failed after delayed retryable response: %v", got.err)
+		}
+		if string(got.body) != "proxy-after-delayed-status" {
+			t.Fatalf("body = %q, want proxy-after-delayed-status", got.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download did not finish within watchdog")
 	}
 }
 
