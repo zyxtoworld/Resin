@@ -614,6 +614,14 @@ func (r *MetricsRepo) queryAccessLatency(ctx context.Context, from, to int64, pl
 		if err := json.Unmarshal([]byte(row.BucketsJSON), &buckets); err != nil {
 			return nil, fmt.Errorf("metrics repo decode access latency bucket: %w", err)
 		}
+		if buckets == nil {
+			return nil, fmt.Errorf("metrics repo decode access latency bucket: expected JSON array")
+		}
+		for _, bucket := range buckets {
+			if bucket < 0 {
+				return nil, fmt.Errorf("metrics repo decode access latency bucket: negative count %d", bucket)
+			}
+		}
 		result = append(result, row)
 	}
 	return result, rows.Err()
