@@ -5,6 +5,12 @@ sing-box-reference
 .devcontainer
 start-instance.sh
 
+# Codex/task-local plans and package-manager gate byproducts
+superpowers/
+docs/plans/
+webui/pnpm-lock.yaml
+webui/pnpm-workspace.yaml
+
 # Claude Code / OMC tooling and local runtime data
 .claude/
 .omc/
