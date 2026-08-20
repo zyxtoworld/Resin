@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/proxy"
+	"github.com/Resinat/Resin/internal/syncutil"
 )
 
 // RuntimeStatsProvider supplies node-pool/platform/lease/latency stats from
@@ -78,7 +79,7 @@ type Manager struct {
 	// historyBucketMu linearizes a history query's SQLite read with bucket
 	// rotation and persistence. Readers hold it across the database query and
 	// current-bucket merge; bucket mutation/flush paths take the write side.
-	historyBucketMu sync.RWMutex
+	historyBucketMu syncutil.RWMutex
 
 	// Lease lifetime samples are queued from routing hot-path and drained by
 	// bucket loop to avoid lock contention in synchronous route handling.

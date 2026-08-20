@@ -610,6 +610,10 @@ func (r *MetricsRepo) queryAccessLatency(ctx context.Context, from, to int64, pl
 		if pid.Valid {
 			row.PlatformID = pid.String
 		}
+		var buckets []int64
+		if err := json.Unmarshal([]byte(row.BucketsJSON), &buckets); err != nil {
+			return nil, fmt.Errorf("metrics repo decode access latency bucket: %w", err)
+		}
 		result = append(result, row)
 	}
 	return result, rows.Err()

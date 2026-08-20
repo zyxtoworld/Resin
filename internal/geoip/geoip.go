@@ -20,6 +20,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/syncutil"
 )
 
 // GeoReader abstracts the GeoIP database reader (e.g., maxminddb reader).
@@ -151,7 +152,7 @@ type Service struct {
 	downloader       netutil.Downloader
 	cron             *cron.Cron
 	cronEntryID      cron.EntryID
-	updateMu         sync.Mutex // serializes UpdateNow calls
+	updateMu         syncutil.Mutex // serializes UpdateNow calls
 	updateStateMu    sync.Mutex
 	activeUpdateDone chan struct{}
 	startMu          sync.Mutex // serializes Start calls
@@ -527,14 +528,16 @@ func (s *Service) UpdateNowContext(parent context.Context) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	s.updateMu.Lock()
+	ctx, releaseContext := s.contextWithLifetime(parent)
+	defer releaseContext()
+	if err := s.updateMu.LockContext(ctx); err != nil {
+		return err
+	}
 	updateDone := s.beginUpdate()
 	defer func() {
 		s.endUpdate(updateDone)
 		s.updateMu.Unlock()
 	}()
-	ctx, releaseContext := s.contextWithLifetime(parent)
-	defer releaseContext()
 
 	if s.isStopped() {
 		return context.Canceled

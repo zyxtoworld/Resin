@@ -12,7 +12,9 @@ func (m *Manager) prepareHistoryRead(ctx context.Context, now time.Time) error {
 	if hook := m.beforeHistoryPrepareHook; hook != nil {
 		hook()
 	}
-	m.historyBucketMu.Lock()
+	if err := m.historyBucketMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer m.historyBucketMu.Unlock()
 	return m.prepareHistoryReadNoBucketLock(ctx, now)
 }
@@ -68,7 +70,9 @@ func (m *Manager) queryHistoryTrafficAtContext(ctx context.Context, fromUnix, to
 	if err := m.prepareHistoryRead(ctx, now); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryTraffic(ctx, fromUnix, toUnix)
 	if err != nil {
@@ -114,7 +118,9 @@ func (m *Manager) QueryHistoryRequestsContext(ctx context.Context, fromUnix, toU
 	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryRequests(ctx, fromUnix, toUnix, platformID)
 	if err != nil {
@@ -164,7 +170,9 @@ func (m *Manager) QueryHistoryAccessLatencyContext(ctx context.Context, fromUnix
 	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryAccessLatency(ctx, fromUnix, toUnix, platformID)
 	if err != nil {
@@ -212,7 +220,9 @@ func (m *Manager) QueryHistoryProbesContext(ctx context.Context, fromUnix, toUni
 	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryProbes(ctx, fromUnix, toUnix)
 	if err != nil {
@@ -256,7 +266,9 @@ func (m *Manager) QueryHistoryNodePoolContext(ctx context.Context, fromUnix, toU
 	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryNodePool(ctx, fromUnix, toUnix)
 	if err != nil {
@@ -306,7 +318,9 @@ func (m *Manager) QueryHistoryLeaseLifetimeContext(ctx context.Context, fromUnix
 	if err := m.prepareHistoryRead(ctx, time.Now()); err != nil {
 		return nil, err
 	}
-	m.historyBucketMu.RLock()
+	if err := m.historyBucketMu.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer m.historyBucketMu.RUnlock()
 	rows, err := m.repo.queryLeaseLifetime(ctx, fromUnix, toUnix, platformID)
 	if err != nil {

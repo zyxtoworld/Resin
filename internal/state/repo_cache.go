@@ -394,9 +394,10 @@ func (r *CacheRepo) flushTx(ctx context.Context, ops FlushOps, interruptible boo
 		ctx = context.Background()
 	}
 	var (
-		tx   *sql.Tx
-		conn *sql.Conn
-		err  error
+		tx          *sql.Tx
+		conn        *sql.Conn
+		err         error
+		discardConn bool
 	)
 	if interruptible {
 		conn, err = r.db.Conn(ctx)
@@ -420,10 +421,11 @@ func (r *CacheRepo) flushTx(ctx context.Context, ops FlushOps, interruptible boo
 			if hook := r.beforeContextConnResetHook; hook != nil {
 				hook(conn)
 			}
-			if ctx.Err() != nil {
+			if discardConn || ctx.Err() != nil {
 				// A canceled transaction can still be blocked by the same
-				// SQLite writer lock. Skip the non-cancelable reset and discard
-				// this connection instead of returning it to the pool.
+				// SQLite writer lock. A failed rollback or commit also leaves
+				// transaction state unknown. Discard the exact connection instead
+				// of returning it to the pool in either case.
 				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			} else if !resetSQLiteBusyTimeout(conn) {
 				// Returning driver.ErrBadConn from Raw makes database/sql discard
@@ -449,7 +451,9 @@ func (r *CacheRepo) flushTx(ctx context.Context, ops FlushOps, interruptible boo
 		// context watcher. Calling Rollback here can itself wait on the same
 		// SQLite lock that caused cancellation, defeating the deadline.
 		if rollback && !committed {
-			_ = tx.Rollback()
+			if err := tx.Rollback(); err != nil {
+				discardConn = true
+			}
 		}
 	}()
 
@@ -532,6 +536,7 @@ func (r *CacheRepo) flushTx(ctx context.Context, ops FlushOps, interruptible boo
 	}
 
 	if err := tx.Commit(); err != nil {
+		discardConn = true
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			rollback = false
 		}
