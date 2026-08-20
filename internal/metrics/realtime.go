@@ -56,11 +56,10 @@ func (r *RealtimeRing) Query(from, to time.Time) []RealtimeSample {
 	for i := 0; i < r.count; i++ {
 		idx := (r.head - 1 - i + r.cap) % r.cap
 		s := r.samples[idx]
-		if s.Timestamp.Before(from) {
-			break // ring is chronologically ordered; stop early
-		}
 		if !s.Timestamp.After(to) {
-			result = append(result, s)
+			if !s.Timestamp.Before(from) {
+				result = append(result, s)
+			}
 		}
 	}
 	return result

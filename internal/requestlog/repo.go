@@ -350,9 +350,10 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 	}
 
 	var (
-		tx   *sql.Tx
-		conn *sql.Conn
-		err  error
+		tx          *sql.Tx
+		conn        *sql.Conn
+		err         error
+		discardConn bool
 	)
 	if interruptible {
 		conn, err = r.activeDB.Conn(ctx)
@@ -376,10 +377,11 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 			if hook := r.beforeContextConnResetHook; hook != nil {
 				hook(conn)
 			}
-			if ctx.Err() != nil {
+			if discardConn || ctx.Err() != nil {
 				// A canceled transaction may still be blocked by the same
-				// SQLite writer lock. Do not run a background PRAGMA while
-				// returning this connection; discard it instead.
+				// SQLite writer lock. A failed rollback or commit likewise
+				// leaves its transaction state unknown. Do not return either
+				// connection to the idle pool.
 				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			} else if !resetSQLiteBusyTimeout(conn) {
 				// Returning driver.ErrBadConn from Raw makes database/sql discard
@@ -408,7 +410,9 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 	committed := false
 	defer func() {
 		if rollback && !committed {
-			_ = tx.Rollback()
+			if err := tx.Rollback(); err != nil {
+				discardConn = true
+			}
 		}
 	}()
 
@@ -498,6 +502,7 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 	}
 
 	if err := tx.Commit(); err != nil {
+		discardConn = true
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			rollback = false
 		}
