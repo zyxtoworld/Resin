@@ -365,6 +365,45 @@ func TestRetryDownloader_AttemptTimeoutLeavesCallerBudgetForProxy(t *testing.T) 
 	}
 }
 
+func TestRetryDownloader_AttemptTimeoutWithoutCapReservesProxyBudget(t *testing.T) {
+	var pickerCalls, proxyCalls int
+	selection := NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node-no-cap"}`))}
+
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(ctx context.Context, _ string) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}),
+		TotalTimeout:     200 * time.Millisecond,
+		MaxProxyAttempts: 3,
+		NodePicker: func(_ context.Context, _ string, _ []NodeSelection) (NodeSelection, error) {
+			pickerCalls++
+			if selection.Hash == node.Zero {
+				t.Fatal("retry candidate hash is zero")
+			}
+			return selection, nil
+		},
+		ProxyFetch: func(ctx context.Context, _ NodeSelection, _ string) ([]byte, error) {
+			proxyCalls++
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return []byte("via-proxy"), nil
+		},
+	}
+
+	body, err := r.Download(context.Background(), "https://example.com")
+	if err != nil {
+		t.Fatalf("expected proxy retry with uncapped attempts, got %v", err)
+	}
+	if string(body) != "via-proxy" {
+		t.Fatalf("body = %q, want proxy response", body)
+	}
+	if pickerCalls != 1 || proxyCalls != 1 {
+		t.Fatalf("expected one proxy retry, got picker=%d proxy=%d", pickerCalls, proxyCalls)
+	}
+}
+
 func TestRetryDownloader_AttemptTimeoutCapStillApplies(t *testing.T) {
 	var pickerCalls, proxyCalls int
 
@@ -410,13 +449,14 @@ func TestRetryDownloader_AttemptTimeoutCapStillApplies(t *testing.T) {
 
 func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testing.T) {
 	const (
-		totalBudget = 120 * time.Millisecond
-		attemptCap  = 60 * time.Millisecond
+		totalBudget  = 400 * time.Millisecond
+		attemptCap   = 200 * time.Millisecond
+		responseLead = 50 * time.Millisecond
 	)
 
 	selection := NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"delayed-status-node"}`))}
 	directEntered := make(chan time.Duration, 1)
-	releaseDirect := make(chan struct{})
+	directElapsed := make(chan time.Duration, 1)
 	var directReturnedStatus atomic.Bool
 
 	r := &RetryDownloader{
@@ -427,13 +467,21 @@ func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testi
 			}
 			remaining := time.Until(deadline)
 			directEntered <- remaining
-			if remaining < 45*time.Millisecond {
+			if remaining < attemptCap/2 {
 				<-ctx.Done()
 				return nil, ctx.Err()
 			}
-			<-releaseDirect
-			directReturnedStatus.Store(true)
-			return nil, &HTTPStatusError{StatusCode: 500, URL: "https://example.com"}
+			timer := time.NewTimer(remaining - responseLead)
+			defer timer.Stop()
+			started := time.Now()
+			select {
+			case <-timer.C:
+				directElapsed <- time.Since(started)
+				directReturnedStatus.Store(true)
+				return nil, &HTTPStatusError{StatusCode: 500, URL: "https://example.com"}
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}),
 		TotalTimeout:      totalBudget,
 		AttemptTimeoutCap: attemptCap,
@@ -463,7 +511,7 @@ func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testi
 
 	select {
 	case remaining := <-directEntered:
-		if remaining < 45*time.Millisecond {
+		if remaining < attemptCap/2 {
 			select {
 			case got := <-result:
 				t.Fatalf("direct budget was pre-divided before retryable response: err=%v body=%q", got.err, got.body)
@@ -471,7 +519,6 @@ func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testi
 				t.Fatal("old direct attempt did not finish within watchdog")
 			}
 		}
-		close(releaseDirect)
 	case <-time.After(time.Second):
 		t.Fatal("direct attempt did not start")
 	}
@@ -483,6 +530,14 @@ func TestRetryDownloader_AttemptCapAllowsDelayedRetryableDirectResponse(t *testi
 		}
 		if string(got.body) != "proxy-after-delayed-status" {
 			t.Fatalf("body = %q, want proxy-after-delayed-status", got.body)
+		}
+		select {
+		case elapsed := <-directElapsed:
+			if elapsed < attemptCap/2 {
+				t.Fatalf("direct response returned too early: %v", elapsed)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("direct completion timing was not recorded")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("download did not finish within watchdog")
@@ -503,11 +558,13 @@ func TestRetryDownloader_TotalBudgetReachesThirdDistinctProxyAfterDirectFailure(
 			if _, ok := ctx.Deadline(); !ok {
 				return nil, errors.New("direct attempt has no request budget")
 			}
-			return nil, context.DeadlineExceeded
+			<-ctx.Done()
+			return nil, ctx.Err()
 		}),
-		TotalTimeout:     150 * time.Millisecond,
-		MaxProxyAttempts: 3,
-		PlatformID:       "default-platform",
+		TotalTimeout:      150 * time.Millisecond,
+		AttemptTimeoutCap: 75 * time.Millisecond,
+		MaxProxyAttempts:  3,
+		PlatformID:        "default-platform",
 		AttemptObserver: func(event AttemptEvent) {
 			events = append(events, event)
 		},
@@ -576,10 +633,12 @@ func TestRetryDownloader_AllProxyCandidatesFailWithinOneRequestBudget(t *testing
 			if _, ok := ctx.Deadline(); !ok {
 				t.Fatalf("direct attempt did not receive request deadline")
 			}
-			return nil, directErr
+			<-ctx.Done()
+			return nil, ctx.Err()
 		}),
-		TotalTimeout:     120 * time.Millisecond,
-		MaxProxyAttempts: 3,
+		TotalTimeout:      120 * time.Millisecond,
+		AttemptTimeoutCap: 60 * time.Millisecond,
+		MaxProxyAttempts:  3,
 		NodePicker: func(_ context.Context, _ string, attempted []NodeSelection) (NodeSelection, error) {
 			pickerCalls++
 			if len(attempted) >= len(selections) {

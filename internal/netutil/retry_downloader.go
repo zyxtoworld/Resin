@@ -69,7 +69,15 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 		started:    time.Now(),
 		observe:    r.AttemptObserver,
 	}
-	directBudget := r.attemptBudget(requestCtx, proxyAttempts+1)
+	directSlots := proxyAttempts + 1
+	if r.AttemptTimeoutCap > 0 {
+		// With an explicit per-attempt cap, direct gets one capped slice;
+		// proxy slots are reserved only after direct fails. Without a cap,
+		// retain the historical total-budget split so a blocked direct
+		// attempt cannot consume every proxy opportunity.
+		directSlots = 1
+	}
+	directBudget := r.attemptBudget(requestCtx, directSlots)
 	if directBudget <= 0 {
 		return nil, requestContextError(ctx, requestCtx)
 	}
@@ -237,11 +245,8 @@ func (r *RetryDownloader) attemptBudget(ctx context.Context, slots int) time.Dur
 		return 0
 	}
 	budget := remaining / time.Duration(slots)
-	if r.AttemptTimeoutCap > 0 {
-		budget = remaining
-		if budget > r.AttemptTimeoutCap {
-			budget = r.AttemptTimeoutCap
-		}
+	if r.AttemptTimeoutCap > 0 && budget > r.AttemptTimeoutCap {
+		budget = r.AttemptTimeoutCap
 	}
 	return budget
 }

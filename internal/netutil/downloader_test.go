@@ -190,7 +190,7 @@ func TestRetryDownloader_DirectAttemptObserverReportsTransportPhases(t *testing.
 	}
 	r := &RetryDownloader{
 		Direct:       direct,
-		TotalTimeout: time.Second,
+		TotalTimeout: 5 * time.Second,
 		PlatformID:   "platform-observe",
 		AttemptObserver: func(event AttemptEvent) {
 			eventsMu.Lock()
