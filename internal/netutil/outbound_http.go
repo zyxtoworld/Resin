@@ -47,9 +47,11 @@ func HTTPGetViaOutbound(
 		return nil, 0, fmt.Errorf("outbound fetch: outbound is nil")
 	}
 
+	var dialOnce sync.Once
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := outbound.DialContext(ctx, network, M.ParseSocksaddr(addr))
+			dialOnce.Do(func() { emitAttemptPhase(ctx, AttemptPhaseDial, attemptResult(ctx, err)) })
 			if err != nil {
 				return nil, err
 			}
@@ -69,6 +71,7 @@ func HTTPGetViaOutbound(
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptResult(ctx, err))
 		return nil, 0, &NonRetryableError{Err: err, url: redactURLCredentials(url)}
 	}
 
@@ -81,17 +84,24 @@ func HTTPGetViaOutbound(
 	var start time.Time
 	var latency time.Duration
 	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Reused {
+				dialOnce.Do(func() { emitAttemptPhase(ctx, AttemptPhaseDial, "reused") })
+			}
+		},
 		TLSHandshakeStart: func() { start = time.Now() },
 		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
 			if err == nil {
 				latency = time.Since(start)
 			}
+			emitAttemptPhase(ctx, AttemptPhaseTLS, attemptResult(ctx, err))
 		},
 	}
 	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 
 	resp, err := client.Do(req)
 	if err != nil {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptResult(ctx, unwrapURLRequestError(err)))
 		return nil, latency, fmt.Errorf(
 			"outbound fetch: request %s failed: %w",
 			redactURLCredentials(url),
@@ -99,6 +109,11 @@ func HTTPGetViaOutbound(
 		)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || !opts.RequireStatusOK {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, "ok")
+	} else {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptStatusResult(resp.StatusCode))
+	}
 
 	if opts.RequireStatusOK && resp.StatusCode != http.StatusOK {
 		return nil, latency, fmt.Errorf(
@@ -112,6 +127,7 @@ func HTTPGetViaOutbound(
 		return nil, latency, fmt.Errorf("outbound fetch: %w", err)
 	}
 	body, err := readResourceBody(resp.Body)
+	emitAttemptPhase(ctx, AttemptPhaseBody, attemptResult(ctx, err))
 	if err != nil {
 		return nil, latency, err
 	}

@@ -19,7 +19,7 @@ func (f slowSubscriptionRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 	return f(req)
 }
 
-func TestScheduler_UpdateSubscription_DefaultFetchTimeoutSupportsSlowResponse(t *testing.T) {
+func TestScheduler_UpdateSubscription_PerAttemptBudgetLeavesRetryHeadroom(t *testing.T) {
 	t.Setenv("RESIN_AUTH_VERSION", "V1")
 	t.Setenv("RESIN_ADMIN_TOKEN", "test-admin")
 	t.Setenv("RESIN_PROXY_TOKEN", "test-proxy")
@@ -37,8 +37,9 @@ func TestScheduler_UpdateSubscription_DefaultFetchTimeoutSupportsSlowResponse(t 
 	direct.Client = &http.Client{
 		Transport: slowSubscriptionRoundTripper(func(req *http.Request) (*http.Response, error) {
 			deadline, ok := req.Context().Deadline()
-			if !ok || time.Until(deadline) < 50*time.Second {
-				return nil, errors.New("subscription response requires the configured slow-fetch headroom")
+			remaining := time.Until(deadline)
+			if !ok || remaining <= 0 || remaining >= envCfg.ResourceFetchTimeout {
+				return nil, errors.New("subscription direct attempt did not receive a shorter request slice")
 			}
 			return &http.Response{
 				StatusCode: http.StatusOK,

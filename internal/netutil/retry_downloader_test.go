@@ -242,8 +242,8 @@ func TestRetryDownloader_ProxyRetriesExhaustedReturnsDirectError(t *testing.T) {
 	if !errors.Is(err, directErr) {
 		t.Fatalf("expected original direct error, got %v", err)
 	}
-	if pickerCalls != 2 {
-		t.Fatalf("expected 2 picker attempts, got %d", pickerCalls)
+	if pickerCalls != 3 {
+		t.Fatalf("expected one final picker exhaustion check, got %d picker attempts", pickerCalls)
 	}
 	if proxyCalls != 2 {
 		t.Fatalf("expected 2 proxy fetch attempts, got %d", proxyCalls)
@@ -327,7 +327,7 @@ func TestRetryDownloader_UsesNextSelectionAfterFirstFailure(t *testing.T) {
 	}
 }
 
-func TestRetryDownloader_NoRetryWhenCallerDeadlineExceeded(t *testing.T) {
+func TestRetryDownloader_AttemptTimeoutLeavesCallerBudgetForProxy(t *testing.T) {
 	var pickerCalls, proxyCalls int
 
 	r := &RetryDownloader{
@@ -335,7 +335,7 @@ func TestRetryDownloader_NoRetryWhenCallerDeadlineExceeded(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}),
-		ProxyAttemptTimeout: 100 * time.Millisecond,
+		AttemptTimeoutCap: 100 * time.Millisecond,
 		NodePicker: func(_ context.Context, _ string, _ []NodeSelection) (NodeSelection, error) {
 			pickerCalls++
 			return NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"retry-node-deadline"}`))}, nil
@@ -349,26 +349,29 @@ func TestRetryDownloader_NoRetryWhenCallerDeadlineExceeded(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_, err := r.Download(ctx, "https://example.com")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected deadline exceeded, got %v", err)
+	body, err := r.Download(ctx, "https://example.com")
+	if err != nil {
+		t.Fatalf("expected remaining caller budget to permit proxy, got %v", err)
 	}
-	if pickerCalls != 0 || proxyCalls != 0 {
-		t.Fatalf("expected no proxy retry after caller deadline, got picker=%d proxy=%d", pickerCalls, proxyCalls)
+	if string(body) != "via-proxy" {
+		t.Fatalf("body = %q, want proxy response", body)
+	}
+	if pickerCalls != 1 || proxyCalls != 1 {
+		t.Fatalf("expected one proxy retry, got picker=%d proxy=%d", pickerCalls, proxyCalls)
 	}
 }
 
-func TestRetryDownloader_ProxyAttemptTimeoutStillApplies(t *testing.T) {
+func TestRetryDownloader_AttemptTimeoutCapStillApplies(t *testing.T) {
 	var pickerCalls, proxyCalls int
 
 	r := &RetryDownloader{
 		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
 			return nil, context.DeadlineExceeded
 		}),
-		ProxyAttemptTimeout: 20 * time.Millisecond,
+		AttemptTimeoutCap: 20 * time.Millisecond,
 		NodePicker: func(_ context.Context, _ string, attempted []NodeSelection) (NodeSelection, error) {
 			pickerCalls++
 			if len(attempted) == 0 {
@@ -401,5 +404,175 @@ func TestRetryDownloader_ProxyAttemptTimeoutStillApplies(t *testing.T) {
 	}
 	if pickerCalls != 2 || proxyCalls != 2 {
 		t.Fatalf("expected two timed attempts, got picker=%d proxy=%d", pickerCalls, proxyCalls)
+	}
+}
+
+func TestRetryDownloader_TotalBudgetReachesThirdDistinctProxyAfterDirectFailure(t *testing.T) {
+	selections := []NodeSelection{
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"budget-node-a"}`))},
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"budget-node-b"}`))},
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"budget-node-c"}`))},
+	}
+	seen := make([]node.Hash, 0, len(selections))
+	var events []AttemptEvent
+
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(ctx context.Context, _ string) ([]byte, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				return nil, errors.New("direct attempt has no request budget")
+			}
+			return nil, context.DeadlineExceeded
+		}),
+		TotalTimeout:     150 * time.Millisecond,
+		MaxProxyAttempts: 3,
+		PlatformID:       "default-platform",
+		AttemptObserver: func(event AttemptEvent) {
+			events = append(events, event)
+		},
+		NodePicker: func(_ context.Context, _ string, attempted []NodeSelection) (NodeSelection, error) {
+			if len(attempted) >= len(selections) {
+				return NodeSelection{}, errors.New("proxy candidates exhausted")
+			}
+			return selections[len(attempted)], nil
+		},
+		ProxyFetch: func(ctx context.Context, selection NodeSelection, _ string) ([]byte, error) {
+			seen = append(seen, selection.Hash)
+			if selection.Hash == selections[2].Hash {
+				return []byte("third-proxy-success"), nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	started := time.Now()
+	body, err := r.Download(context.Background(), "https://user:secret@example.test/sub?token=secret")
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+	if string(body) != "third-proxy-success" {
+		t.Fatalf("body = %q, want third proxy response", body)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("proxy attempts = %d, want 3", len(seen))
+	}
+	for i := range seen {
+		for j := i + 1; j < len(seen); j++ {
+			if seen[i] == seen[j] {
+				t.Fatalf("proxy candidate %d was repeated", i)
+			}
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond+100*time.Millisecond {
+		t.Fatalf("download exceeded request budget: %v", elapsed)
+	}
+	if len(events) == 0 {
+		t.Fatal("attempt observer received no events")
+	}
+	for _, event := range events {
+		if event.RequestID == 0 || event.PlatformID == "" || event.Attempt < 0 || event.Kind == "" || event.Phase == "" || event.Result == "" {
+			t.Fatalf("incomplete attempt event: %+v", event)
+		}
+		if event.NodeID == "" && event.Kind == AttemptKindProxy {
+			t.Fatalf("proxy event has no stable node id: %+v", event)
+		}
+	}
+}
+
+func TestRetryDownloader_AllProxyCandidatesFailWithinOneRequestBudget(t *testing.T) {
+	selections := []NodeSelection{
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"bounded-node-a"}`))},
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"bounded-node-b"}`))},
+		{Hash: node.HashFromRawOptions([]byte(`{"id":"bounded-node-c"}`))},
+	}
+	var seen []node.Hash
+	var pickerCalls int
+	directErr := context.DeadlineExceeded
+
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(ctx context.Context, _ string) ([]byte, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatalf("direct attempt did not receive request deadline")
+			}
+			return nil, directErr
+		}),
+		TotalTimeout:     120 * time.Millisecond,
+		MaxProxyAttempts: 3,
+		NodePicker: func(_ context.Context, _ string, attempted []NodeSelection) (NodeSelection, error) {
+			pickerCalls++
+			if len(attempted) >= len(selections) {
+				return NodeSelection{}, errors.New("proxy candidates exhausted")
+			}
+			return selections[len(attempted)], nil
+		},
+		ProxyFetch: func(ctx context.Context, selection NodeSelection, _ string) ([]byte, error) {
+			seen = append(seen, selection.Hash)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	started := time.Now()
+	_, err := r.Download(context.Background(), "https://example.test/sub")
+	if !errors.Is(err, directErr) {
+		t.Fatalf("error = %v, want original direct error", err)
+	}
+	if len(seen) != len(selections) {
+		t.Fatalf("proxy attempts = %d, want %d", len(seen), len(selections))
+	}
+	if pickerCalls != len(selections) {
+		t.Fatalf("picker calls = %d, want %d", pickerCalls, len(selections))
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond+100*time.Millisecond {
+		t.Fatalf("all-failed download exceeded request budget: %v", elapsed)
+	}
+}
+
+func TestRetryDownloader_CancelInterruptsProxyAttempt(t *testing.T) {
+	selection := NodeSelection{Hash: node.HashFromRawOptions([]byte(`{"id":"cancel-proxy-node"}`))}
+	proxyEntered := make(chan struct{})
+	var pickerCalls int
+	r := &RetryDownloader{
+		Direct: downloaderFunc(func(_ context.Context, _ string) ([]byte, error) {
+			return nil, &HTTPStatusError{StatusCode: 503, URL: "https://example.test/sub"}
+		}),
+		TotalTimeout:     time.Second,
+		MaxProxyAttempts: 4,
+		NodePicker: func(_ context.Context, _ string, attempted []NodeSelection) (NodeSelection, error) {
+			pickerCalls++
+			if len(attempted) != 0 {
+				return NodeSelection{}, errors.New("unexpected second picker call")
+			}
+			return selection, nil
+		},
+		ProxyFetch: func(ctx context.Context, _ NodeSelection, _ string) ([]byte, error) {
+			close(proxyEntered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.Download(ctx, "https://example.test/sub")
+		result <- err
+	}()
+	select {
+	case <-proxyEntered:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("proxy attempt did not start")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("download error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy attempt did not stop after cancellation")
+	}
+	if pickerCalls != 1 {
+		t.Fatalf("picker calls = %d, want 1", pickerCalls)
 	}
 }

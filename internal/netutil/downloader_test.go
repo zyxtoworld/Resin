@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -171,6 +172,64 @@ func TestDirectDownloader_FallbackTimeoutWithoutContextDeadline(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+}
+
+func TestRetryDownloader_DirectAttemptObserverReportsTransportPhases(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("observed"))
+	}))
+	defer server.Close()
+
+	events := make([]AttemptEvent, 0, 8)
+	var eventsMu sync.Mutex
+	direct := &DirectDownloader{
+		Client:      server.Client(),
+		TimeoutFn:   func() time.Duration { return 0 },
+		UserAgentFn: func() string { return "" },
+	}
+	r := &RetryDownloader{
+		Direct:       direct,
+		TotalTimeout: time.Second,
+		PlatformID:   "platform-observe",
+		AttemptObserver: func(event AttemptEvent) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, event)
+		},
+	}
+
+	body, err := r.Download(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+	if string(body) != "observed" {
+		t.Fatalf("body = %q, want observed", body)
+	}
+	want := map[AttemptPhase]bool{
+		AttemptPhaseDial:     false,
+		AttemptPhaseTLS:      false,
+		AttemptPhaseHeaders:  false,
+		AttemptPhaseBody:     false,
+		AttemptPhaseComplete: false,
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, event := range events {
+		if event.RequestID == 0 || event.PlatformID != "platform-observe" || event.Kind != AttemptKindDirect || event.Attempt != 1 {
+			t.Fatalf("unexpected attempt identity: %+v", event)
+		}
+		if event.NodeID != "" {
+			t.Fatalf("direct attempt exposed a node identity: %+v", event)
+		}
+		if _, ok := want[event.Phase]; ok {
+			want[event.Phase] = true
+		}
+	}
+	for phase, seen := range want {
+		if !seen {
+			t.Fatalf("missing %s event: %+v", phase, events)
+		}
 	}
 }
 

@@ -2,11 +2,14 @@ package netutil
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	neturl "net/url"
+	"sync"
 	"time"
 )
 
@@ -147,12 +150,28 @@ func (d *DirectDownloader) Download(ctx context.Context, url string) ([]byte, er
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptResult(ctx, err))
 		return nil, &NonRetryableError{Err: err, url: redactURLCredentials(url)}
 	}
 	userAgent := d.currentUserAgent()
 	if userAgent != "" {
 		req.Header.Set("User-Agent", userAgent)
 	}
+	var dialOnce sync.Once
+	trace := &httptrace.ClientTrace{
+		ConnectDone: func(_ string, _ string, err error) {
+			dialOnce.Do(func() { emitAttemptPhase(ctx, AttemptPhaseDial, attemptResult(ctx, err)) })
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Reused {
+				dialOnce.Do(func() { emitAttemptPhase(ctx, AttemptPhaseDial, "reused") })
+			}
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			emitAttemptPhase(ctx, AttemptPhaseTLS, attemptResult(ctx, err))
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 
 	client := d.Client
 	if client == nil {
@@ -161,12 +180,18 @@ func (d *DirectDownloader) Download(ctx context.Context, url string) ([]byte, er
 	resp, err := client.Do(req)
 	if err != nil {
 		underlying := unwrapURLRequestError(err)
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptResult(ctx, underlying))
 		return nil, &downloadRequestError{
 			url: redactURLCredentials(url),
 			err: underlying,
 		}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, "ok")
+	} else {
+		emitAttemptPhase(ctx, AttemptPhaseHeaders, attemptStatusResult(resp.StatusCode))
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, &HTTPStatusError{StatusCode: resp.StatusCode, URL: redactURLCredentials(url)}
@@ -176,6 +201,7 @@ func (d *DirectDownloader) Download(ctx context.Context, url string) ([]byte, er
 		return nil, fmt.Errorf("downloader: %w", err)
 	}
 	body, err := readResourceBody(resp.Body)
+	emitAttemptPhase(ctx, AttemptPhaseBody, attemptResult(ctx, err))
 	if err != nil {
 		return nil, fmt.Errorf("downloader: %w", err)
 	}

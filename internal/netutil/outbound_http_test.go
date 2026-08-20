@@ -145,6 +145,61 @@ func TestHTTPGetViaOutbound_AllowNon200(t *testing.T) {
 	}
 }
 
+func TestHTTPGetViaOutbound_AttemptObserverReportsSafeProxyPhases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("proxy-observed"))
+	}))
+	defer server.Close()
+
+	outbound, err := (&testutil.StubOutboundBuilder{}).Build(nil)
+	if err != nil {
+		t.Fatalf("build outbound: %v", err)
+	}
+	events := make([]AttemptEvent, 0, 4)
+	var eventsMu sync.Mutex
+	ctx := withAttemptState(context.Background(), &attemptState{
+		requestID:  7,
+		platformID: "platform-proxy-observe",
+		attempt:    2,
+		kind:       AttemptKindProxy,
+		nodeID:     "node-safe-id",
+		started:    time.Now(),
+		observe: func(event AttemptEvent) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, event)
+		},
+	})
+
+	body, _, err := HTTPGetViaOutbound(ctx, outbound, server.URL, OutboundHTTPOptions{})
+	if err != nil {
+		t.Fatalf("proxy fetch failed: %v", err)
+	}
+	if string(body) != "proxy-observed" {
+		t.Fatalf("body = %q, want proxy-observed", body)
+	}
+	want := map[AttemptPhase]bool{
+		AttemptPhaseDial:    false,
+		AttemptPhaseHeaders: false,
+		AttemptPhaseBody:    false,
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, event := range events {
+		if event.RequestID != 7 || event.PlatformID != "platform-proxy-observe" || event.Attempt != 2 || event.Kind != AttemptKindProxy || event.NodeID != "node-safe-id" {
+			t.Fatalf("unexpected proxy attempt identity: %+v", event)
+		}
+		if _, ok := want[event.Phase]; ok {
+			want[event.Phase] = true
+		}
+	}
+	for phase, seen := range want {
+		if !seen {
+			t.Fatalf("missing %s event: %+v", phase, events)
+		}
+	}
+}
+
 func TestConnCloseHook_CloseIsIdempotentAndConcurrentSafe(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()

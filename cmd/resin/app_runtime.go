@@ -22,6 +22,7 @@ import (
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/observability"
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/routing"
@@ -213,7 +214,25 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 	// Phase 1: Create DirectDownloader and RetryDownloader shell.
 	// NodePicker/ProxyFetch are nil initially; set after Pool + OutboundManager creation.
 	direct := newDirectDownloader(a.envCfg)
-	retryDL := &netutil.RetryDownloader{Direct: direct}
+	retryDL := &netutil.RetryDownloader{
+		Direct:           direct,
+		TotalTimeout:     a.envCfg.ResourceFetchTimeout,
+		MaxProxyAttempts: 4,
+		PlatformID:       platform.DefaultPlatformID,
+		AttemptObserver: func(event netutil.AttemptEvent) {
+			log.Printf(
+				"resource_attempt request_id=%d platform_id=%s attempt=%d kind=%s node_id=%s phase=%s elapsed_ms=%d result=%s",
+				event.RequestID,
+				event.PlatformID,
+				event.Attempt,
+				event.Kind,
+				event.NodeID,
+				event.Phase,
+				event.Elapsed/time.Millisecond,
+				event.Result,
+			)
+		},
+	}
 
 	// Phase 2: Construct GeoIP service (start after retry downloader wiring).
 	a.geoSvc = newGeoIPService(a.envCfg.CacheDir, a.envCfg.GeoIPUpdateSchedule, retryDL)
