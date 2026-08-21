@@ -694,6 +694,74 @@ type gatedKnownLengthBody struct {
 	closeMu sync.Once
 }
 
+type blockingKnownLengthBody struct {
+	readEntered chan struct{}
+	readDone    chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
+	mu          sync.Mutex
+	maxReadSize int
+}
+
+func (b *blockingKnownLengthBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if len(p) > b.maxReadSize {
+		b.maxReadSize = len(p)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.readEntered:
+	default:
+		close(b.readEntered)
+	}
+	<-b.closed
+	close(b.readDone)
+	return 0, context.Canceled
+}
+
+func (b *blockingKnownLengthBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func (b *blockingKnownLengthBody) maxRead() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.maxReadSize
+}
+
+func TestCaptureKnownLengthRequestBody_GrowsWithBytesNotDeclaredCapacity(t *testing.T) {
+	body := &blockingKnownLengthBody{
+		readEntered: make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/declared-large", body)
+	req.ContentLength = responseRuleRetryBodyLimit
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := captureKnownLengthRequestBody(ctx, req)
+		result <- err
+	}()
+	waitForChannel(t, body.readEntered, "known length body read")
+	if got := body.maxRead(); got >= responseRuleRetryBodyLimit {
+		t.Fatalf("first read buffer preallocated declared body: got %d bytes, limit %d", got, responseRuleRetryBodyLimit)
+	}
+	cancel()
+	if err := waitForChannel(t, result, "known length body cancellation"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("known length body cancellation: %v", err)
+	}
+	waitForChannel(t, body.readDone, "known length body read exit")
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("known length body was not closed")
+	}
+}
+
 func (b *gatedKnownLengthBody) Read(p []byte) (int, error) {
 	i := int(b.index.Add(1)) - 1
 	if i >= len(b.chunks) {

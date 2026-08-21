@@ -397,15 +397,14 @@ func captureKnownLengthRequestBody(ctx context.Context, req *http.Request) ([]by
 		ctx = context.Background()
 	}
 
-	payload := make([]byte, int(req.ContentLength))
 	capture := newReplayBodyCapture(req.Body, req.ContentLength)
 	owner := newAttemptRequestBody(capture)
 	readDone := make(chan struct{})
-	var readN int
+	var readN int64
 	var readErr error
 	var closeErr error
 	go func() {
-		readN, readErr = io.ReadFull(owner, payload)
+		readN, readErr = io.CopyN(io.Discard, owner, req.ContentLength)
 		closeErr = owner.Close()
 		close(readDone)
 	}()
@@ -413,12 +412,19 @@ func captureKnownLengthRequestBody(ctx context.Context, req *http.Request) ([]by
 	select {
 	case <-readDone:
 		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				readErr = io.ErrUnexpectedEOF
+			}
 			return nil, false, readErr
 		}
 		if closeErr != nil {
 			return nil, false, closeErr
 		}
-		if readN != len(payload) {
+		if readN != req.ContentLength {
+			return nil, false, io.ErrUnexpectedEOF
+		}
+		payload := capture.Bytes()
+		if int64(len(payload)) != req.ContentLength || !capture.Replayable() {
 			return nil, false, io.ErrUnexpectedEOF
 		}
 		return payload, true, nil
