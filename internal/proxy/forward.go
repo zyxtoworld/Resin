@@ -583,9 +583,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if attempt == 0 {
 				retryBudget = routed.Route.RetryBudget
-				if retryBudget < 1 {
-					retryBudget = 1
-				}
+				retryBudget = proxyAttemptLimit(retryBudget)
 				budget, enabled := effectiveProxyRequestBudget(routed.Route.RequestTotalTimeout, p.requestTotalTimeout)
 				budgetEnabled = enabled
 				if enabled {

@@ -440,6 +440,86 @@ func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *te
 	}
 }
 
+func TestReverseRetryRoundTripperLargeCandidateBudgetUsesBoundedAttempts(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(8 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequestForProxy("plat", "large-budget", "https://example.com/large-budget")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RetryBudget = 1444
+
+	var attempts atomic.Int32
+	var firstAttemptBudget time.Duration
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			trace := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), trace.clientTrace())), trace
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				if deadline, ok := req.Context().Deadline(); ok && attempt == 1 {
+					firstAttemptBudget = time.Until(deadline)
+				}
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+					t.Fatal("attempt missing request trace")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				if attempt == 1 {
+					return nil, responseHeaderTimeoutError{}
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/large-budget", nil))
+	if err != nil {
+		t.Fatalf("bounded retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("bounded retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want exactly one retry", got)
+	}
+	if firstAttemptBudget < time.Second {
+		t.Fatalf("first attempt budget = %s, candidate count must not create a millisecond deadline", firstAttemptBudget)
+	}
+}
+
 func TestReverseRetryRoundTripper_RetriesBodyClosedAtContentLength(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")

@@ -81,6 +81,39 @@ func TestAttemptContextForRequestReservesOverallDeadline(t *testing.T) {
 	}
 }
 
+func TestAttemptContextForRequestDoesNotDivideByCandidateCount(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		total time.Duration
+		want  time.Duration
+	}{
+		{name: "eight seconds", total: 8 * time.Second, want: time.Second},
+		{name: "fifteen seconds", total: 15 * time.Second, want: 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, cancel := context.WithTimeout(context.Background(), tc.total)
+			defer cancel()
+			ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 1444)
+			if !bounded || ctx == nil || attemptCancel == nil {
+				t.Fatal("large candidate set did not receive a bounded attempt context")
+			}
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("attempt context has no deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining < tc.want {
+				t.Fatalf("first attempt budget = %s, want at least %s", remaining, tc.want)
+			}
+			if remaining > tc.total {
+				t.Fatalf("first attempt escaped total budget: %s > %s", remaining, tc.total)
+			}
+			attemptCancel()
+			releaseAttempt()
+		})
+	}
+}
+
 func TestStoppableDeadlineContextAlreadyCanceledCleansHandles(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	cancelParent()

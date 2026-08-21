@@ -12,6 +12,29 @@ import (
 	"github.com/Resinat/Resin/internal/routing"
 )
 
+const (
+	// maxProxyAttempts bounds work per request. A platform view may contain
+	// thousands of candidates, but that is not a reason to create thousands of
+	// tiny deadline slices or to retry until the caller's deadline is exhausted.
+	maxProxyAttempts = 3
+
+	// attemptBudgetReservationSlots reserves time for the current attempt and
+	// one next-node attempt. Further attempts are still possible when earlier
+	// attempts finish early, but candidate cardinality never shrinks the first
+	// attempt to milliseconds.
+	attemptBudgetReservationSlots = 2
+)
+
+func proxyAttemptLimit(candidateBudget int) int {
+	if candidateBudget < 1 {
+		return 1
+	}
+	if candidateBudget > maxProxyAttempts {
+		return maxProxyAttempts
+	}
+	return candidateBudget
+}
+
 // classifyTransportFailure returns a stable policy input. It deliberately
 // uses only transport milestones observed by this attempt; error strings are
 // not a protocol and must not drive routing decisions.
@@ -200,6 +223,9 @@ func attemptContextForRequest(parent context.Context, attempt, total int) (conte
 	remainingSlots := total - attempt
 	if remainingSlots < 1 {
 		return nil, nil, func() {}, true
+	}
+	if remainingSlots > attemptBudgetReservationSlots {
+		remainingSlots = attemptBudgetReservationSlots
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
