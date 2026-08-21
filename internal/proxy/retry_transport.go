@@ -54,15 +54,18 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	baseReq := req
 	var capture *replayBodyCapture
 	var preparedBody []byte
+	var bodyPrepared bool
 	if budgetEnabled && baseReq.Body != nil && baseReq.Body != http.NoBody {
 		var prepared bool
 		var prepareErr error
-		preparedBody, prepared, prepareErr = captureKnownLengthRequestBody(requestCtx, req)
+		var passthroughBody io.ReadCloser
+		preparedBody, prepared, passthroughBody, prepareErr = captureRequestBodyForRetry(requestCtx, req)
 		if prepareErr != nil {
 			releaseRequest()
 			cancelRequest()
 			return nil, prepareErr
 		}
+		bodyPrepared = prepared
 		baseReq = baseReq.Clone(baseReq.Context())
 		if prepared {
 			baseReq.Body = http.NoBody
@@ -70,6 +73,8 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			baseReq.GetBody = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(preparedBody)), nil
 			}
+		} else if passthroughBody != nil {
+			baseReq.Body = passthroughBody
 		} else {
 			capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
 			baseReq.Body = capture
@@ -169,7 +174,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		resp, err, bodyBytes, bodyComplete := roundTripWithBodyCompletion(
 			attemptCtx, t.transportFor(current), outReq,
 		)
-		bodyReplayable := preparedBody != nil || requestCanBeReplayed(req, capture)
+		bodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
 		retryCurrent := func() bool {
 			if cancelAttempt != nil {
 				cancelAttempt()

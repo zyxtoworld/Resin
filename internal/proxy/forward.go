@@ -241,6 +241,8 @@ func prepareForwardOutboundRequest(in *http.Request) *http.Request {
 
 const responseRuleRetryBodyLimit = 8 << 20
 
+var errRetryBodyTooLarge = errors.New("upstream request body exceeds retry capture limit")
+
 // replayBodyCapture records a request body while the first upstream attempt
 // consumes it. A retry is allowed only when the entire body was read without
 // an error and stayed within the bounded memory limit.
@@ -382,16 +384,63 @@ func cloneForwardRequestForRetry(base *http.Request, body []byte) *http.Request 
 	return retry
 }
 
-// captureKnownLengthRequestBody buffers only small, declared request bodies
-// before the first upstream attempt. The caller supplies the request-level
-// budget context; there is deliberately no second fixed upload timeout here.
-// This gives every attempt an independent reader even when a transport fails
-// before touching Request.Body. Unknown or oversized bodies remain streaming
-// and therefore fail closed for retry.
-func captureKnownLengthRequestBody(ctx context.Context, req *http.Request) ([]byte, bool, error) {
-	if req == nil || req.Body == nil || req.Body == http.NoBody || req.ContentLength <= 0 ||
+// replayPassthroughBody restores the bytes already inspected while retaining
+// the unread source. It is used only for an over-limit unknown-length body:
+// the first attempt must still receive the complete stream, but no retry may
+// use it as a replay source.
+type replayPassthroughBody struct {
+	mu        sync.Mutex
+	prefix    []byte
+	offset    int
+	tail      io.ReadCloser
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (b *replayPassthroughBody) Read(p []byte) (int, error) {
+	if b == nil {
+		return 0, io.EOF
+	}
+	b.mu.Lock()
+	if b.offset < len(b.prefix) {
+		n := copy(p, b.prefix[b.offset:])
+		b.offset += n
+		b.mu.Unlock()
+		return n, nil
+	}
+	tail := b.tail
+	b.mu.Unlock()
+	if tail == nil {
+		return 0, io.EOF
+	}
+	return tail.Read(p)
+}
+
+func (b *replayPassthroughBody) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.closeOnce.Do(func() {
+		if b.tail != nil {
+			b.closeErr = b.tail.Close()
+		}
+	})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closeErr
+}
+
+// captureRequestBodyForRetry buffers only bodies that fit the bounded replay
+// contract before the first upstream attempt. The caller supplies the
+// request-level budget context; there is deliberately no second fixed upload
+// timeout here. Known lengths are read exactly. Unknown lengths are read
+// incrementally until EOF, but never beyond the replay limit. An over-limit
+// unknown body is reconstructed as a complete first-attempt stream while
+// remaining deliberately non-replayable.
+func captureRequestBodyForRetry(ctx context.Context, req *http.Request) ([]byte, bool, io.ReadCloser, error) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody ||
 		req.ContentLength > int64(responseRuleRetryBodyLimit) {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -403,34 +452,75 @@ func captureKnownLengthRequestBody(ctx context.Context, req *http.Request) ([]by
 	var readN int64
 	var readErr error
 	var closeErr error
+	var overflowByte byte
+	var overflow bool
 	go func() {
-		readN, readErr = io.CopyN(io.Discard, owner, req.ContentLength)
-		closeErr = owner.Close()
+		if req.ContentLength > 0 {
+			readN, readErr = io.CopyN(io.Discard, owner, req.ContentLength)
+		} else {
+			buf := make([]byte, 32<<10)
+			for {
+				remaining := int64(responseRuleRetryBodyLimit) - readN
+				bufSize := len(buf)
+				if remaining >= 0 && remaining < int64(bufSize) {
+					bufSize = int(remaining) + 1
+				}
+				n, err := owner.Read(buf[:bufSize])
+				if n > 0 && readN+int64(n) > int64(responseRuleRetryBodyLimit) {
+					overflowByte = buf[int(remaining)]
+					overflow = true
+					readN += int64(n)
+					readErr = errRetryBodyTooLarge
+					break
+				}
+				readN += int64(n)
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						readErr = nil
+					} else {
+						readErr = err
+					}
+					break
+				}
+			}
+		}
+		if !overflow {
+			closeErr = owner.Close()
+		}
 		close(readDone)
 	}()
 
 	select {
 	case <-readDone:
+		if overflow {
+			prefix := capture.Bytes()
+			prefix = append(prefix, overflowByte)
+			return nil, false, &replayPassthroughBody{prefix: prefix, tail: capture}, nil
+		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				readErr = io.ErrUnexpectedEOF
 			}
-			return nil, false, readErr
+			return nil, false, nil, readErr
 		}
 		if closeErr != nil {
-			return nil, false, closeErr
+			return nil, false, nil, closeErr
 		}
-		if readN != req.ContentLength {
-			return nil, false, io.ErrUnexpectedEOF
+		if req.ContentLength > 0 && readN != req.ContentLength {
+			return nil, false, nil, io.ErrUnexpectedEOF
 		}
 		payload := capture.Bytes()
-		if int64(len(payload)) != req.ContentLength || !capture.Replayable() {
-			return nil, false, io.ErrUnexpectedEOF
+		if (req.ContentLength > 0 && int64(len(payload)) != req.ContentLength) || !capture.Replayable() {
+			return nil, false, nil, io.ErrUnexpectedEOF
 		}
-		return payload, true, nil
+		return payload, true, nil, nil
 	case <-ctx.Done():
 		owner.abort()
-		return nil, false, ctx.Err()
+		select {
+		case <-readDone:
+		case <-time.After(attemptBodyQuiescenceBudget):
+		}
+		return nil, false, nil, ctx.Err()
 	}
 }
 

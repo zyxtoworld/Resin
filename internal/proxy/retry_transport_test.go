@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -686,6 +687,169 @@ func TestReverseRetryRoundTripper_TimeoutBeforeBodyReadCoolsAndRetriesReplayable
 	}
 }
 
+func TestReverseRetryRoundTripper_RetriesSmallUnknownLengthBodyAfterUnreadTimeout(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "chunked-account", "https://example.com/chunked")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2 distinct candidates", initial.RetryBudget)
+	}
+	initialEntry := initial.SelectedEntry()
+	if initialEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	payload := []byte(`{"model":"generic","stream":false,"input":"chunked-timeout-retry"}`)
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	var bodies [][]byte
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initialEntry},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				if attempt == 1 {
+					// The production failure shape: a chunked/unknown-length body is
+					// still untouched when the first transport attempt times out.
+					return nil, responseHeaderTimeoutError{}
+				}
+				body, readErr := io.ReadAll(req.Body)
+				closeErr := req.Body.Close()
+				if readErr != nil || closeErr != nil {
+					t.Fatalf("retry body completion: read=%v close=%v", readErr, closeErr)
+				}
+				bodies = append(bodies, body)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	requestBody := io.NopCloser(bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/chunked", requestBody)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	if req.ContentLength >= 0 {
+		t.Fatalf("test request unexpectedly has known content length: %d", req.ContentLength)
+	}
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unknown-length timeout retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("unknown-length timeout response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want 2", got)
+	}
+	if len(attempted) != 2 || attempted[0] == attempted[1] {
+		t.Fatalf("retry did not choose a distinct entry: %v", attempted)
+	}
+	if len(bodies) != 1 || !bytes.Equal(bodies[0], payload) {
+		t.Fatalf("retry body: got %q, want one exact payload", bodies)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("timeout cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+}
+
+func TestReverseRetryRoundTripper_RetriesUnknownEmptyBodyAfterUnreadTimeout(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "empty-account", "https://example.com/empty")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2 distinct candidates", initial.RetryBudget)
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if attempts.Add(1) == 1 {
+					return nil, responseHeaderTimeoutError{}
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/empty", io.NopCloser(strings.NewReader("")))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unknown empty body retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("unknown empty body response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want 2", got)
+	}
+}
+
 type gatedKnownLengthBody struct {
 	chunks  [][]byte
 	gates   []chan struct{}
@@ -743,7 +907,7 @@ func TestCaptureKnownLengthRequestBody_GrowsWithBytesNotDeclaredCapacity(t *test
 
 	result := make(chan error, 1)
 	go func() {
-		_, _, err := captureKnownLengthRequestBody(ctx, req)
+		_, _, _, err := captureRequestBodyForRetry(ctx, req)
 		result <- err
 	}()
 	waitForChannel(t, body.readEntered, "known length body read")
@@ -759,6 +923,90 @@ func TestCaptureKnownLengthRequestBody_GrowsWithBytesNotDeclaredCapacity(t *test
 	case <-body.closed:
 	default:
 		t.Fatal("known length body was not closed")
+	}
+}
+
+func TestCaptureRequestBodyForRetryUnknownLengthCancellationClosesOwner(t *testing.T) {
+	body := &blockingKnownLengthBody{
+		readEntered: make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/unknown-cancel", body)
+	req.ContentLength = -1
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, err := captureRequestBodyForRetry(ctx, req)
+		result <- err
+	}()
+	waitForChannel(t, body.readEntered, "unknown body read")
+	cancel()
+	if err := waitForChannel(t, result, "unknown body cancellation"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("unknown body cancellation: %v", err)
+	}
+	waitForChannel(t, body.readDone, "unknown body read exit")
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("unknown body was not closed")
+	}
+}
+
+func TestReverseRetryRoundTripper_OverLimitUnknownBodyStreamsOnceWithoutRetry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	initial, err := env.router.RouteRequest("plat", "large-account", "https://example.com/large")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	payload := bytes.Repeat([]byte("x"), responseRuleRetryBodyLimit+1)
+	var attempts atomic.Int32
+	var received []byte
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				var readErr error
+				received, readErr = io.ReadAll(req.Body)
+				if readErr != nil {
+					t.Fatalf("large body read: %v", readErr)
+				}
+				if err := req.Body.Close(); err != nil {
+					t.Fatalf("large body close: %v", err)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/large", io.NopCloser(bytes.NewReader(payload)))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("large body first attempt: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("large body response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("large body attempts: got %d, want 1", got)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("large body bytes changed: got=%d want=%d", len(received), len(payload))
 	}
 }
 
@@ -1019,7 +1267,8 @@ func TestReverseRetryRoundTripper_UnreplayableTimeoutStillCoolsWithoutRetry(t *t
 			})
 		},
 	}
-	req := httptest.NewRequest(http.MethodPost, "https://example.com/unreplayable", strings.NewReader("unknown-length"))
+	largePayload := bytes.Repeat([]byte("x"), responseRuleRetryBodyLimit+1)
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/unreplayable", io.NopCloser(bytes.NewReader(largePayload)))
 	req.ContentLength = -1
 	_, err = retry.RoundTrip(req)
 	if _, ok := err.(responseHeaderTimeoutError); !ok {
