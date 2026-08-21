@@ -20,6 +20,7 @@ import (
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
+	"github.com/Resinat/Resin/internal/routing"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -540,6 +541,493 @@ func TestReverseRetryRoundTripper_RetriesBodyClosedAtContentLength(t *testing.T)
 	}
 	if len(readBodies) != 2 || string(readBodies[0]) != string(payload) || string(readBodies[1]) != string(payload) {
 		t.Fatalf("request bodies: got %q, want two complete copies", readBodies)
+	}
+}
+
+func TestReverseRetryRoundTripper_TimeoutBeforeBodyReadCoolsAndRetriesReplayablePost(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	other := platform.NewPlatform("other-id", "other", nil, nil)
+	env.pool.RegisterPlatform(other)
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "body-account", "https://example.com/ccload-like")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2 distinct candidates", initial.RetryBudget)
+	}
+	initialEntry := initial.SelectedEntry()
+	if initialEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	payload := []byte(`{"model":"generic","stream":false,"input":"timeout-retry"}`)
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	var bodies [][]byte
+	var finalRoute routing.RouteResult
+	var finalEntry *node.NodeEntry
+	var committedAttempts atomic.Int32
+	var committedBodyBytes atomic.Int64
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initialEntry},
+		onAttemptEgress: func(_, bodyBytes int64) {
+			committedAttempts.Add(1)
+			committedBodyBytes.Add(bodyBytes)
+		},
+		onRoute: func(route routing.RouteResult, entry *node.NodeEntry) {
+			finalRoute = route
+			finalEntry = entry
+		},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				if attempt == 1 {
+					// This is the production failure shape: transport returns a
+					// timeout before it reads or closes the POST body.
+					return nil, responseHeaderTimeoutError{}
+				}
+				body, readErr := io.ReadAll(req.Body)
+				closeErr := req.Body.Close()
+				if readErr != nil || closeErr != nil {
+					t.Fatalf("retry body completion: read=%v close=%v", readErr, closeErr)
+				}
+				bodies = append(bodies, body)
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+					t.Fatal("successful retry attempt missing request trace")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	started := time.Now()
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/ccload-like", strings.NewReader(string(payload)))
+	req.ContentLength = int64(len(payload))
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("timeout retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("timeout retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if elapsed := time.Since(started); elapsed >= 3*time.Second {
+		t.Fatalf("retry exceeded platform total budget: %s", elapsed)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want 2", got)
+	}
+	if len(attempted) != 2 || attempted[0] == attempted[1] {
+		t.Fatalf("retry did not choose a distinct entry: %v", attempted)
+	}
+	if len(bodies) != 1 || string(bodies[0]) != string(payload) {
+		t.Fatalf("retry body: got %q, want one exact payload", bodies)
+	}
+	if committedAttempts.Load() != 1 || committedBodyBytes.Load() != int64(len(payload)) {
+		t.Fatalf("egress commits: attempts=%d body_bytes=%d, want one exact successful body", committedAttempts.Load(), committedBodyBytes.Load())
+	}
+	if finalEntry == nil || finalEntry.Hash != attempted[1] {
+		t.Fatalf("final route entry does not match successful attempt")
+	}
+	if !env.router.CommitRouteForAccount(finalRoute, "body-account") {
+		t.Fatal("successful route was not committed")
+	}
+	sticky, err := env.router.RouteRequest("plat", "body-account", "https://example.com/ccload-like")
+	if err != nil {
+		t.Fatalf("sticky route: %v", err)
+	}
+	if sticky.SelectedEntry() != finalEntry || sticky.EgressIP != finalRoute.EgressIP {
+		t.Fatalf("sticky route changed after successful retry: entry=%v ip=%s", sticky.SelectedEntry(), sticky.EgressIP)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("timeout cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+	otherCooldowns, otherOK := env.router.SnapshotResponseCooldownsForPlatform("other-id", time.Now())
+	if otherOK && len(otherCooldowns) != 0 {
+		t.Fatalf("timeout cooldown leaked to other platform: %v", otherCooldowns)
+	}
+}
+
+type gatedKnownLengthBody struct {
+	chunks  [][]byte
+	gates   []chan struct{}
+	index   atomic.Int32
+	closed  chan struct{}
+	closeMu sync.Once
+}
+
+func (b *gatedKnownLengthBody) Read(p []byte) (int, error) {
+	i := int(b.index.Add(1)) - 1
+	if i >= len(b.chunks) {
+		return 0, io.EOF
+	}
+	select {
+	case <-b.gates[i]:
+	case <-b.closed:
+		return 0, context.Canceled
+	}
+	return copy(p, b.chunks[i]), nil
+}
+
+func (b *gatedKnownLengthBody) Close() error {
+	b.closeMu.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestReverseRetryRoundTripper_SlowKnownBodyUsesRequestBudgetNotCleanupBudget(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "slow-body", "https://example.com/slow-body")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 1 {
+		t.Fatalf("initial route retry budget: got %d", initial.RetryBudget)
+	}
+	const payload = "slow-known-body"
+	body := &gatedKnownLengthBody{
+		chunks: [][]byte{[]byte("slow-"), []byte("known-"), []byte("body")},
+		gates:  []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})},
+		closed: make(chan struct{}),
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				got, readErr := io.ReadAll(req.Body)
+				if readErr != nil || string(got) != payload {
+					t.Fatalf("slow body at transport: got=%q err=%v", got, readErr)
+				}
+				_ = req.Body.Close()
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+			})
+		},
+	}
+	result := make(chan struct {
+		resp *http.Response
+		err  error
+	}, 1)
+	started := time.Now()
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/slow-body", body)
+		req.ContentLength = int64(len(payload))
+		resp, roundTripErr := retry.RoundTrip(req)
+		result <- struct {
+			resp *http.Response
+			err  error
+		}{resp: resp, err: roundTripErr}
+	}()
+	select {
+	case <-time.After(1100 * time.Millisecond):
+		close(body.gates[0])
+	case <-result:
+		t.Fatal("request completed before the deliberately slow body was released")
+	}
+	close(body.gates[1])
+	close(body.gates[2])
+	outcome := waitForChannel(t, result, "slow known body request")
+	if outcome.err != nil || outcome.resp == nil || outcome.resp.StatusCode != http.StatusOK {
+		t.Fatalf("slow known body outcome: resp=%#v err=%v", outcome.resp, outcome.err)
+	}
+	_ = outcome.resp.Body.Close()
+	if elapsed := time.Since(started); elapsed < time.Second {
+		t.Fatalf("slow body test did not cross the old 1s cleanup budget: %s", elapsed)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("slow body attempts: got %d, want 1", got)
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("slow request body was not closed")
+	}
+}
+
+type cancelableKnownLengthBody struct {
+	readStarted chan struct{}
+	readDone    chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
+}
+
+func (b *cancelableKnownLengthBody) Read([]byte) (int, error) {
+	select {
+	case <-b.readStarted:
+	default:
+		close(b.readStarted)
+	}
+	<-b.closed
+	close(b.readDone)
+	return 0, io.EOF
+}
+
+func (b *cancelableKnownLengthBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestReverseRetryRoundTripper_KnownBodyBudgetDeadlineAbortsBeforeAttempt(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "deadline-body", "https://example.com/deadline-body")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RequestTotalTimeout = 100 * time.Millisecond
+	body := &cancelableKnownLengthBody{
+		readStarted: make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("unexpected"))}, nil
+			})
+		},
+	}
+	result := make(chan error, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/deadline-body", body)
+		req.ContentLength = 4
+		_, roundTripErr := retry.RoundTrip(req)
+		result <- roundTripErr
+	}()
+	waitForChannel(t, body.readStarted, "known body read")
+	select {
+	case roundTripErr := <-result:
+		if !errors.Is(roundTripErr, context.DeadlineExceeded) {
+			t.Fatalf("deadline body error: %v", roundTripErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("known body did not stop at request budget")
+	}
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("deadline body reached upstream: %d attempts", got)
+	}
+	waitForChannel(t, body.readDone, "deadline body read exit")
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("deadline body was not closed")
+	}
+}
+
+func TestReverseRetryRoundTripper_KnownBodyCallerCancellationAbortsBeforeAttempt(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "canceled-body", "https://example.com/canceled-body")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	body := &cancelableKnownLengthBody{
+		readStarted: make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return nil, errors.New("unexpected upstream attempt")
+			})
+		},
+	}
+	result := make(chan error, 1)
+	go func() {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "https://example.com/canceled-body", body)
+		req.ContentLength = 4
+		_, roundTripErr := retry.RoundTrip(req)
+		result <- roundTripErr
+	}()
+	waitForChannel(t, body.readStarted, "cancellable body read")
+	cancel()
+	if roundTripErr := waitForChannel(t, result, "canceled known body request"); !errors.Is(roundTripErr, context.Canceled) {
+		t.Fatalf("canceled body error: %v", roundTripErr)
+	}
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("canceled body reached upstream: %d attempts", got)
+	}
+	waitForChannel(t, body.readDone, "canceled body read exit")
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("canceled body was not closed")
+	}
+}
+
+func TestReverseRetryRoundTripper_UnreplayableTimeoutStillCoolsWithoutRetry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "unknown-body", "https://example.com/unreplayable")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2", initial.RetryBudget)
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := newUpstreamRequestTrace().newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return nil, responseHeaderTimeoutError{}
+			})
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/unreplayable", strings.NewReader("unknown-length"))
+	req.ContentLength = -1
+	_, err = retry.RoundTrip(req)
+	if _, ok := err.(responseHeaderTimeoutError); !ok {
+		t.Fatalf("unreplayable timeout error: got %T %v", err, err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("unreplayable timeout retried: got %d attempts, want 1", got)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("unreplayable timeout cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+}
+
+func TestReverseRetryRoundTripper_StartedResponseUsesCapturedBudgetWithoutRetry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "idle-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"idle_timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "started-response", "https://example.com/started")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2", initial.RetryBudget)
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := newUpstreamRequestTrace().newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil || trace.GotFirstResponseByte == nil {
+					t.Fatal("started-response attempt missing trace callbacks")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				trace.GotFirstResponseByte()
+				attempts.Add(1)
+				return nil, responseHeaderTimeoutError{}
+			})
+		},
+	}
+	_, err = retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/started", nil))
+	if err == nil {
+		t.Fatal("started-response timeout unexpectedly succeeded")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("started-response timeout retried: got %d attempts, want 1", got)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("started-response cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
 	}
 }
 

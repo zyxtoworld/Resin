@@ -382,6 +382,52 @@ func cloneForwardRequestForRetry(base *http.Request, body []byte) *http.Request 
 	return retry
 }
 
+// captureKnownLengthRequestBody buffers only small, declared request bodies
+// before the first upstream attempt. The caller supplies the request-level
+// budget context; there is deliberately no second fixed upload timeout here.
+// This gives every attempt an independent reader even when a transport fails
+// before touching Request.Body. Unknown or oversized bodies remain streaming
+// and therefore fail closed for retry.
+func captureKnownLengthRequestBody(ctx context.Context, req *http.Request) ([]byte, bool, error) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody || req.ContentLength <= 0 ||
+		req.ContentLength > int64(responseRuleRetryBodyLimit) {
+		return nil, false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	payload := make([]byte, int(req.ContentLength))
+	capture := newReplayBodyCapture(req.Body, req.ContentLength)
+	owner := newAttemptRequestBody(capture)
+	readDone := make(chan struct{})
+	var readN int
+	var readErr error
+	var closeErr error
+	go func() {
+		readN, readErr = io.ReadFull(owner, payload)
+		closeErr = owner.Close()
+		close(readDone)
+	}()
+
+	select {
+	case <-readDone:
+		if readErr != nil {
+			return nil, false, readErr
+		}
+		if closeErr != nil {
+			return nil, false, closeErr
+		}
+		if readN != len(payload) {
+			return nil, false, io.ErrUnexpectedEOF
+		}
+		return payload, true, nil
+	case <-ctx.Done():
+		owner.abort()
+		return nil, false, ctx.Err()
+	}
+}
+
 func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	platName, account, authErr := p.authenticate(r)
 	if authErr != nil {

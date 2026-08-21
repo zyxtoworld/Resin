@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -36,13 +37,6 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		return nil, context.Canceled
 	}
 
-	baseReq := req
-	var capture *replayBodyCapture
-	if baseReq.Body != nil && baseReq.Body != http.NoBody {
-		capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
-		baseReq = baseReq.Clone(baseReq.Context())
-		baseReq.Body = capture
-	}
 	requestBudget, budgetEnabled := effectiveProxyRequestBudget(t.initial.Route.RequestTotalTimeout, t.requestTotalTimeout)
 	requestCtx := req.Context()
 	cancelRequest := func() {}
@@ -56,6 +50,31 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			cancelRequest()
 		}
 	}()
+
+	baseReq := req
+	var capture *replayBodyCapture
+	var preparedBody []byte
+	if budgetEnabled && baseReq.Body != nil && baseReq.Body != http.NoBody {
+		var prepared bool
+		var prepareErr error
+		preparedBody, prepared, prepareErr = captureKnownLengthRequestBody(requestCtx, req)
+		if prepareErr != nil {
+			releaseRequest()
+			cancelRequest()
+			return nil, prepareErr
+		}
+		baseReq = baseReq.Clone(baseReq.Context())
+		if prepared {
+			baseReq.Body = http.NoBody
+			baseReq.ContentLength = int64(len(preparedBody))
+			baseReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(preparedBody)), nil
+			}
+		} else {
+			capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
+			baseReq.Body = capture
+		}
+	}
 	finishResponse := func(resp *http.Response, accepted bool, cancelAttempt context.CancelFunc) (*http.Response, error) {
 		t.promotable = accepted
 		releaseRequest()
@@ -136,7 +155,9 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			t.onRoute(current.Route, current.Entry)
 		}
 		outReq := baseReq
-		if attempt > 0 {
+		if preparedBody != nil {
+			outReq = cloneForwardRequestForRetry(baseReq, preparedBody)
+		} else if attempt > 0 {
 			outReq = cloneForwardRequestForRetry(baseReq, capture.Bytes())
 		}
 		outReq = outReq.WithContext(attemptCtx)
@@ -148,7 +169,27 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		resp, err, bodyBytes, bodyComplete := roundTripWithBodyCompletion(
 			attemptCtx, t.transportFor(current), outReq,
 		)
+		bodyReplayable := preparedBody != nil || requestCanBeReplayed(req, capture)
+		retryCurrent := func() bool {
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
+			next, ok := advance()
+			if !ok {
+				return false
+			}
+			current = next
+			return true
+		}
 		if !bodyComplete {
+			if err != nil {
+				failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
+				canRetry := budgetEnabled && failureMatched && failureMatch.RetryNext() && (attemptTrace == nil || !attemptTrace.responseStarted()) && resp == nil && bounded &&
+					bodyReplayable && attempt+1 < budget && requestCtx.Err() == nil
+				if canRetry && retryCurrent() {
+					continue
+				}
+			}
 			if cancelAttempt != nil {
 				cancelAttempt()
 			}
@@ -164,15 +205,9 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		if err != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
 			canRetry := budgetEnabled && failureMatched && failureMatch.RetryNext() && (attemptTrace == nil || !attemptTrace.responseStarted()) && resp == nil && bounded &&
-				requestCanBeReplayed(req, capture) && attempt+1 < budget && requestCtx.Err() == nil
-			if canRetry {
-				if cancelAttempt != nil {
-					cancelAttempt()
-				}
-				if next, ok := advance(); ok {
-					current = next
-					continue
-				}
+				bodyReplayable && attempt+1 < budget && requestCtx.Err() == nil
+			if canRetry && retryCurrent() {
+				continue
 			}
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -185,7 +220,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 
 		decision, matched := applyResponseRules(t.router, current.Route, resp)
 		finalAccepted := !matched || decision.Action == platform.ResponseRuleActionPassthrough
-		if !matched || !budgetEnabled || !decision.RetryNext() || !requestCanBeReplayed(req, capture) || attempt+1 >= budget {
+		if !matched || !budgetEnabled || !decision.RetryNext() || !bodyReplayable || attempt+1 >= budget {
 			return finishResponse(resp, finalAccepted, cancelAttempt)
 		}
 		if requestCtx.Err() != nil {

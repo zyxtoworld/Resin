@@ -322,6 +322,13 @@ func roundTripWithBodyCompletionBudget(
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
+			// Preserve a transport error for policy classification even when the
+			// request body owner did not quiesce. Callers must still fail closed
+			// for egress accounting, but a known transport failure must not skip
+			// its platform cooldown rule.
+			if err != nil && !errors.Is(awaitErr, context.Canceled) && !errors.Is(awaitErr, context.DeadlineExceeded) {
+				return nil, err, 0, false
+			}
 			return nil, awaitErr, 0, false
 		}
 	}
