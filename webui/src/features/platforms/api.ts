@@ -35,6 +35,8 @@ function parseMissAction(raw: ApiPlatform["reverse_proxy_miss_action"]): Platfor
 function normalizePlatform(raw: ApiPlatform): Platform {
   return {
     ...raw,
+    proxy_request_total_timeout:
+      typeof raw.proxy_request_total_timeout === "string" ? raw.proxy_request_total_timeout : "",
     reverse_proxy_miss_action: parseMissAction(raw.reverse_proxy_miss_action),
     regex_filters: Array.isArray(raw.regex_filters) ? raw.regex_filters : [],
     region_filters: Array.isArray(raw.region_filters) ? raw.region_filters : [],

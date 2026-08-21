@@ -150,6 +150,56 @@ func TestRouteResult_CapturesPassiveCircuitBreakerPolicy(t *testing.T) {
 	}
 }
 
+func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	current, ok := pool.GetPlatform(platID)
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	current.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	makeRoutableNode(t, pool, subMgr, `{"budget-generation":"1"}`, "1.2.3.6", "cloudflare.com", 50*time.Millisecond)
+	router := makeRouter(pool, nil)
+
+	oldRoute, err := router.RouteRequestForProxy(platName, "account", "example.com")
+	if err != nil {
+		t.Fatalf("old route: %v", err)
+	}
+	if oldRoute.RequestTotalTimeout != 2*time.Second {
+		t.Fatalf("old route budget = %s, want 2s", oldRoute.RequestTotalTimeout)
+	}
+
+	replacement := platform.NewPlatform(platID, platName, nil, nil)
+	replacement.StickyTTLNs = current.StickyTTLNs
+	replacement.ProxyRequestTotalTimeoutNs = int64(5 * time.Second)
+	if err := pool.ReplacePlatform(replacement); err != nil {
+		t.Fatalf("ReplacePlatform: %v", err)
+	}
+	newRoute, err := router.RouteRequestForProxy(platName, "new-account", "example.com")
+	if err != nil {
+		t.Fatalf("new route: %v", err)
+	}
+	if newRoute.RequestTotalTimeout != 5*time.Second {
+		t.Fatalf("new route budget = %s, want 5s", newRoute.RequestTotalTimeout)
+	}
+	if oldRoute.RequestTotalTimeout != 2*time.Second {
+		t.Fatalf("old in-flight route budget changed after replacement: %s", oldRoute.RequestTotalTimeout)
+	}
+
+	pool.UnregisterPlatform(platID)
+	recreated := platform.NewPlatform(platID, platName, nil, nil)
+	recreated.StickyTTLNs = current.StickyTTLNs
+	if err := pool.RegisterPlatform(recreated); err != nil {
+		t.Fatalf("RegisterPlatform recreated: %v", err)
+	}
+	recreatedRoute, err := router.RouteRequestForProxy(platName, "recreated-account", "example.com")
+	if err != nil {
+		t.Fatalf("recreated route: %v", err)
+	}
+	if recreatedRoute.RequestTotalTimeout != 0 {
+		t.Fatalf("recreated platform inherited retry budget: %s", recreatedRoute.RequestTotalTimeout)
+	}
+}
+
 func TestRandomRoute_MultipleNodes(t *testing.T) {
 	pool, subMgr := setupPool(t)
 	h1 := makeRoutableNode(t, pool, subMgr, `{"multi":"1"}`, "10.0.0.1", "cloudflare.com", 50*time.Millisecond)

@@ -20,7 +20,10 @@ type Platform struct {
 	ReverseProxyFixedAccountHeader   string                 `json:"reverse_proxy_fixed_account_header"`
 	AllocationPolicy                 string                 `json:"allocation_policy"`
 	PassiveCircuitBreakerDisabled    bool                   `json:"passive_circuit_breaker_disabled"`
-	UpdatedAtNs                      int64                  `json:"updated_at_ns"`
+	// ProxyRequestTotalTimeoutNs is the platform-owned pre-response retry
+	// budget. Zero means retry-next is disabled for this platform.
+	ProxyRequestTotalTimeoutNs int64 `json:"proxy_request_total_timeout_ns"`
+	UpdatedAtNs                int64 `json:"updated_at_ns"`
 }
 
 // PlatformResponseRule describes one ordered, first-match response policy.

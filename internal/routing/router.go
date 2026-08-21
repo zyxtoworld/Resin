@@ -263,6 +263,9 @@ type RouteResult struct {
 	LeaseCreated                  bool
 	PassiveCircuitBreakerDisabled bool
 	ResponseRules                 platform.ResponseRules
+	// RequestTotalTimeout is copied from the platform generation. It is the
+	// platform opt-in; proxy code applies the process-wide cap separately.
+	RequestTotalTimeout time.Duration
 	// selectedEntry is the exact pool entry that passed the platform view at
 	// route selection time. Consumers must re-read the pool and compare pointer
 	// identity before using the current entry; this is not a resource lease.
@@ -294,10 +297,11 @@ type routeRetryCandidate struct {
 // RouteRetrySnapshot is captured by the initial route generation. It cannot
 // grow when the platform is hot-reloaded.
 type RouteRetrySnapshot struct {
-	platformID string
-	platform   *platform.Platform
-	candidates []routeRetryCandidate
-	budget     int
+	platformID          string
+	platform            *platform.Platform
+	candidates          []routeRetryCandidate
+	budget              int
+	requestTotalTimeout time.Duration
 }
 
 // RetrySnapshot returns the immutable retry candidate generation captured by
@@ -414,7 +418,8 @@ func (r *Router) RouteRequestNext(previous RouteResult, exclusions RouteRetryExc
 			PlatformID: snapshot.platform.ID, PlatformName: snapshot.platform.Name,
 			NodeHash: candidate.hash, EgressIP: candidate.ip,
 			RetryBudget: snapshot.budget, ResponseRules: snapshot.platform.ResponseRules,
-			selectedEntry: candidate.entry, platform: snapshot.platform, retrySnapshot: snapshot,
+			RequestTotalTimeout: snapshot.requestTotalTimeout,
+			selectedEntry:       candidate.entry, platform: snapshot.platform, retrySnapshot: snapshot,
 		}
 		result = withPlatformContext(snapshot.platform, result)
 		if r.nodeTagResolver != nil {
@@ -618,6 +623,7 @@ func (r *Router) captureRetrySnapshot(plat *platform.Platform, cooldowns *Respon
 		return snapshot
 	}
 	snapshot.platformID = plat.ID
+	snapshot.requestTotalTimeout = time.Duration(plat.ProxyRequestTotalTimeoutNs)
 	plat.RangeViewEntries(func(hash node.Hash, published *node.NodeEntry) bool {
 		if published == nil || !published.IsHealthy() || r.pool.IsNodeDisabled(hash) {
 			return true
@@ -641,6 +647,7 @@ func withPlatformContext(plat *platform.Platform, res RouteResult) RouteResult {
 	res.PlatformName = plat.Name
 	res.PassiveCircuitBreakerDisabled = plat.PassiveCircuitBreakerDisabled
 	res.ResponseRules = plat.ResponseRules
+	res.RequestTotalTimeout = time.Duration(plat.ProxyRequestTotalTimeoutNs)
 	return res
 }
 

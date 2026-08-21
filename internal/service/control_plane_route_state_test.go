@@ -395,6 +395,66 @@ func TestGetPlatformRouteStateBoundsNodePayloadAtProductionScale(t *testing.T) {
 	}
 }
 
+func TestGetPlatformRouteStateCursorWalksBeyondFiveThousandNodes(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	sub := subscription.NewSubscription("route-state-cursor-scale-sub", "RouteStateCursorScale", "https://example.com/route-state-cursor-scale", true, false)
+	cp.SubMgr.Register(sub)
+	const totalNodes = 5005
+	for i := 0; i < totalNodes; i++ {
+		raw := []byte(fmt.Sprintf(`{"id":"route-state-cursor-%d","type":"ss","server":"198.51.100.1","port":443}`, i))
+		hash := node.HashFromRawOptions(raw)
+		cp.Pool.AddNodeFromSub(hash, raw, sub.ID)
+		sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{})
+		entry, ok := cp.Pool.GetEntry(hash)
+		if !ok {
+			t.Fatalf("cursor scale fixture entry %d missing", i)
+		}
+		entry.CircuitOpenSince.Store(0)
+		entry.SetEgressIP(netip.AddrFrom4([4]byte{198, 20, byte(i >> 8), byte(i)}))
+		entry.LatencyTable.Update("cloudflare.com", time.Millisecond, time.Minute)
+		outbound := testutil.NewNoopOutbound()
+		entry.Outbound.Store(&outbound)
+	}
+	plat.FullRebuild(cp.Pool.Range, cp.Pool.MakeSubLookup(), func(netip.Addr) string { return "us" })
+
+	seen := make(map[string]struct{}, totalNodes)
+	cursor := ""
+	for page := 0; ; page++ {
+		state, err := cp.GetPlatformRouteStateContext(context.Background(), plat.ID, PlatformRouteStateQuery{
+			NodeLimit:  200,
+			NodeCursor: cursor,
+		})
+		if err != nil {
+			t.Fatalf("cursor page %d: %v", page, err)
+		}
+		if state.NodesTotal != totalNodes || len(state.Nodes) > 200 {
+			t.Fatalf("cursor page %d bounds: total=%d len=%d", page, state.NodesTotal, len(state.Nodes))
+		}
+		for _, item := range state.Nodes {
+			if _, exists := seen[item.NodeHash]; exists {
+				t.Fatalf("cursor page %d repeated node %s", page, item.NodeHash)
+			}
+			seen[item.NodeHash] = struct{}{}
+		}
+		if !state.NodesHasMore {
+			if state.NodesNextCursor != "" {
+				t.Fatalf("last cursor page exposed next cursor %q", state.NodesNextCursor)
+			}
+			break
+		}
+		if state.NodesNextCursor == "" {
+			t.Fatalf("cursor page %d reported has_more without next cursor", page)
+		}
+		cursor = state.NodesNextCursor
+		if page > totalNodes/200+2 {
+			t.Fatalf("cursor traversal exceeded expected page bound at page %d", page)
+		}
+	}
+	if len(seen) != totalNodes {
+		t.Fatalf("cursor traversal saw %d unique nodes, want %d", len(seen), totalNodes)
+	}
+}
+
 func TestGetPlatformRouteStateBoundsLargeCooldownAndLeasePayload(t *testing.T) {
 	cp, plat := newLeaseInheritanceTestService()
 	sub := subscription.NewSubscription("route-state-large-sub", "RouteStateLarge", "https://example.com/route-state-large", true, false)

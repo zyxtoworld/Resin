@@ -35,6 +35,7 @@ type PlatformResponse struct {
 	ReverseProxyFixedAccountHeader   string                       `json:"reverse_proxy_fixed_account_header"`
 	AllocationPolicy                 string                       `json:"allocation_policy"`
 	PassiveCircuitBreakerDisabled    bool                         `json:"passive_circuit_breaker_disabled"`
+	ProxyRequestTotalTimeout         string                       `json:"proxy_request_total_timeout"`
 	UpdatedAt                        string                       `json:"updated_at"`
 }
 
@@ -55,8 +56,16 @@ func platformToResponse(p model.Platform) PlatformResponse {
 		ReverseProxyFixedAccountHeader:   fixedHeader,
 		AllocationPolicy:                 p.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    p.PassiveCircuitBreakerDisabled,
+		ProxyRequestTotalTimeout:         platformProxyRequestTotalTimeoutString(p.ProxyRequestTotalTimeoutNs),
 		UpdatedAt:                        time.Unix(0, p.UpdatedAtNs).UTC().Format(time.RFC3339Nano),
 	}
+}
+
+func platformProxyRequestTotalTimeoutString(ns int64) string {
+	if ns <= 0 {
+		return ""
+	}
+	return time.Duration(ns).String()
 }
 
 func (s *ControlPlaneService) withRoutableNodeCount(resp PlatformResponse) PlatformResponse {
@@ -90,6 +99,7 @@ type platformConfig struct {
 	ReverseProxyFixedAccountHeader   string
 	AllocationPolicy                 string
 	PassiveCircuitBreakerDisabled    bool
+	ProxyRequestTotalTimeoutNs       int64
 }
 
 func normalizePlatformMissAction(raw string) string {
@@ -120,7 +130,8 @@ func (s *ControlPlaneService) defaultPlatformConfig(name string) platformConfig 
 		ReverseProxyFixedAccountHeader: normalizeHeaderFieldName(
 			s.EnvCfg.DefaultPlatformReverseProxyFixedAccountHeader,
 		),
-		AllocationPolicy: s.EnvCfg.DefaultPlatformAllocationPolicy,
+		AllocationPolicy:           s.EnvCfg.DefaultPlatformAllocationPolicy,
+		ProxyRequestTotalTimeoutNs: 0,
 	}
 }
 
@@ -136,6 +147,7 @@ func platformConfigFromModel(mp model.Platform) platformConfig {
 		ReverseProxyFixedAccountHeader:   normalizeHeaderFieldName(mp.ReverseProxyFixedAccountHeader),
 		AllocationPolicy:                 mp.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    mp.PassiveCircuitBreakerDisabled,
+		ProxyRequestTotalTimeoutNs:       mp.ProxyRequestTotalTimeoutNs,
 	}
 }
 
@@ -153,6 +165,7 @@ func (cfg platformConfig) toModel(id string, updatedAtNs int64) model.Platform {
 		ReverseProxyFixedAccountHeader:   cfg.ReverseProxyFixedAccountHeader,
 		AllocationPolicy:                 cfg.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    cfg.PassiveCircuitBreakerDisabled,
+		ProxyRequestTotalTimeoutNs:       cfg.ProxyRequestTotalTimeoutNs,
 		UpdatedAtNs:                      updatedAtNs,
 	}
 }
@@ -174,6 +187,7 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 		cfg.AllocationPolicy,
 		cfg.PassiveCircuitBreakerDisabled,
 	)
+	plat.ProxyRequestTotalTimeoutNs = cfg.ProxyRequestTotalTimeoutNs
 	responseRules, err := platform.CompileResponseRules(id, cfg.ResponseRules)
 	if err != nil {
 		return nil, err
@@ -281,6 +295,17 @@ func setPlatformAllocationPolicy(cfg *platformConfig, policy string) *ServiceErr
 	return nil
 }
 
+func setPlatformProxyRequestTotalTimeout(cfg *platformConfig, d time.Duration) *ServiceError {
+	if d < 0 {
+		return invalidArg("proxy_request_total_timeout: must be non-negative")
+	}
+	if err := platform.ValidateProxyRequestTotalTimeoutNs(int64(d)); err != nil {
+		return invalidArg(err.Error())
+	}
+	cfg.ProxyRequestTotalTimeoutNs = int64(d)
+	return nil
+}
+
 func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *ServiceError {
 	if cfg == nil {
 		return invalidArg("platform config is required")
@@ -297,6 +322,9 @@ func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *Se
 	}
 	if err := validatePlatformEmptyAccountConfig(cfg); err != nil {
 		return err
+	}
+	if err := platform.ValidateProxyRequestTotalTimeoutNs(cfg.ProxyRequestTotalTimeoutNs); err != nil {
+		return invalidArg(err.Error())
 	}
 	if _, err := platform.CompileResponseRules("config", cfg.ResponseRules); err != nil {
 		return invalidArg(err.Error())
@@ -541,6 +569,7 @@ type CreatePlatformRequest struct {
 	ReverseProxyFixedAccountHeader   *string                      `json:"reverse_proxy_fixed_account_header"`
 	AllocationPolicy                 *string                      `json:"allocation_policy"`
 	PassiveCircuitBreakerDisabled    *bool                        `json:"passive_circuit_breaker_disabled"`
+	ProxyRequestTotalTimeout         *string                      `json:"proxy_request_total_timeout"`
 	ResponseRules                    []model.PlatformResponseRule `json:"response_rules"`
 }
 
@@ -612,6 +641,15 @@ func (s *ControlPlaneService) CreatePlatformContext(ctx context.Context, req Cre
 	}
 	if req.PassiveCircuitBreakerDisabled != nil {
 		cfg.PassiveCircuitBreakerDisabled = *req.PassiveCircuitBreakerDisabled
+	}
+	if req.ProxyRequestTotalTimeout != nil {
+		d, err := time.ParseDuration(strings.TrimSpace(*req.ProxyRequestTotalTimeout))
+		if err != nil {
+			return nil, invalidArg("proxy_request_total_timeout: " + err.Error())
+		}
+		if err := setPlatformProxyRequestTotalTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
 	}
 	if err := validatePlatformConfig(&cfg, true); err != nil {
 		return nil, err
@@ -764,6 +802,13 @@ func (s *ControlPlaneService) UpdatePlatformContext(ctx context.Context, id stri
 		return nil, err
 	} else if ok {
 		cfg.PassiveCircuitBreakerDisabled = disabled
+	}
+	if d, ok, err := patch.optionalNonNegativeDurationString("proxy_request_total_timeout"); err != nil {
+		return nil, err
+	} else if ok {
+		if err := setPlatformProxyRequestTotalTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
 	}
 	if err := validatePlatformConfig(&cfg, regionFiltersPatched); err != nil {
 		return nil, err

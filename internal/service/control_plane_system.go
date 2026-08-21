@@ -505,6 +505,7 @@ var platformPatchAllowedFields = map[string]bool{
 	"reverse_proxy_fixed_account_header":   true,
 	"allocation_policy":                    true,
 	"passive_circuit_breaker_disabled":     true,
+	"proxy_request_total_timeout":          true,
 	"response_rules":                       true,
 }
 

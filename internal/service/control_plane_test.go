@@ -491,7 +491,8 @@ func TestCreatePlatform_BuildsRoutableViewBeforePublish(t *testing.T) {
 	}
 
 	name := "new-platform"
-	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name})
+	totalTimeout := "45s"
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name, ProxyRequestTotalTimeout: &totalTimeout})
 	if err != nil {
 		t.Fatalf("CreatePlatform: %v", err)
 	}
@@ -512,6 +513,32 @@ func TestCreatePlatform_BuildsRoutableViewBeforePublish(t *testing.T) {
 	if plat.PassiveCircuitBreakerDisabled {
 		t.Fatal("runtime platform should default passive circuit breaker to not disabled")
 	}
+	if created.ProxyRequestTotalTimeout != totalTimeout {
+		t.Fatalf("created platform proxy request total timeout = %q, want %q", created.ProxyRequestTotalTimeout, totalTimeout)
+	}
+	if plat.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
+		t.Fatalf("runtime platform proxy request total timeout = %d, want %d", plat.ProxyRequestTotalTimeoutNs, 45*time.Second)
+	}
+	persisted, err := engine.GetPlatform(created.ID)
+	if err != nil {
+		t.Fatalf("GetPlatform after create: %v", err)
+	}
+	if persisted.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
+		t.Fatalf("persisted platform proxy request total timeout = %d, want %d", persisted.ProxyRequestTotalTimeoutNs, 45*time.Second)
+	}
+
+	updated, err := cp.UpdatePlatform(created.ID, []byte(`{"proxy_request_total_timeout":"90s"}`))
+	if err != nil {
+		t.Fatalf("UpdatePlatform proxy request total timeout: %v", err)
+	}
+	if updated.ProxyRequestTotalTimeout != "1m30s" {
+		t.Fatalf("updated platform proxy request total timeout = %q, want 1m30s", updated.ProxyRequestTotalTimeout)
+	}
+	updatedRuntime, ok := pool.GetPlatform(created.ID)
+	if !ok || updatedRuntime.ProxyRequestTotalTimeoutNs != int64(90*time.Second) {
+		t.Fatalf("updated runtime platform proxy request total timeout = %v, want 90s", updatedRuntime)
+	}
+
 }
 
 func TestCreatePlatform_RejectsReservedAPIName(t *testing.T) {

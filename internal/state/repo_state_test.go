@@ -961,6 +961,7 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	p := model.Platform{
 		ID: "plat-1", Name: "Default", StickyTTLNs: 1000,
 		RegexFilters: []string{}, RegionFilters: []string{},
+		ProxyRequestTotalTimeoutNs: int64(45 * time.Second),
 		ResponseRules: []model.PlatformResponseRule{{
 			ID: "quota", Enabled: true,
 			Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
@@ -991,6 +992,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	if !got.PassiveCircuitBreakerDisabled {
 		t.Fatal("expected passive_circuit_breaker_disabled to round-trip true")
 	}
+	if got.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
+		t.Fatalf("proxy request total timeout did not round-trip: got %d, want %d", got.ProxyRequestTotalTimeoutNs, 45*time.Second)
+	}
 	if len(got.ResponseRules) != 1 || got.ResponseRules[0].ID != "quota" || !got.ResponseRules[0].Enabled || got.ResponseRules[0].Action.CooldownScope != "egress_ip" || got.ResponseRules[0].Action.FixedDuration != "24h" {
 		t.Fatalf("response_rules did not round-trip: %+v", got.ResponseRules)
 	}
@@ -1019,6 +1023,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	}
 	if list[0].PassiveCircuitBreakerDisabled {
 		t.Fatal("expected passive_circuit_breaker_disabled to update to false")
+	}
+	if list[0].ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
+		t.Fatalf("proxy request total timeout changed unexpectedly: got %d, want %d", list[0].ProxyRequestTotalTimeoutNs, 45*time.Second)
 	}
 
 	// Delete.

@@ -41,6 +41,7 @@ type EnvConfig struct {
 	DefaultPlatformReverseProxyFixedAccountHeader   string
 	DefaultPlatformAllocationPolicy                 string
 	ProbeTimeout                                    time.Duration
+	ProxyRequestTotalTimeout                        time.Duration
 	ResourceFetchTimeout                            time.Duration
 	NodeDNSUpstreams                                []string
 	ProxyTransportMaxIdleConns                      int
@@ -76,11 +77,12 @@ type EnvConfig struct {
 // contains many strings and optional byte slices, so accepting an arbitrary
 // channel capacity turns configuration into an unbounded allocation request.
 const (
-	MaxRequestLogQueueSize      = 1 << 17
-	MaxRequestLogFlushBatchSize = 1 << 16
-	defaultRequestLogQueueSize  = 8192
-	defaultRequestLogBatchSize  = 4096
-	defaultResourceFetchTimeout = 60 * time.Second
+	MaxRequestLogQueueSize          = 1 << 17
+	MaxRequestLogFlushBatchSize     = 1 << 16
+	defaultRequestLogQueueSize      = 8192
+	defaultRequestLogBatchSize      = 4096
+	defaultProxyRequestTotalTimeout = 30 * time.Second
+	defaultResourceFetchTimeout     = 60 * time.Second
 )
 
 // DefaultNodeDNSUpstreams returns the default node DNS upstream URI list.
@@ -133,6 +135,7 @@ func LoadEnvConfig() (*EnvConfig, error) {
 		string(platform.AllocationPolicyBalanced),
 	)
 	cfg.ProbeTimeout = envDuration("RESIN_PROBE_TIMEOUT", 15*time.Second, &errs)
+	cfg.ProxyRequestTotalTimeout = envDuration("RESIN_PROXY_REQUEST_TOTAL_TIMEOUT", defaultProxyRequestTotalTimeout, &errs)
 	cfg.ResourceFetchTimeout = envDuration("RESIN_RESOURCE_FETCH_TIMEOUT", defaultResourceFetchTimeout, &errs)
 	cfg.NodeDNSUpstreams = envStringSlice("RESIN_NODE_DNS_UPSTREAMS", DefaultNodeDNSUpstreams(), &errs)
 	cfg.ProxyTransportMaxIdleConns = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS", 1024, &errs)
@@ -279,6 +282,9 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	}
 	if cfg.ResourceFetchTimeout <= 0 {
 		errs = append(errs, "RESIN_RESOURCE_FETCH_TIMEOUT must be positive")
+	}
+	if cfg.ProxyRequestTotalTimeout <= 0 {
+		errs = append(errs, "RESIN_PROXY_REQUEST_TOTAL_TIMEOUT must be positive")
 	}
 	if len(cfg.NodeDNSUpstreams) == 0 {
 		errs = append(errs, "RESIN_NODE_DNS_UPSTREAMS must contain at least one DNS upstream when defined")

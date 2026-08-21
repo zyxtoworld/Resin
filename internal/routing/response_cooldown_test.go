@@ -110,6 +110,66 @@ func TestResponseCooldownReadSnapshotFilterChecksEachItemOnce(t *testing.T) {
 	}
 }
 
+func TestResponseCooldownReadSnapshotDefersFullOrderingUntilRequested(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	now := time.Now()
+	for i := 0; i < 1500; i++ {
+		hash := node.HashFromRawOptions([]byte(fmt.Sprintf(`{"id":"snapshot-order-%d"}`, i)))
+		cooldowns.Mark(platform.ResponseRuleScopeNode, hash, netip.Addr{}, now.Add(time.Hour))
+	}
+	snapshot := cooldowns.ReadSnapshot(now)
+	if len(snapshot.byNode) != 1500 || len(snapshot.byEgress) != 0 {
+		t.Fatalf("snapshot indexes = node:%d egress:%d, want 1500/0", len(snapshot.byNode), len(snapshot.byEgress))
+	}
+	items := snapshot.Items()
+	if len(items) != 1500 {
+		t.Fatalf("ordered snapshot items = %d, want 1500", len(items))
+	}
+	for i := 1; i < len(items); i++ {
+		if compareResponseCooldownSnapshots(items[i-1], items[i]) >= 0 {
+			t.Fatalf("ordered snapshot is not strictly stable at %d", i)
+		}
+	}
+	page, total, hasMore := snapshot.SnapshotPageWithCount(0, 50, nil, nil)
+	if len(page) != 50 || total != 1500 || !hasMore {
+		t.Fatalf("bounded snapshot page = len:%d total:%d has_more:%t", len(page), total, hasMore)
+	}
+}
+
+func TestResponseCooldownReadSnapshotPageHasMoreUsesPageEligibleCount(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	now := time.Now()
+	pageEligible := make(map[node.Hash]struct{}, 55)
+	for i := 0; i < 100; i++ {
+		hash := node.HashFromRawOptions([]byte(fmt.Sprintf(`{"id":"snapshot-page-filter-%d"}`, i)))
+		cooldowns.Mark(platform.ResponseRuleScopeNode, hash, netip.Addr{}, now.Add(time.Hour))
+		if i < 55 {
+			pageEligible[hash] = struct{}{}
+		}
+	}
+	snapshot := cooldowns.ReadSnapshot(now)
+	countAll := func(ResponseCooldownSnapshot) bool { return true }
+	pageFilter := func(item ResponseCooldownSnapshot) bool {
+		_, ok := pageEligible[item.NodeHash]
+		return ok
+	}
+
+	first, total, hasMore := snapshot.SnapshotPageWithCount(0, 50, countAll, pageFilter)
+	if len(first) != 50 || total != 100 || !hasMore {
+		t.Fatalf("first page = len:%d total:%d has_more:%t, want 50/100/true", len(first), total, hasMore)
+	}
+	last, total, hasMore := snapshot.SnapshotPageWithCount(50, 50, countAll, pageFilter)
+	if len(last) != 5 || total != 100 || hasMore {
+		t.Fatalf("last page = len:%d total:%d has_more:%t, want 5/100/false", len(last), total, hasMore)
+	}
+	if page, _, hasMore := snapshot.SnapshotPageWithCount(55, 50, countAll, pageFilter); len(page) != 0 || hasMore {
+		t.Fatalf("page after eligible range = len:%d has_more:%t, want 0/false", len(page), hasMore)
+	}
+	if page, _, hasMore := snapshot.SnapshotPageWithCount(100, 50, countAll, pageFilter); len(page) != 0 || hasMore {
+		t.Fatalf("offset beyond counted range = len:%d has_more:%t, want 0/false", len(page), hasMore)
+	}
+}
+
 func TestResponseCooldowns_EgressCooldownSurvivesEntryRebuild(t *testing.T) {
 	cooldowns := NewResponseCooldowns()
 	hash := node.HashFromRawOptions([]byte(`{"id":"egress-generation"}`))

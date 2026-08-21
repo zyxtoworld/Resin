@@ -146,6 +146,28 @@ func (p mergePatch) optionalDurationString(field string) (time.Duration, bool, *
 	return d, true, nil
 }
 
+func (p mergePatch) optionalNonNegativeDurationString(field string) (time.Duration, bool, *ServiceError) {
+	raw, ok := p[field]
+	if !ok {
+		return 0, false, nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return 0, true, invalidArg(fmt.Sprintf("%s: must be a string", field))
+	}
+	if strings.TrimSpace(value) == "" {
+		return 0, true, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, true, invalidArg(fmt.Sprintf("%s: %s", field, err.Error()))
+	}
+	if d < 0 {
+		return 0, true, invalidArg(fmt.Sprintf("%s: must be non-negative", field))
+	}
+	return d, true, nil
+}
+
 func parseHTTPAbsoluteURL(field, value string) (*url.URL, *ServiceError) {
 	u, err := url.ParseRequestURI(value)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
@@ -22,32 +23,38 @@ import (
 
 // ForwardProxyConfig holds dependencies for the forward proxy.
 type ForwardProxyConfig struct {
-	ProxyToken        string
-	Router            *routing.Router
-	Pool              outbound.PoolAccessor
-	Health            HealthRecorder
-	Events            EventEmitter
-	MetricsSink       MetricsEventSink
-	OutboundTransport OutboundTransportConfig
-	TransportPool     *OutboundTransportPool
-	ProxyBypassRules  []string
+	ProxyToken          string
+	Router              *routing.Router
+	Pool                outbound.PoolAccessor
+	Health              HealthRecorder
+	Events              EventEmitter
+	MetricsSink         MetricsEventSink
+	RequestTotalTimeout time.Duration
+	// onRequestBudgetCreated is a package-private test seam for proving that
+	// early handler exits release the platform budget immediately.
+	onRequestBudgetCreated func(context.Context)
+	OutboundTransport      OutboundTransportConfig
+	TransportPool          *OutboundTransportPool
+	ProxyBypassRules       []string
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
 // authentication, HTTP request forwarding, and CONNECT tunneling.
 type ForwardProxy struct {
-	token             string
-	router            *routing.Router
-	pool              outbound.PoolAccessor
-	health            HealthRecorder
-	events            EventEmitter
-	metricsSink       MetricsEventSink
-	transportConfig   OutboundTransportConfig
-	transportPool     *OutboundTransportPool
-	transportPoolOnce sync.Once
-	directTransport   atomic.Pointer[http.Transport]
-	directOnce        sync.Once
-	bypass            *TargetBypassMatcher
+	token                  string
+	router                 *routing.Router
+	pool                   outbound.PoolAccessor
+	health                 HealthRecorder
+	events                 EventEmitter
+	metricsSink            MetricsEventSink
+	requestTotalTimeout    time.Duration
+	onRequestBudgetCreated func(context.Context)
+	transportConfig        OutboundTransportConfig
+	transportPool          *OutboundTransportPool
+	transportPoolOnce      sync.Once
+	directTransport        atomic.Pointer[http.Transport]
+	directOnce             sync.Once
+	bypass                 *TargetBypassMatcher
 }
 
 // NewForwardProxy creates a new forward proxy handler.
@@ -62,15 +69,17 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		transportPool = NewOutboundTransportPool(transportCfg)
 	}
 	return &ForwardProxy{
-		token:           cfg.ProxyToken,
-		router:          cfg.Router,
-		pool:            cfg.Pool,
-		health:          cfg.Health,
-		events:          ev,
-		metricsSink:     cfg.MetricsSink,
-		transportConfig: transportCfg,
-		transportPool:   transportPool,
-		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		token:                  cfg.ProxyToken,
+		router:                 cfg.Router,
+		pool:                   cfg.Pool,
+		health:                 cfg.Health,
+		events:                 ev,
+		metricsSink:            cfg.MetricsSink,
+		requestTotalTimeout:    cfg.RequestTotalTimeout,
+		onRequestBudgetCreated: cfg.onRequestBudgetCreated,
+		transportConfig:        transportCfg,
+		transportPool:          transportPool,
+		bypass:                 NewTargetBypassMatcher(cfg.ProxyBypassRules),
 	}
 }
 
@@ -384,6 +393,11 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var pending *routedOutbound
 	finalResponseAccepted := true
 	var finalAttemptCancel context.CancelFunc
+	requestCtx := r.Context()
+	cancelRequest := func() {}
+	releaseRequest := func() {}
+	budgetEnabled := false
+	defer func() { cancelRequest() }()
 	for attempt := 0; attempt < retryBudget; attempt++ {
 		upstreamAttemptTrace := upstreamTrace.newAttempt()
 		var transport *http.Transport
@@ -410,6 +424,14 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				if retryBudget < 1 {
 					retryBudget = 1
 				}
+				budget, enabled := effectiveProxyRequestBudget(routed.Route.RequestTotalTimeout, p.requestTotalTimeout)
+				budgetEnabled = enabled
+				if enabled {
+					requestCtx, cancelRequest, releaseRequest = withProxyRequestBudgetController(r.Context(), budget)
+					if p.onRequestBudgetCreated != nil {
+						p.onRequestBudgetCreated(requestCtx)
+					}
+				}
 			}
 			if _, duplicateIP := attemptedIPs[routed.Route.EgressIP.String()]; duplicateIP {
 				break
@@ -428,7 +450,13 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			transport = p.outboundHTTPTransport(routed)
 		}
-		attemptCtx, cancelAttempt, bounded := attemptContextForRequest(r.Context(), attempt, retryBudget)
+		attemptCtx := requestCtx
+		var cancelAttempt context.CancelFunc
+		releaseAttempt := func() {}
+		bounded := false
+		if budgetEnabled {
+			attemptCtx, cancelAttempt, releaseAttempt, bounded = attemptContextForRequest(requestCtx, attempt, retryBudget)
+		}
 		if bounded && attemptCtx == nil {
 			if err := r.Context().Err(); err != nil {
 				lifecycle.setNetOK(true)
@@ -469,10 +497,15 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 			lifecycle.addEgressBytes(bodyBytes)
 		}
+		if bodyComplete && resp != nil && roundTripErr == nil {
+			// The pre-response timer has served its purpose. Do not let the
+			// platform retry budget truncate an accepted streaming response.
+			releaseAttempt()
+		}
 		if roundTripErr != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(p.router, route, upstreamAttemptTrace, roundTripErr)
-			canRetry := hasRoute && failureMatched && failureMatch.RetryNext() && !upstreamAttemptTrace.responseStarted() && resp == nil && bounded &&
-				requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget && r.Context().Err() == nil
+			canRetry := hasRoute && budgetEnabled && failureMatched && failureMatch.RetryNext() && !upstreamAttemptTrace.responseStarted() && resp == nil && bounded &&
+				requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget && requestCtx.Err() == nil
 			if canRetry {
 				if cancelAttempt != nil {
 					cancelAttempt()
@@ -527,8 +560,8 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			responseMatch, matchedRule = applyResponseRules(p.router, route, resp)
 		}
 		finalResponseAccepted = !matchedRule || responseMatch.Action == platform.ResponseRuleActionPassthrough
-		if matchedRule && responseMatch.RetryNext() && requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget {
-			if r.Context().Err() != nil {
+		if matchedRule && budgetEnabled && responseMatch.RetryNext() && requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget {
+			if requestCtx.Err() != nil {
 				_ = resp.Body.Close()
 				if cancelAttempt != nil {
 					cancelAttempt()
@@ -568,6 +601,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		releaseRequest()
 		finalAttemptCancel = cancelAttempt
 		break
 	}

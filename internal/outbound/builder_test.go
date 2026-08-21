@@ -687,6 +687,55 @@ func TestSingboxBuilder_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestSingboxBuilder_RejectsUnsupportedCertificatePin(t *testing.T) {
+	b := newTestSingboxBuilder(t)
+	defer b.Close()
+
+	const certificateFingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	for _, key := range []string{"certificate_sha256", "certificate_public_key_sha256"} {
+		t.Run(key, func(t *testing.T) {
+			raw := json.RawMessage(`{"type":"vless","tag":"pin-test","server":"example.com","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{"enabled":true,"insecure":true,"` + key + `":["` + certificateFingerprint + `"]}}`)
+			_, err := b.Build(raw)
+			if err == nil || !strings.Contains(err.Error(), "certificate pin") {
+				t.Fatalf("Build(%s) error = %v, want explicit unsupported certificate pin error", key, err)
+			}
+		})
+	}
+
+	t.Run("hysteria2 pinSHA256 marker", func(t *testing.T) {
+		raw := json.RawMessage(`{"type":"hysteria2","tag":"hy2-pin-test","server":"example.com","server_port":443,"password":"password","tls":{"enabled":true,"certificate_sha256":["` + certificateFingerprint + `"]}}`)
+		_, err := b.Build(raw)
+		if err == nil || !strings.Contains(err.Error(), "certificate pin") {
+			t.Fatalf("Build(hysteria2 pinSHA256) error = %v, want explicit unsupported certificate pin error", err)
+		}
+	})
+}
+
+func TestSingboxBuilder_UnknownUTLSFingerprintFailsClosed(t *testing.T) {
+	b := newTestSingboxBuilder(t)
+	defer b.Close()
+
+	raw := json.RawMessage(`{"type":"vless","tag":"unknown-utls","server":"example.com","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{"enabled":true,"insecure":true,"utls":{"enabled":true,"fingerprint":"not-a-sing-box-profile"}}}`)
+	_, err := b.Build(raw)
+	if err == nil {
+		t.Fatal("expected unknown uTLS fingerprint to fail closed")
+	}
+	if !strings.Contains(err.Error(), "uTLS") && !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("unexpected unknown uTLS error: %v", err)
+	}
+}
+
+func TestSingboxBuilder_RejectsAmbiguousClashFingerprintAlias(t *testing.T) {
+	b := newTestSingboxBuilder(t)
+	defer b.Close()
+
+	raw := json.RawMessage(`{"type":"vless","tag":"ambiguous-fingerprint","server":"example.com","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555","tls":{"enabled":true,"unsupported_fingerprint_alias":true}}`)
+	_, err := b.Build(raw)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("Build() error = %v, want ambiguous TLS fingerprint alias error", err)
+	}
+}
+
 func TestStubOutboundBuilder_Build(t *testing.T) {
 	ob, err := (&testutil.StubOutboundBuilder{}).Build(nil)
 	if err != nil {

@@ -496,8 +496,8 @@ const platformInsertSQL = `
 		                       response_rules_json,
 		                       reverse_proxy_miss_action, reverse_proxy_empty_account_behavior,
 		                       reverse_proxy_fixed_account_header, allocation_policy,
-		                       passive_circuit_breaker_disabled, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		                       passive_circuit_breaker_disabled, proxy_request_total_timeout_ns, updated_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 const platformUpsertSQL = platformInsertSQL + `
 		ON CONFLICT(id) DO UPDATE SET
@@ -511,6 +511,7 @@ const platformUpsertSQL = platformInsertSQL + `
 			reverse_proxy_fixed_account_header   = excluded.reverse_proxy_fixed_account_header,
 			allocation_policy        = excluded.allocation_policy,
 			passive_circuit_breaker_disabled = excluded.passive_circuit_breaker_disabled,
+			proxy_request_total_timeout_ns = excluded.proxy_request_total_timeout_ns,
 			updated_at_ns            = excluded.updated_at_ns`
 
 func preparePlatformPersistence(p model.Platform) (model.Platform, string, string, string, error) {
@@ -527,6 +528,9 @@ func preparePlatformPersistence(p model.Platform) (model.Platform, string, strin
 		return model.Platform{}, "", "", "", err
 	}
 	if _, err := platform.CompileResponseRules(p.ID, p.ResponseRules); err != nil {
+		return model.Platform{}, "", "", "", err
+	}
+	if err := platform.ValidateProxyRequestTotalTimeoutNs(p.ProxyRequestTotalTimeoutNs); err != nil {
 		return model.Platform{}, "", "", "", err
 	}
 	if p.ResponseRules == nil {
@@ -578,7 +582,7 @@ func platformPersistenceArgs(p model.Platform, regexFiltersJSON, regionFiltersJS
 	return []any{
 		p.ID, p.Name, p.StickyTTLNs, regexFiltersJSON, regionFiltersJSON, responseRulesJSON,
 		p.ReverseProxyMissAction, p.ReverseProxyEmptyAccountBehavior, p.ReverseProxyFixedAccountHeader,
-		p.AllocationPolicy, p.PassiveCircuitBreakerDisabled, p.UpdatedAtNs,
+		p.AllocationPolicy, p.PassiveCircuitBreakerDisabled, p.ProxyRequestTotalTimeoutNs, p.UpdatedAtNs,
 	}
 }
 
@@ -778,7 +782,7 @@ func (r *StateRepo) GetPlatformNameContext(ctx context.Context, id string) (stri
 
 const platformSelectSQL = `SELECT id, name, sticky_ttl_ns, regex_filters_json, region_filters_json, response_rules_json,
 	reverse_proxy_miss_action, reverse_proxy_empty_account_behavior, reverse_proxy_fixed_account_header,
-	allocation_policy, passive_circuit_breaker_disabled, updated_at_ns FROM platforms`
+	allocation_policy, passive_circuit_breaker_disabled, proxy_request_total_timeout_ns, updated_at_ns FROM platforms`
 
 type platformRowScanner interface {
 	Scan(dest ...any) error
@@ -790,7 +794,8 @@ func scanPlatformRow(row platformRowScanner) (model.Platform, error) {
 	var passiveCircuitBreakerDisabled int
 	if err := row.Scan(&p.ID, &p.Name, &p.StickyTTLNs, &regexFiltersJSON,
 		&regionFiltersJSON, &responseRulesJSON, &p.ReverseProxyMissAction, &p.ReverseProxyEmptyAccountBehavior,
-		&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled, &p.UpdatedAtNs); err != nil {
+		&p.ReverseProxyFixedAccountHeader, &p.AllocationPolicy, &passiveCircuitBreakerDisabled,
+		&p.ProxyRequestTotalTimeoutNs, &p.UpdatedAtNs); err != nil {
 		return model.Platform{}, err
 	}
 	p.PassiveCircuitBreakerDisabled = passiveCircuitBreakerDisabled != 0

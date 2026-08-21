@@ -31,7 +31,8 @@ const (
 	stateVersionAddEndpointEnabled               = 8
 	stateVersionPlatformRegexFilterRules         = 9
 	stateVersionPlatformResponseRules            = 10
-	stateLatestVersion                           = stateVersionPlatformResponseRules
+	stateVersionPlatformProxyRequestTotalTimeout = 11
+	stateLatestVersion                           = stateVersionPlatformProxyRequestTotalTimeout
 	stateLegacyBaselineVersion                   = stateVersionAddFixedAccountHeader
 
 	stateBaseSchemaMigration = stateMigrationsPath + "/000001_state_base.up.sql"

@@ -47,7 +47,10 @@ type Platform struct {
 	ReverseProxyFixedAccountHeaders  []string
 	AllocationPolicy                 AllocationPolicy
 	PassiveCircuitBreakerDisabled    bool
-	ResponseRules                    ResponseRules
+	// ProxyRequestTotalTimeoutNs is copied into each route generation. Zero is
+	// deliberate fail-closed: a global cap never enables platform retries.
+	ProxyRequestTotalTimeoutNs int64
+	ResponseRules              ResponseRules
 
 	// Routable view & its publication lock.
 	// viewMu serializes publishers while allowing concurrent identity reads.

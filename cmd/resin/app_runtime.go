@@ -568,29 +568,31 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 	}
 
 	forwardProxy := proxy.NewForwardProxy(proxy.ForwardProxyConfig{
-		ProxyToken:        a.envCfg.ProxyToken,
-		Router:            a.topoRuntime.router,
-		Pool:              a.topoRuntime.pool,
-		Health:            a.healthWriteOwner,
-		Events:            proxyEvents,
-		MetricsSink:       a.metricsManager,
-		OutboundTransport: outboundTransportCfg,
-		TransportPool:     a.transportPool,
-		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		ProxyToken:          a.envCfg.ProxyToken,
+		Router:              a.topoRuntime.router,
+		Pool:                a.topoRuntime.pool,
+		Health:              a.healthWriteOwner,
+		Events:              proxyEvents,
+		MetricsSink:         a.metricsManager,
+		RequestTotalTimeout: a.envCfg.ProxyRequestTotalTimeout,
+		OutboundTransport:   outboundTransportCfg,
+		TransportPool:       a.transportPool,
+		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
 	})
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
-		ProxyToken:        a.envCfg.ProxyToken,
-		Router:            a.topoRuntime.router,
-		Pool:              a.topoRuntime.pool,
-		PlatformLookup:    a.topoRuntime.pool,
-		Health:            a.healthWriteOwner,
-		Matcher:           a.accountMatcher,
-		Events:            proxyEvents,
-		MetricsSink:       a.metricsManager,
-		OutboundTransport: outboundTransportCfg,
-		TransportPool:     a.transportPool,
-		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		ProxyToken:          a.envCfg.ProxyToken,
+		Router:              a.topoRuntime.router,
+		Pool:                a.topoRuntime.pool,
+		PlatformLookup:      a.topoRuntime.pool,
+		Health:              a.healthWriteOwner,
+		Matcher:             a.accountMatcher,
+		Events:              proxyEvents,
+		MetricsSink:         a.metricsManager,
+		RequestTotalTimeout: a.envCfg.ProxyRequestTotalTimeout,
+		OutboundTransport:   outboundTransportCfg,
+		TransportPool:       a.transportPool,
+		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
 	})
 	a.closeProxyTransports = func() {
 		forwardProxy.CloseIdleConnections()

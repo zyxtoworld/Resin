@@ -38,7 +38,6 @@ type ResponseCooldownSnapshot struct {
 // one cooldown-owner read. Callers may classify many nodes against it without
 // re-entering the cooldown mutex for every node.
 type ResponseCooldownReadSnapshot struct {
-	items    []ResponseCooldownSnapshot
 	byNode   map[node.Hash]ResponseCooldownSnapshot
 	byEgress map[netip.Addr]ResponseCooldownSnapshot
 }
@@ -180,7 +179,6 @@ func (c *ResponseCooldowns) Snapshot(now time.Time) []ResponseCooldownSnapshot {
 // The returned value is immutable and safe for repeated node classification.
 func (c *ResponseCooldowns) ReadSnapshot(now time.Time) ResponseCooldownReadSnapshot {
 	result := ResponseCooldownReadSnapshot{
-		items:    []ResponseCooldownSnapshot{},
 		byNode:   make(map[node.Hash]ResponseCooldownSnapshot),
 		byEgress: make(map[netip.Addr]ResponseCooldownSnapshot),
 	}
@@ -190,7 +188,6 @@ func (c *ResponseCooldowns) ReadSnapshot(now time.Time) ResponseCooldownReadSnap
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pruneExpiredLocked(now)
-	result.items = make([]ResponseCooldownSnapshot, 0, len(c.byNode)+len(c.byEgress))
 	for hash, until := range c.byNode {
 		if until.After(now) {
 			item := ResponseCooldownSnapshot{
@@ -199,7 +196,6 @@ func (c *ResponseCooldowns) ReadSnapshot(now time.Time) ResponseCooldownReadSnap
 				Entry:    c.nodeEntry[hash],
 				Until:    until,
 			}
-			result.items = append(result.items, item)
 			result.byNode[hash] = item
 		}
 	}
@@ -210,19 +206,44 @@ func (c *ResponseCooldowns) ReadSnapshot(now time.Time) ResponseCooldownReadSnap
 				EgressIP: ip,
 				Until:    until,
 			}
-			result.items = append(result.items, item)
 			result.byEgress[ip] = item
 		}
 	}
-	sort.Slice(result.items, func(i, j int) bool {
-		return compareResponseCooldownSnapshots(result.items[i], result.items[j]) < 0
-	})
 	return result
 }
 
+// Range visits the immutable cooldown indexes without sorting or materializing
+// a second ordered slice. It is intended for classification and bounded page
+// selection; callers must not mutate the supplied snapshots.
+func (s ResponseCooldownReadSnapshot) Range(visit func(ResponseCooldownSnapshot) bool) {
+	if visit == nil {
+		return
+	}
+	for _, item := range s.byNode {
+		if !visit(item) {
+			return
+		}
+	}
+	for _, item := range s.byEgress {
+		if !visit(item) {
+			return
+		}
+	}
+}
+
 // Items returns a detached, deterministically ordered list from the read view.
+// Sorting is deliberately deferred to this explicit full-list API; route-state
+// classification and bounded pages use Range instead.
 func (s ResponseCooldownReadSnapshot) Items() []ResponseCooldownSnapshot {
-	return append([]ResponseCooldownSnapshot(nil), s.items...)
+	items := make([]ResponseCooldownSnapshot, 0, len(s.byNode)+len(s.byEgress))
+	s.Range(func(item ResponseCooldownSnapshot) bool {
+		items = append(items, item)
+		return true
+	})
+	sort.Slice(items, func(i, j int) bool {
+		return compareResponseCooldownSnapshots(items[i], items[j]) < 0
+	})
+	return items
 }
 
 // Filter evaluates include exactly once per item and returns another detached
@@ -234,21 +255,20 @@ func (s ResponseCooldownReadSnapshot) Filter(include func(ResponseCooldownSnapsh
 		return s
 	}
 	filtered := ResponseCooldownReadSnapshot{
-		items:    make([]ResponseCooldownSnapshot, 0, len(s.items)),
 		byNode:   make(map[node.Hash]ResponseCooldownSnapshot),
 		byEgress: make(map[netip.Addr]ResponseCooldownSnapshot),
 	}
-	for _, item := range s.items {
+	s.Range(func(item ResponseCooldownSnapshot) bool {
 		if !include(item) {
-			continue
+			return true
 		}
-		filtered.items = append(filtered.items, item)
 		if item.Scope == platform.ResponseRuleScopeNode {
 			filtered.byNode[item.NodeHash] = item
 		} else if item.EgressIP.IsValid() {
 			filtered.byEgress[item.EgressIP] = item
 		}
-	}
+		return true
+	})
 	return filtered
 }
 
@@ -342,6 +362,7 @@ func (s ResponseCooldownReadSnapshot) SnapshotPageWithCount(
 	selected := &responseCooldownPageHeap{}
 	heap.Init(selected)
 	total := 0
+	pageTotal := 0
 	visit := func(item ResponseCooldownSnapshot) {
 		if countInclude == nil || countInclude(item) {
 			total++
@@ -349,6 +370,7 @@ func (s ResponseCooldownReadSnapshot) SnapshotPageWithCount(
 		if pageInclude != nil && !pageInclude(item) {
 			return
 		}
+		pageTotal++
 		if selected.Len() < window {
 			heap.Push(selected, item)
 			return
@@ -358,9 +380,10 @@ func (s ResponseCooldownReadSnapshot) SnapshotPageWithCount(
 			heap.Push(selected, item)
 		}
 	}
-	for _, item := range s.items {
+	s.Range(func(item ResponseCooldownSnapshot) bool {
 		visit(item)
-	}
+		return true
+	})
 	items := make([]ResponseCooldownSnapshot, 0, selected.Len())
 	for selected.Len() > 0 {
 		items = append(items, heap.Pop(selected).(ResponseCooldownSnapshot))
@@ -376,7 +399,7 @@ func (s ResponseCooldownReadSnapshot) SnapshotPageWithCount(
 		end = len(items)
 	}
 	page := items[offset:end]
-	return page, total, end < total
+	return page, total, end < pageTotal
 }
 
 func (c *ResponseCooldowns) isCooling(

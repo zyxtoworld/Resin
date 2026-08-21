@@ -3,7 +3,10 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -60,7 +63,7 @@ func TestClassifyTransportFailureRecognizesWrappedTimeout(t *testing.T) {
 func TestAttemptContextForRequestReservesOverallDeadline(t *testing.T) {
 	parent, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	ctx, attemptCancel, bounded := attemptContextForRequest(parent, 0, 3)
+	ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 3)
 	if !bounded || attemptCancel == nil || ctx == nil {
 		t.Fatal("deadline request did not receive a bounded attempt context")
 	}
@@ -70,9 +73,119 @@ func TestAttemptContextForRequestReservesOverallDeadline(t *testing.T) {
 		t.Fatal("attempt context escaped caller deadline")
 	}
 	attemptCancel()
+	releaseAttempt()
 
-	unbounded, noCancel, bounded := attemptContextForRequest(context.Background(), 0, 3)
+	unbounded, noCancel, _, bounded := attemptContextForRequest(context.Background(), 0, 3)
 	if bounded || noCancel != nil || unbounded == nil {
 		t.Fatal("request without an overall deadline must not claim a bounded retry budget")
+	}
+}
+
+func TestStoppableDeadlineContextAlreadyCanceledCleansHandles(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	ctx, cancel, release := newStoppableDeadlineContext(parent, 5*time.Minute)
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("already-canceled parent did not cancel derived context")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("derived context error = %v, want context.Canceled", ctx.Err())
+	}
+	c := ctx.(*stoppableDeadlineContext)
+	c.mu.Lock()
+	closed, stopHook, timer := c.closed, c.stopHook, c.timer
+	c.mu.Unlock()
+	if !closed || stopHook != nil || timer != nil {
+		t.Fatalf("closed context retained handles: closed=%v stopHook=%v timer=%v", closed, stopHook != nil, timer != nil)
+	}
+	cancel()
+	cancel()
+	release()
+	release()
+}
+
+func TestStoppableDeadlineContextConcurrentCancelRelease(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		parent, cancelParent := context.WithCancel(context.Background())
+		ctx, cancel, release := newStoppableDeadlineContext(parent, time.Nanosecond)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			cancel()
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			release()
+			release()
+		}()
+		go func() {
+			defer wg.Done()
+			cancelParent()
+		}()
+		wg.Wait()
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("concurrent cancellation did not close derived context")
+		}
+		cancel()
+		release()
+	}
+}
+
+type testReadWriteCloser struct {
+	closeCount atomic.Int32
+	writes     []byte
+}
+
+func (b *testReadWriteCloser) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (b *testReadWriteCloser) Write(p []byte) (int, error) {
+	b.writes = append(b.writes, p...)
+	return len(p), nil
+}
+
+func (b *testReadWriteCloser) Close() error {
+	b.closeCount.Add(1)
+	return nil
+}
+
+func TestCancelOnCloseReadWriteCloserPreservesHalfClose(t *testing.T) {
+	backend := &testReadWriteCloser{}
+	var cancelCount atomic.Int32
+	wrapped := &cancelOnCloseReadWriteCloser{
+		ReadWriteCloser: backend,
+		cancel:          func() { cancelCount.Add(1) },
+	}
+	var _ io.ReadWriteCloser = wrapped
+
+	if _, err := wrapped.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read error = %v, want EOF", err)
+	}
+	if got := cancelCount.Load(); got != 0 {
+		t.Fatalf("half-close canceled budget: got %d, want 0", got)
+	}
+	if n, err := wrapped.Write([]byte("client-data")); err != nil || n != len("client-data") {
+		t.Fatalf("write: n=%d err=%v", n, err)
+	}
+	if string(backend.writes) != "client-data" {
+		t.Fatalf("write payload = %q, want client-data", backend.writes)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if got := backend.closeCount.Load(); got != 1 {
+		t.Fatalf("backend close count = %d, want 1", got)
+	}
+	if got := cancelCount.Load(); got != 1 {
+		t.Fatalf("cancel count = %d, want 1", got)
 	}
 }

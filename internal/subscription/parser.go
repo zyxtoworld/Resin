@@ -1301,12 +1301,7 @@ func convertClashProxyToNode(proxy map[string]any) (ParsedNode, bool) {
 		if alpn := getStringSlice(proxy, "alpn"); len(alpn) > 0 {
 			tls["alpn"] = alpn
 		}
-		applyUTLSFromValue(tls, firstNonEmpty(
-			getString(proxy, "fingerprint"),
-			getString(proxy, "client-fingerprint"),
-			getString(proxy, "client_fingerprint"),
-			getString(proxy, "fp"),
-		))
+		applyClashTLSFingerprints(tls, proxy)
 		applyTLSCertificateFromClash(tls, proxy)
 		outbound := map[string]any{
 			"type":        "hysteria2",
@@ -1461,12 +1456,7 @@ func convertClashProxyToNode(proxy map[string]any) (ParsedNode, bool) {
 		))
 		insecure, _ := getBool(proxy, "skip-cert-verify", "allowInsecure", "insecure")
 		tls := newClashEnabledTLS(sni, insecure, getStringSlice(proxy, "alpn"))
-		applyUTLSFromValue(tls, firstNonEmpty(
-			getString(proxy, "fingerprint"),
-			getString(proxy, "client-fingerprint"),
-			getString(proxy, "client_fingerprint"),
-			getString(proxy, "fp"),
-		))
+		applyClashTLSFingerprints(tls, proxy)
 		applyTLSCertificateFromClash(tls, proxy)
 		outbound := map[string]any{
 			"type":        "hysteria",
@@ -3372,7 +3362,7 @@ func parseHysteria2URI(uri string) (ParsedNode, bool) {
 		query.Get("pin-sha256"),
 		query.Get("pin_sha256"),
 	)); len(pins) > 0 {
-		tls["certificate_public_key_sha256"] = pins
+		tls["certificate_sha256"] = pins
 	}
 	if certPath := strings.TrimSpace(query.Get("ca")); certPath != "" {
 		tls["certificate_path"] = certPath
@@ -3856,12 +3846,7 @@ func setTLSFromClash(outbound map[string]any, proxy map[string]any, key string) 
 	if alpn := getStringSlice(proxy, "alpn"); len(alpn) > 0 {
 		tls["alpn"] = alpn
 	}
-	applyUTLSFromValue(tls, firstNonEmpty(
-		getString(proxy, "fingerprint"),
-		getString(proxy, "client-fingerprint"),
-		getString(proxy, "client_fingerprint"),
-		getString(proxy, "fp"),
-	))
+	applyClashTLSFingerprints(tls, proxy)
 	applyClashRealityToTLS(tls, proxy)
 	applyTLSCertificateFromClash(tls, proxy)
 	outbound["tls"] = tls
@@ -3914,6 +3899,31 @@ func applyUTLSFromValue(tls map[string]any, rawFingerprint string) {
 	tls["utls"] = map[string]any{
 		"enabled":     true,
 		"fingerprint": fingerprint,
+	}
+}
+
+// applyClashTLSFingerprints keeps Clash Meta's certificate fingerprint and
+// ClientHello fingerprint separate. sing-box v1.12.21 does not have a
+// certificate SHA-256 pin option; certificate_sha256 is therefore an
+// internal fail-closed marker consumed by the outbound builder, never a
+// sing-box option that can be silently ignored.
+func applyClashTLSFingerprints(tls map[string]any, proxy map[string]any) {
+	applyCertificateFingerprint(tls, strings.TrimSpace(getString(proxy, "fingerprint")))
+	applyUTLSFromValue(tls, firstNonEmpty(
+		getString(proxy, "client-fingerprint"),
+		getString(proxy, "client_fingerprint"),
+	))
+	if strings.TrimSpace(getString(proxy, "fp")) != "" {
+		// Clash does not define fp as a ClientHello alias here. Preserve the
+		// ambiguity as an internal marker so the builder fails closed instead
+		// of silently dropping it or treating it as a certificate pin.
+		tls["unsupported_fingerprint_alias"] = true
+	}
+}
+
+func applyCertificateFingerprint(tls map[string]any, rawFingerprint string) {
+	if fingerprint := strings.TrimSpace(rawFingerprint); fingerprint != "" {
+		tls["certificate_sha256"] = []string{fingerprint}
 	}
 }
 

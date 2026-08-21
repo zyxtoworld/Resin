@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test": "node --experimental-strip-types src/features/platforms/responseRulesModel.test.ts && node --experimental-strip-types src/features/systemConfig/types.test.ts",
+    "test": "node --experimental-strip-types src/features/platforms/responseRulesModel.test.ts && node --experimental-strip-types src/features/platforms/formModel.test.ts && node --experimental-strip-types src/features/systemConfig/types.test.ts",
     "lint": "eslint .",
     "preview": "vite preview"
   },

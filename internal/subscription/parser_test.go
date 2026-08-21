@@ -3,6 +3,7 @@ package subscription
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -842,7 +843,7 @@ func TestParseGeneralSubscription_ClashJSON_HysteriaAdvancedFields(t *testing.T)
 				"auth-str": "token",
 				"up": "30",
 				"down": "100",
-				"fingerprint": "chrome",
+				"client-fingerprint": "chrome",
 				"ca": "/etc/ssl/certs/custom.pem",
 				"ca-str": "-----BEGIN CERTIFICATE-----ABC",
 				"hop-interval": 15
@@ -1010,7 +1011,7 @@ func TestParseGeneralSubscription_ClashJSON_Hysteria2AdvancedFields(t *testing.T
 				"obfs": "salamander",
 				"obfs-password": "obfs-secret",
 				"hop-interval": 12,
-				"fingerprint": "firefox",
+				"client-fingerprint": "firefox",
 				"ca": "/etc/ssl/certs/hy2.pem",
 				"ca-str": "-----BEGIN CERTIFICATE-----XYZ"
 			}
@@ -1060,6 +1061,144 @@ func TestParseGeneralSubscription_ClashJSON_Hysteria2AdvancedFields(t *testing.T
 	utls := mustMapField(t, tls, "utls")
 	if got := utls["fingerprint"]; got != "firefox" {
 		t.Fatalf("tls.utls.fingerprint: got %v", got)
+	}
+}
+
+func TestParseGeneralSubscription_ClashTLSFingerprintAndClientFingerprintRemainSeparate(t *testing.T) {
+	const certificateFingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	data := []byte(`{
+		"proxies": [
+			{
+				"name": "hy2-pin-only",
+				"type": "hysteria2",
+				"server": "hy2-pin.example.com",
+				"port": 443,
+				"password": "password",
+				"fingerprint": "` + certificateFingerprint + `"
+			},
+			{
+				"name": "hy2-both",
+				"type": "hysteria2",
+				"server": "hy2-both.example.com",
+				"port": 443,
+				"password": "password",
+				"fingerprint": "` + certificateFingerprint + `",
+				"client-fingerprint": "chrome"
+			},
+			{
+				"name": "vless-both",
+				"type": "vless",
+				"server": "vless.example.com",
+				"port": 443,
+				"uuid": "11111111-2222-3333-4444-555555555555",
+				"tls": true,
+				"fingerprint": "` + certificateFingerprint + `",
+				"client-fingerprint": "firefox"
+			},
+			{
+				"name": "vmess-both",
+				"type": "vmess",
+				"server": "vmess.example.com",
+				"port": 443,
+				"uuid": "22222222-3333-4444-5555-666666666666",
+				"tls": true,
+				"fingerprint": "` + certificateFingerprint + `",
+				"client-fingerprint": "safari"
+			},
+			{
+				"name": "vless-ambiguous-fp",
+				"type": "vless",
+				"server": "vless-alias.example.com",
+				"port": 443,
+				"uuid": "33333333-4444-5555-6666-777777777777",
+				"tls": true,
+				"fp": "chrome"
+			}
+		]
+	}`)
+
+	nodes, err := ParseGeneralSubscription(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 5 {
+		t.Fatalf("expected 5 parsed nodes, got %d", len(nodes))
+	}
+
+	byTag := parseNodesByTag(t, nodes)
+	assertTLSFingerprintSeparation := func(tag, wantClient string) {
+		t.Helper()
+		tls := mustMapField(t, byTag[tag], "tls")
+		pins := mustSliceField(t, tls, "certificate_sha256")
+		if !containsAnyString(pins, certificateFingerprint) {
+			t.Fatalf("%s tls.certificate_sha256: got %v", tag, pins)
+		}
+		utls := mustMapField(t, tls, "utls")
+		if got := utls["fingerprint"]; got != wantClient {
+			t.Fatalf("%s tls.utls.fingerprint: got %v, want %q", tag, got, wantClient)
+		}
+	}
+
+	hy2PinOnlyTLS := mustMapField(t, byTag["hy2-pin-only"], "tls")
+	if _, ok := hy2PinOnlyTLS["utls"]; ok {
+		t.Fatalf("hy2-pin-only tls.utls must be absent for certificate fingerprint: got %v", hy2PinOnlyTLS["utls"])
+	}
+	if pins := mustSliceField(t, hy2PinOnlyTLS, "certificate_sha256"); !containsAnyString(pins, certificateFingerprint) {
+		t.Fatalf("hy2-pin-only tls.certificate_sha256: got %v", pins)
+	}
+	assertTLSFingerprintSeparation("hy2-both", "chrome")
+	assertTLSFingerprintSeparation("vless-both", "firefox")
+	assertTLSFingerprintSeparation("vmess-both", "safari")
+	ambiguousTLS := mustMapField(t, byTag["vless-ambiguous-fp"], "tls")
+	if got := ambiguousTLS["unsupported_fingerprint_alias"]; got != true {
+		t.Fatalf("vless-ambiguous-fp unsupported_fingerprint_alias: got %v", got)
+	}
+}
+
+func TestParseGeneralSubscription_ClashProductionFingerprintShapeFailsClosed(t *testing.T) {
+	const certificateFingerprint = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	proxies := make([]map[string]any, 0, 35)
+	for i := 0; i < 33; i++ {
+		proxies = append(proxies, map[string]any{
+			"name":        fmt.Sprintf("hy2-%02d", i),
+			"type":        "hysteria2",
+			"server":      fmt.Sprintf("hy2-%02d.example.com", i),
+			"port":        443,
+			"password":    "redacted-test-password",
+			"fingerprint": certificateFingerprint,
+		})
+	}
+	for i := 0; i < 2; i++ {
+		proxies = append(proxies, map[string]any{
+			"name":        fmt.Sprintf("vless-%02d", i),
+			"type":        "vless",
+			"server":      fmt.Sprintf("vless-%02d.example.com", i),
+			"port":        443,
+			"uuid":        "11111111-2222-3333-4444-555555555555",
+			"tls":         true,
+			"fingerprint": certificateFingerprint,
+		})
+	}
+	data, err := json.Marshal(map[string]any{"proxies": proxies})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := ParseGeneralSubscription(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 35 {
+		t.Fatalf("expected 35 production-shaped nodes, got %d", len(nodes))
+	}
+	for _, node := range nodes {
+		tls := mustMapField(t, parseNodeRaw(t, node.RawOptions), "tls")
+		if pins := mustSliceField(t, tls, "certificate_sha256"); !containsAnyString(pins, certificateFingerprint) {
+			t.Fatalf("%s certificate pin marker: got %v", node.Tag, pins)
+		}
+		if _, ok := tls["utls"]; ok {
+			t.Fatalf("%s must not treat certificate fingerprint as uTLS", node.Tag)
+		}
 	}
 }
 
@@ -1455,7 +1594,7 @@ func TestParseGeneralSubscription_VLESSURIWSDropsALPN(t *testing.T) {
 
 func TestParseGeneralSubscription_VLESSURITLSAdvancedFields(t *testing.T) {
 	data := []byte(
-		"vless://11111111-2222-3333-4444-555555555555@example.com:443?type=tcp&security=tls&sni=example.com&allowInsecure=1&alpn=h2%2Ch3&fp=firefox",
+		"vless://11111111-2222-3333-4444-555555555555@example.com:443?type=tcp&security=tls&sni=example.com&allowInsecure=1&alpn=h2%2Ch3&fp=chrome",
 	)
 
 	nodes, err := ParseGeneralSubscription(data)
@@ -1485,8 +1624,8 @@ func TestParseGeneralSubscription_VLESSURITLSAdvancedFields(t *testing.T) {
 	if got := utls["enabled"]; got != true {
 		t.Fatalf("tls.utls.enabled: got %v", got)
 	}
-	if got := utls["fingerprint"]; got != "firefox" {
-		t.Fatalf("tls.utls.fingerprint: got %v", got)
+	if got := utls["fingerprint"]; got != "chrome" {
+		t.Fatalf("tls.utls.fingerprint: got %v, want chrome", got)
 	}
 }
 
@@ -1802,7 +1941,7 @@ func TestParseGeneralSubscription_HY2URIUserPassAuth(t *testing.T) {
 	}
 }
 
-func TestParseGeneralSubscription_HY2URIPinSHA256MapsToTLSCertPublicKeyPin(t *testing.T) {
+func TestParseGeneralSubscription_HY2URIPinSHA256MapsToTLSCertificatePin(t *testing.T) {
 	data := []byte("hy2://hy2-password@hy2.example.com:443?pinSHA256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=&sni=hy2.example.com")
 
 	nodes, err := ParseGeneralSubscription(data)
@@ -1815,9 +1954,9 @@ func TestParseGeneralSubscription_HY2URIPinSHA256MapsToTLSCertPublicKeyPin(t *te
 
 	obj := parseNodeRaw(t, nodes[0].RawOptions)
 	tls := mustMapField(t, obj, "tls")
-	pins := mustSliceField(t, tls, "certificate_public_key_sha256")
+	pins := mustSliceField(t, tls, "certificate_sha256")
 	if !containsAnyString(pins, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") {
-		t.Fatalf("tls.certificate_public_key_sha256: got %v", pins)
+		t.Fatalf("tls.certificate_sha256: got %v", pins)
 	}
 	if _, hasUTLS := tls["utls"]; hasUTLS {
 		t.Fatalf("tls.utls should be absent when only pinSHA256 is provided: got %v", tls["utls"])

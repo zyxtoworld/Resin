@@ -108,11 +108,12 @@ func (s *ControlPlaneService) collectPlatformRouteNodePage(
 	selected := &platformRouteNodeHeap{}
 	heap.Init(selected)
 	cooldownNodeHashes := make(map[node.Hash]struct{})
-	for _, item := range cooldowns.Items() {
+	cooldowns.Range(func(item routing.ResponseCooldownSnapshot) bool {
 		if item.Scope == platform.ResponseRuleScopeNode {
 			cooldownNodeHashes[item.NodeHash] = struct{}{}
 		}
-	}
+		return true
+	})
 	currentEntries = make(map[node.Hash]*node.NodeEntry, len(cooldownNodeHashes))
 	forEach := func(hash node.Hash, entry *node.NodeEntry) bool {
 		if entry == nil {

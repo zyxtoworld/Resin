@@ -51,6 +51,9 @@ func newProxyE2EEnv(t *testing.T) *proxyE2EEnv {
 
 	plat := platform.NewPlatform("plat-id", "plat", nil, nil)
 	plat.StickyTTLNs = int64(time.Hour)
+	// Test platforms opt into a bounded retry budget explicitly; production
+	// platforms default to zero and therefore remain fail-closed.
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
 	plat.ReverseProxyMissAction = "TREAT_AS_EMPTY"
 	pool.RegisterPlatform(plat)
 

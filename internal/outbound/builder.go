@@ -129,6 +129,10 @@ func NewSingboxBuilderWithConfig(cfg SingboxBuilderConfig) (*SingboxBuilder, err
 // type/tag fields) into a real adapter.Outbound and runs it through the
 // lifecycle stages.
 func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (adapter.Outbound, error) {
+	if err := rejectUnsupportedTLSOptions(rawOptions); err != nil {
+		return nil, err
+	}
+
 	// 1. Parse via official option.Outbound path (strips type/tag, creates
 	//    typed options via OutboundOptionsRegistry + badjson.UnmarshallExcluded).
 	var outboundConfig option.Outbound
@@ -159,6 +163,29 @@ func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (adapter.Outbound, er
 	}
 
 	return ob, nil
+}
+
+func rejectUnsupportedTLSOptions(rawOptions json.RawMessage) error {
+	var envelope struct {
+		TLS *struct {
+			CertificateSHA256           []string `json:"certificate_sha256"`
+			CertificatePublicKeySHA256  []string `json:"certificate_public_key_sha256"`
+			UnsupportedFingerprintAlias bool     `json:"unsupported_fingerprint_alias"`
+		} `json:"tls"`
+	}
+	if err := json.Unmarshal(rawOptions, &envelope); err != nil || envelope.TLS == nil {
+		return nil
+	}
+	if len(envelope.TLS.CertificateSHA256) > 0 {
+		return errors.New("unsupported certificate pin: sing-box has no certificate SHA-256 verifier")
+	}
+	if len(envelope.TLS.CertificatePublicKeySHA256) > 0 {
+		return errors.New("unsupported certificate pin: sing-box has no certificate public-key SHA-256 verifier")
+	}
+	if envelope.TLS.UnsupportedFingerprintAlias {
+		return errors.New("unsupported TLS fingerprint alias: Clash fp is ambiguous")
+	}
+	return nil
 }
 
 // Close shuts down the builder's internal DNS services.

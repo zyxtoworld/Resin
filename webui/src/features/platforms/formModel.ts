@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { allocationPolicies, emptyAccountBehaviors, missActions } from "./constants";
-import { parseHeaderLines, parseLinesToList } from "./formParsers";
-import { parseResponseRulesText } from "./responseRulesModel";
+import { allocationPolicies, emptyAccountBehaviors, missActions } from "./constants.ts";
+import { parseHeaderLines, parseLinesToList } from "./formParsers.ts";
+import { parseResponseRulesText } from "./responseRulesModel.ts";
 import type { Platform, PlatformCreateInput, PlatformResponseRule, PlatformUpdateInput } from "./types";
 
 const platformNameForbiddenChars = ".:|/\\@?#%~";
@@ -32,6 +32,7 @@ export const platformFormSchema = z.object({
       message: "平台名称不能为保留字",
     }),
   sticky_ttl: z.string().optional(),
+  proxy_request_total_timeout: z.string().optional(),
   regex_filters_text: z.string().optional(),
   region_filters_text: z.string().optional(),
   response_rules_text: z.string(),
@@ -63,6 +64,7 @@ export type PlatformFormValues = z.infer<typeof platformFormSchema>;
 export const defaultPlatformFormValues: PlatformFormValues = {
   name: "",
   sticky_ttl: "",
+  proxy_request_total_timeout: "",
   regex_filters_text: "",
   region_filters_text: "",
   response_rules_text: "",
@@ -80,6 +82,7 @@ export function platformToFormValues(platform: Platform): PlatformFormValues {
   return {
     name: platform.name,
     sticky_ttl: platform.sticky_ttl,
+    proxy_request_total_timeout: platform.proxy_request_total_timeout ?? "",
     regex_filters_text: regexFilters.join("\n"),
     region_filters_text: regionFilters.join("\n"),
     response_rules_text: JSON.stringify(platform.response_rules ?? [], null, 2),
@@ -95,6 +98,7 @@ function toPlatformPayloadBase(values: PlatformFormValues) {
   const responseRules = JSON.parse(values.response_rules_text || "[]") as PlatformResponseRule[];
   return {
     name: values.name.trim(),
+    proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() ?? "",
     regex_filters: parseLinesToList(values.regex_filters_text),
     region_filters: parseLinesToList(values.region_filters_text, (value) => value.toLowerCase()),
     response_rules: responseRules,
@@ -110,6 +114,7 @@ export function toPlatformCreateInput(values: PlatformFormValues): PlatformCreat
   return {
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || undefined,
+    proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() || undefined,
   };
 }
 
@@ -117,5 +122,6 @@ export function toPlatformUpdateInput(values: PlatformFormValues): PlatformUpdat
   return {
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || "",
+    proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() || "",
   };
 }

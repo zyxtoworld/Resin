@@ -47,6 +47,7 @@ export type Platform = {
   id: string;
   name: string;
   sticky_ttl: string;
+  proxy_request_total_timeout: string;
   regex_filters: string[];
   region_filters: string[];
   response_rules: PlatformResponseRule[];
@@ -69,6 +70,7 @@ export type PageResponse<T> = {
 export type PlatformCreateInput = {
   name: string;
   sticky_ttl?: string;
+  proxy_request_total_timeout?: string;
   regex_filters?: string[];
   region_filters?: string[];
   response_rules?: PlatformResponseRule[];
@@ -82,6 +84,7 @@ export type PlatformCreateInput = {
 export type PlatformUpdateInput = {
   name?: string;
   sticky_ttl?: string;
+  proxy_request_total_timeout?: string;
   regex_filters?: string[];
   region_filters?: string[];
   response_rules?: PlatformResponseRule[];

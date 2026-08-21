@@ -275,6 +275,20 @@ export function PlatformPage() {
               </div>
 
               <div className="field-group">
+                <label className="field-label" htmlFor="create-proxy-request-total-timeout">
+                  {t("平台总重试预算（可选）")}
+                </label>
+                <Input
+                  id="create-proxy-request-total-timeout"
+                  placeholder={t("例如 30s")}
+                  {...createForm.register("proxy_request_total_timeout")}
+                />
+                <p className="field-hint">
+                  {t("仅限制响应开始前的重试阶段；每次尝试按剩余槽位分配，并受全局上限约束。留空表示不启用平台级重试。")}
+                </p>
+              </div>
+
+              <div className="field-group">
                 <label className="field-label" htmlFor="create-miss-action">
                   {t("反向代理账号解析出错策略")}
                 </label>

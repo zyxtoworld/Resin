@@ -61,32 +61,166 @@ func applyTransportFailureRule(
 	return match, ok, kind
 }
 
-// attemptContextForRequest reserves the remaining caller deadline across the
-// attempts still available in this immutable retry snapshot. A transport
-// failure retry is not allowed without an overall deadline: otherwise one
-// stuck RoundTripper could consume an unbounded amount of time.
-func attemptContextForRequest(parent context.Context, attempt, total int) (context.Context, context.CancelFunc, bool) {
+// withProxyRequestBudgetController creates the one request-level budget used
+// by all attempts in a proxy request. A caller deadline always wins when it is
+// earlier. A zero budget deliberately preserves fail-closed behavior for
+// callers that have no deadline and did not opt into a proxy budget.
+func withProxyRequestBudgetController(parent context.Context, total time.Duration) (context.Context, context.CancelFunc, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if total <= 0 {
+		return parent, func() {}, func() {}
+	}
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= total {
+		return parent, func() {}, func() {}
+	}
+	return newStoppableDeadlineContext(parent, total)
+}
+
+type stoppableDeadlineContext struct {
+	parent context.Context
+	done   chan struct{}
+
+	mu       sync.Mutex
+	err      error
+	closed   bool
+	active   bool
+	deadline time.Time
+	timer    *time.Timer
+	stopHook func() bool
+}
+
+func newStoppableDeadlineContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	c := &stoppableDeadlineContext{
+		parent:   parent,
+		done:     make(chan struct{}),
+		active:   true,
+		deadline: time.Now().Add(timeout),
+	}
+	// Install both asynchronous handles while holding the same mutex used by
+	// finish. A canceled parent or a zero/very short timer may invoke its
+	// callback before AfterFunc/time.AfterFunc returns; the callback must not
+	// observe a half-installed context and the constructor must not attach a
+	// handle after finish has closed done.
+	c.mu.Lock()
+	c.stopHook = context.AfterFunc(parent, func() { c.finish(parent.Err(), true) })
+	c.timer = time.AfterFunc(timeout, func() { c.finish(context.DeadlineExceeded, false) })
+	c.mu.Unlock()
+	cancel := func() {
+		c.finish(context.Canceled, false)
+	}
+	release := func() {
+		c.release()
+	}
+	return c, cancel, release
+}
+
+func (c *stoppableDeadlineContext) Deadline() (time.Time, bool) {
+	c.mu.Lock()
+	active := c.active
+	deadline := c.deadline
+	c.mu.Unlock()
+	if active {
+		return deadline, true
+	}
+	return c.parent.Deadline()
+}
+
+func (c *stoppableDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *stoppableDeadlineContext) Err() error {
+	c.mu.Lock()
+	err := c.err
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.parent.Err()
+}
+
+func (c *stoppableDeadlineContext) Value(key any) any { return c.parent.Value(key) }
+
+func (c *stoppableDeadlineContext) finish(err error, fromParent bool) {
+	if err == nil {
+		err = context.Canceled
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.active = false
+	c.err = err
+	stopHook := c.stopHook
+	c.stopHook = nil
+	timer := c.timer
+	c.timer = nil
+	close(c.done)
+	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	if !fromParent && stopHook != nil {
+		stopHook()
+	}
+}
+
+func (c *stoppableDeadlineContext) release() {
+	c.mu.Lock()
+	if c.closed || !c.active {
+		c.mu.Unlock()
+		return
+	}
+	c.active = false
+	timer := c.timer
+	c.timer = nil
+	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+// attemptContextForRequest reserves the remaining request deadline across the
+// attempts still available in this immutable retry snapshot. The caller must
+// pass the context returned by withProxyRequestBudgetController so a configured budget
+// is created once, not reset for every retry.
+func attemptContextForRequest(parent context.Context, attempt, total int) (context.Context, context.CancelFunc, func(), bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	deadline, ok := parent.Deadline()
 	if !ok {
-		return parent, nil, false
+		return parent, nil, func() {}, false
 	}
 	remainingSlots := total - attempt
 	if remainingSlots < 1 {
-		return nil, nil, true
+		return nil, nil, func() {}, true
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return nil, nil, true
+		return nil, nil, func() {}, true
 	}
 	perAttempt := remaining / time.Duration(remainingSlots)
 	if perAttempt <= 0 {
-		return nil, nil, true
+		return nil, nil, func() {}, true
 	}
-	ctx, cancel := context.WithTimeout(parent, perAttempt)
-	return ctx, cancel, true
+	ctx, cancel, release := newStoppableDeadlineContext(parent, perAttempt)
+	return ctx, cancel, release, true
+}
+
+func effectiveProxyRequestBudget(platformBudget, globalCap time.Duration) (time.Duration, bool) {
+	if platformBudget <= 0 {
+		return 0, false
+	}
+	if globalCap > 0 && platformBudget > globalCap {
+		return globalCap, true
+	}
+	return platformBudget, true
 }
 
 type cancelOnCloseReadCloser struct {
@@ -114,4 +248,42 @@ func (r *cancelOnCloseReadCloser) Close() error {
 	err := r.ReadCloser.Close()
 	r.finish()
 	return err
+}
+
+// cancelOnCloseReadWriteCloser preserves the bidirectional body contract used
+// by HTTP 101 upgrades while keeping the same request-budget lifetime rule as
+// cancelOnCloseReadCloser.
+type cancelOnCloseReadWriteCloser struct {
+	io.ReadWriteCloser
+	cancel    func()
+	once      sync.Once
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *cancelOnCloseReadWriteCloser) finish() {
+	if r == nil || r.cancel == nil {
+		return
+	}
+	r.once.Do(r.cancel)
+}
+
+func (r *cancelOnCloseReadWriteCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadWriteCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.finish()
+	}
+	return n, err
+}
+
+func (r *cancelOnCloseReadWriteCloser) Write(p []byte) (int, error) {
+	return r.ReadWriteCloser.Write(p)
+}
+
+func (r *cancelOnCloseReadWriteCloser) Close() error {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.ReadWriteCloser.Close()
+		r.finish()
+	})
+	return r.closeErr
 }

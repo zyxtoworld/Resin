@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -221,6 +223,7 @@ func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *te
 		t.Fatalf("CompileResponseRules: %v", err)
 	}
 	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
 	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
 	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
 
@@ -394,6 +397,7 @@ func TestForwardProxy_TransportFailureRuleRetriesAfterConnectTimeout(t *testing.
 		t.Fatalf("CompileResponseRules: %v", err)
 	}
 	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(time.Second)
 	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
 	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
 
@@ -424,13 +428,14 @@ func TestForwardProxy_TransportFailureRuleRetriesAfterConnectTimeout(t *testing.
 	})
 
 	proxy := NewForwardProxy(ForwardProxyConfig{
-		ProxyToken: "tok",
-		Router:     env.router,
-		Pool:       env.pool,
+		ProxyToken:          "tok",
+		Router:              env.router,
+		Pool:                env.pool,
+		RequestTotalTimeout: time.Second,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	request := httptest.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/connect-timeout", nil)
+	// A real net/http server request normally has no context deadline. The
+	// proxy must use its configured total budget to make this retry bounded.
+	request := httptest.NewRequest(http.MethodGet, "http://example.com/connect-timeout", nil)
 	request.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
 	writer := httptest.NewRecorder()
 	proxy.ServeHTTP(writer, request)
@@ -445,6 +450,461 @@ func TestForwardProxy_TransportFailureRuleRetriesAfterConnectTimeout(t *testing.
 		t.Fatalf("connect-timeout cooldowns: ok=%v cooldowns=%v", ok, cooldowns)
 	}
 }
+
+func TestReverseRetryRoundTripper_UnconfiguredPlatformDoesNotRetryWithCallerDeadline(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retryable", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusBadGateway}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = 0
+	// The caller deadline proves that this request is bounded, but it must not
+	// enable retry-next for a platform that has no persisted platform budget.
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/unconfigured")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("retryable")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+	initial.RetryBudget = 2
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := retry.RoundTrip(httptest.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/unconfigured", nil))
+	if err != nil {
+		t.Fatalf("unconfigured retry returned error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("unconfigured response: %#v, want first 502", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("unconfigured platform attempts: got %d, want 1", got)
+	}
+}
+
+func TestReverseRetryRoundTripper_UnconfiguredPlatformKeepsFullCallerLifetime(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = 0
+	for i, raw := range []string{
+		`{"type":"stub","server":"127.0.0.2","server_port":2}`,
+		`{"type":"stub","server":"127.0.0.3","server_port":3}`,
+		`{"type":"stub","server":"127.0.0.4","server_port":4}`,
+		`{"type":"stub","server":"127.0.0.5","server_port":5}`,
+	} {
+		setupResponseRetryNode(t, env, raw, fmt.Sprintf("203.0.113.%d", 11+i), "127.0.0.1:1")
+	}
+	initial, err := env.router.RouteRequestForProxy("plat", "account", "https://example.com/full-lifetime")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RetryBudget = 5
+
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer callerCancel()
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				timer := time.NewTimer(120 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader("ok")),
+						Request:    req,
+					}, nil
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+			})
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequestWithContext(callerCtx, http.MethodGet, "https://example.com/full-lifetime", nil))
+	if err != nil {
+		t.Fatalf("unconfigured platform request: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("unconfigured platform response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("unconfigured platform attempts: got %d, want 1", got)
+	}
+}
+
+func TestForwardProxy_UnconfiguredPlatformKeepsFullCallerLifetime(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = 0
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits.Add(1)
+		timer := time.NewTimer(120 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		case <-req.Context().Done():
+			return
+		}
+	}))
+	defer upstream.Close()
+
+	baseRaw := `{"type":"stub","server":"127.0.0.1","server_port":1}`
+	baseHash := node.HashFromRawOptions(json.RawMessage(baseRaw))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base entry not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	for i, raw := range []string{
+		`{"type":"stub","server":"127.0.0.2","server_port":2}`,
+		`{"type":"stub","server":"127.0.0.3","server_port":3}`,
+		`{"type":"stub","server":"127.0.0.4","server_port":4}`,
+		`{"type":"stub","server":"127.0.0.5","server_port":5}`,
+	} {
+		entry := setupResponseRetryNode(t, env, raw, fmt.Sprintf("203.0.113.%d", 11+i), upstream.Listener.Addr().String())
+		if entry == nil {
+			t.Fatal("retry entry was nil")
+		}
+	}
+
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+	})
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer callerCancel()
+	req := httptest.NewRequestWithContext(callerCtx, http.MethodGet, "http://example.com/full-lifetime", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	response := httptest.NewRecorder()
+	fp.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || response.Body.String() != "ok" {
+		t.Fatalf("unconfigured platform forward response: status=%d body=%q", response.Code, response.Body.String())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("unconfigured platform forward attempts: got %d, want 1", got)
+	}
+}
+
+func TestForwardProxy_CancelsRequestBudgetOnImmediateFailure(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(5 * time.Minute)
+	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return nil, errors.New("deterministic dial failure")
+	})
+
+	budgetCreated := make(chan context.Context, 1)
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken:          "tok",
+		Router:              env.router,
+		Pool:                env.pool,
+		RequestTotalTimeout: 10 * time.Minute,
+		onRequestBudgetCreated: func(ctx context.Context) {
+			budgetCreated <- ctx
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/budget-cleanup", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat", "tok"))
+	response := httptest.NewRecorder()
+	fp.ServeHTTP(response, req)
+	if response.Code == http.StatusOK {
+		t.Fatal("immediate dial failure unexpectedly returned 200")
+	}
+	var budgetCtx context.Context
+	select {
+	case budgetCtx = <-budgetCreated:
+	default:
+		t.Fatal("forward proxy did not create a platform request budget")
+	}
+	select {
+	case <-budgetCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("request budget remained live after immediate handler failure")
+	}
+}
+
+func TestReverseRetryRoundTripper_ReleasedRetryBudgetDoesNotCutOffStreamingBody(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(40 * time.Millisecond)
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/stream")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	requestContext := make(chan context.Context, 1)
+	body := &gatedStreamBody{data: []byte("stream-after-budget"), allow: make(chan struct{})}
+	retry := &reverseRetryRoundTripper{
+		router:              env.router,
+		pool:                env.pool,
+		initial:             routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		requestTotalTimeout: 2 * time.Second,
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				requestContext <- req.Context()
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
+			})
+		},
+	}
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/stream", nil))
+	if err != nil || resp == nil {
+		t.Fatalf("stream response: resp=%v err=%v", resp, err)
+	}
+	ctx := <-requestContext
+	timer := time.NewTimer(80 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		t.Fatalf("attempt context expired after response headers: %v", ctx.Err())
+	case <-timer.C:
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("attempt context expired after response headers: %v", err)
+	}
+	close(body.allow)
+	data, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read streaming body: %v", readErr)
+	}
+	if string(data) != "stream-after-budget" {
+		t.Fatalf("stream body: got %q", data)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestReverseRetryRoundTripper_NoNextRoutePreservesResponseBodyContext(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(40 * time.Millisecond)
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retry-without-next", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusBadGateway}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	initial, err := env.router.RouteRequestForProxy("plat", "account", "https://example.com/no-next")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RequestTotalTimeout != 40*time.Millisecond {
+		t.Fatalf("initial route budget = %s, want 40ms", initial.RequestTotalTimeout)
+	}
+	if _, matched := initial.ResponseRules.Match(http.StatusBadGateway, nil, true, make(http.Header), time.Now()); !matched {
+		t.Fatal("initial route did not carry the retry response rule")
+	}
+	initial.RetryBudget = 2
+	body := &contextAwareBody{allow: make(chan struct{}), data: []byte("fallback-body")}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				if req.Body != nil && req.Body != http.NoBody {
+					if _, err := io.Copy(io.Discard, req.Body); err != nil {
+						return nil, err
+					}
+					if err := req.Body.Close(); err != nil {
+						return nil, err
+					}
+				}
+				body.ctx = req.Context()
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       body,
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodPost, "https://example.com/no-next", strings.NewReader("request-body")))
+	if err != nil {
+		t.Fatalf("fallback response: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("fallback response: %#v, want 502", resp)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("fallback transport attempts = %d, want 1", got)
+	}
+	if body.ctx == nil {
+		t.Fatal("fallback response body did not receive request context")
+	}
+	watchdog := time.NewTimer(100 * time.Millisecond)
+	defer watchdog.Stop()
+	select {
+	case <-body.ctx.Done():
+		t.Fatal("advance failure canceled the accepted response body context")
+	case <-watchdog.C:
+	}
+	close(body.allow)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read fallback response body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if string(data) != "fallback-body" {
+		t.Fatalf("fallback response body: got %q, want fallback-body", data)
+	}
+}
+
+func TestReverseRetryRoundTripper_ReleasesRequestBudgetOnTerminalPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response *http.Response
+		err      error
+	}{
+		{
+			name: "transport error",
+			err:  errors.New("terminal transport error"),
+		},
+		{
+			name: "no response body",
+			response: &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			plat.ProxyRequestTotalTimeoutNs = int64(5 * time.Minute)
+			initial, err := env.router.RouteRequestForProxy("plat", "account", "https://example.com/terminal")
+			if err != nil {
+				t.Fatalf("initial route: %v", err)
+			}
+			var attemptCtx context.Context
+			retry := &reverseRetryRoundTripper{
+				router:  env.router,
+				pool:    env.pool,
+				initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+				transportFor: func(routedOutbound) http.RoundTripper {
+					return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+						attemptCtx = req.Context()
+						if tc.response == nil {
+							return nil, tc.err
+						}
+						response := *tc.response
+						response.Request = req
+						return &response, nil
+					})
+				},
+			}
+			_, _ = retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/terminal", nil))
+			if attemptCtx == nil {
+				t.Fatal("terminal attempt did not receive a context")
+			}
+			select {
+			case <-attemptCtx.Done():
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("terminal reverse attempt budget remained live")
+			}
+		})
+	}
+}
+
+type contextAwareBody struct {
+	ctx   context.Context
+	allow chan struct{}
+	data  []byte
+	done  bool
+}
+
+func (b *contextAwareBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	case <-b.allow:
+		b.done = true
+		return copy(p, b.data), nil
+	}
+}
+
+func (b *contextAwareBody) Close() error { return nil }
+
+type gatedStreamBody struct {
+	data  []byte
+	off   int
+	allow chan struct{}
+}
+
+func (b *gatedStreamBody) Read(p []byte) (int, error) {
+	<-b.allow
+	if b.off >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.off:])
+	b.off += n
+	return n, nil
+}
+
+func (b *gatedStreamBody) Close() error { return nil }
 
 func TestReverseRetryRoundTripper_WaitsForRequestBodyCompletionBeforeEgressCommit(t *testing.T) {
 	for _, tc := range []struct {

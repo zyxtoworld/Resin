@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
@@ -31,35 +32,37 @@ type PlatformGenerationReader interface {
 
 // ReverseProxyConfig holds dependencies for the reverse proxy.
 type ReverseProxyConfig struct {
-	ProxyToken        string
-	Router            *routing.Router
-	Pool              outbound.PoolAccessor
-	PlatformLookup    PlatformLookup
-	Health            HealthRecorder
-	Matcher           AccountRuleMatcher
-	Events            EventEmitter
-	MetricsSink       MetricsEventSink
-	OutboundTransport OutboundTransportConfig
-	TransportPool     *OutboundTransportPool
-	ProxyBypassRules  []string
+	ProxyToken          string
+	Router              *routing.Router
+	Pool                outbound.PoolAccessor
+	PlatformLookup      PlatformLookup
+	Health              HealthRecorder
+	Matcher             AccountRuleMatcher
+	Events              EventEmitter
+	MetricsSink         MetricsEventSink
+	RequestTotalTimeout time.Duration
+	OutboundTransport   OutboundTransportConfig
+	TransportPool       *OutboundTransportPool
+	ProxyBypassRules    []string
 }
 
 // ReverseProxy implements an HTTP reverse proxy.
 type ReverseProxy struct {
-	token             string
-	router            *routing.Router
-	pool              outbound.PoolAccessor
-	platLook          PlatformLookup
-	health            HealthRecorder
-	matcher           AccountRuleMatcher
-	events            EventEmitter
-	metricsSink       MetricsEventSink
-	transportConfig   OutboundTransportConfig
-	transportPool     *OutboundTransportPool
-	transportPoolOnce sync.Once
-	directTransport   atomic.Pointer[http.Transport]
-	directOnce        sync.Once
-	bypass            *TargetBypassMatcher
+	token               string
+	router              *routing.Router
+	pool                outbound.PoolAccessor
+	platLook            PlatformLookup
+	health              HealthRecorder
+	matcher             AccountRuleMatcher
+	events              EventEmitter
+	metricsSink         MetricsEventSink
+	requestTotalTimeout time.Duration
+	transportConfig     OutboundTransportConfig
+	transportPool       *OutboundTransportPool
+	transportPoolOnce   sync.Once
+	directTransport     atomic.Pointer[http.Transport]
+	directOnce          sync.Once
+	bypass              *TargetBypassMatcher
 }
 
 // NewReverseProxy creates a new reverse proxy handler.
@@ -74,17 +77,18 @@ func NewReverseProxy(cfg ReverseProxyConfig) *ReverseProxy {
 		transportPool = NewOutboundTransportPool(transportCfg)
 	}
 	return &ReverseProxy{
-		token:           cfg.ProxyToken,
-		router:          cfg.Router,
-		pool:            cfg.Pool,
-		platLook:        cfg.PlatformLookup,
-		health:          cfg.Health,
-		matcher:         cfg.Matcher,
-		events:          ev,
-		metricsSink:     cfg.MetricsSink,
-		transportConfig: transportCfg,
-		transportPool:   transportPool,
-		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		token:               cfg.ProxyToken,
+		router:              cfg.Router,
+		pool:                cfg.Pool,
+		platLook:            cfg.PlatformLookup,
+		health:              cfg.Health,
+		matcher:             cfg.Matcher,
+		events:              ev,
+		metricsSink:         cfg.MetricsSink,
+		requestTotalTimeout: cfg.RequestTotalTimeout,
+		transportConfig:     transportCfg,
+		transportPool:       transportPool,
+		bypass:              NewTargetBypassMatcher(cfg.ProxyBypassRules),
 	}
 }
 
@@ -383,6 +387,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		transport = p.outboundHTTPTransport(routed)
 		retryTransport = &reverseRetryRoundTripper{
 			router: p.router, pool: p.pool, initial: routed, account: account,
+			requestTotalTimeout: p.requestTotalTimeout,
 			decorateAttempt: func(req *http.Request, candidate routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
 				return decorateReverseUpstreamAttempt(req, candidate, upstreamTrace, p.health, parsed.Protocol, domain)
 			},

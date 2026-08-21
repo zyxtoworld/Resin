@@ -10,6 +10,20 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 )
 
+// MaxProxyRequestTotalTimeout bounds the manually configured pre-response
+// retry budget. The process-wide environment setting remains the upper cap.
+const MaxProxyRequestTotalTimeout = 10 * time.Minute
+
+func ValidateProxyRequestTotalTimeoutNs(ns int64) error {
+	if ns < 0 {
+		return fmt.Errorf("proxy_request_total_timeout_ns: must be non-negative")
+	}
+	if ns > int64(MaxProxyRequestTotalTimeout) {
+		return fmt.Errorf("proxy_request_total_timeout_ns: must not exceed %s", MaxProxyRequestTotalTimeout)
+	}
+	return nil
+}
+
 func isLowerAlpha2(s string) bool {
 	if len(s) != 2 {
 		return false
@@ -100,6 +114,9 @@ func CompileModelRegexFilters(platformID string, regexFilters []string) (node.Ta
 
 // BuildFromModel builds a runtime platform from a persisted model.Platform.
 func BuildFromModel(mp model.Platform) (*Platform, error) {
+	if err := ValidateProxyRequestTotalTimeoutNs(mp.ProxyRequestTotalTimeoutNs); err != nil {
+		return nil, fmt.Errorf("decode platform %s: %w", mp.ID, err)
+	}
 	regexFilters, err := CompileModelRegexFilters(mp.ID, mp.RegexFilters)
 	if err != nil {
 		return nil, err
@@ -148,6 +165,7 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		mp.AllocationPolicy,
 		mp.PassiveCircuitBreakerDisabled,
 	)
+	plat.ProxyRequestTotalTimeoutNs = mp.ProxyRequestTotalTimeoutNs
 	responseRules, err := CompileResponseRules(mp.ID, mp.ResponseRules)
 	if err != nil {
 		return nil, err

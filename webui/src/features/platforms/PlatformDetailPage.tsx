@@ -718,6 +718,24 @@ export function PlatformDetailPage() {
                   </div>
 
                   <div className="field-group">
+                    <label className="field-label" htmlFor="detail-edit-proxy-request-total-timeout">
+                      {t("平台总重试预算")}
+                    </label>
+                    <Input
+                      id="detail-edit-proxy-request-total-timeout"
+                      placeholder={t("例如 30s；留空关闭")}
+                      invalid={Boolean(editForm.formState.errors.proxy_request_total_timeout)}
+                      {...editForm.register("proxy_request_total_timeout")}
+                    />
+                    <p className="field-hint">
+                      {t("只用于响应开始前的重试；每次尝试按剩余槽位切片，并受全局上限约束。响应开始后不会换节点。")}
+                    </p>
+                    {editForm.formState.errors.proxy_request_total_timeout ? (
+                      <p className="field-error">{editForm.formState.errors.proxy_request_total_timeout.message}</p>
+                    ) : null}
+                  </div>
+
+                  <div className="field-group">
                     <label className="field-label" htmlFor="detail-edit-passive-circuit-breaker" style={{ visibility: "hidden" }}>
                       {t("禁用请求失败熔断")}
                     </label>
