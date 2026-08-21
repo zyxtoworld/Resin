@@ -177,6 +177,9 @@ export async function clearAllPlatformLeases(id: string): Promise<void> {
 
 export type PlatformRouteStateInput = Omit<ListPlatformLeasesInput, "offset"> & {
   cursor?: string;
+  node_limit?: number;
+  node_cursor?: string;
+  node_status?: "available" | "cooling" | "circuit_open" | "not_ready" | "disabled";
 };
 
 export async function getPlatformRouteState(id: string, input: PlatformRouteStateInput = {}): Promise<PlatformRouteState> {
@@ -192,6 +195,13 @@ export async function getPlatformRouteState(id: string, input: PlatformRouteStat
   }
   if (input.cursor) {
     query.set("cursor", input.cursor);
+  }
+  query.set("node_limit", String(input.node_limit ?? 50));
+  if (input.node_cursor) {
+    query.set("node_cursor", input.node_cursor);
+  }
+  if (input.node_status) {
+    query.set("node_status", input.node_status);
   }
   return apiRequest<PlatformRouteState>(`${basePath}/${id}/route-state?${query.toString()}`);
 }

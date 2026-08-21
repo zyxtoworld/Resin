@@ -3,7 +3,9 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -12,7 +14,11 @@ import (
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/observability"
+	"github.com/Resinat/Resin/internal/platform"
+	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/service"
+	"github.com/Resinat/Resin/internal/subscription"
+	"github.com/Resinat/Resin/internal/testutil"
 )
 
 func TestLeaseProjectionsNeverExposeAccountCredential(t *testing.T) {
@@ -354,5 +360,121 @@ func TestPlatformRouteStateHandlerFiltersOpaqueAccountDisplay(t *testing.T) {
 	}
 	if strings.Contains(filtered.Body.String(), rawAccount) {
 		t.Fatal("opaque route-state filter response exposed the raw account")
+	}
+}
+
+func TestPlatformRouteStateHandlerBoundsLargeNodesCooldownsAndLeases(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "route-state-large-api")
+	plat, ok := cp.Pool.GetPlatform(platformID)
+	if !ok || plat == nil {
+		t.Fatal("large route-state platform missing")
+	}
+	sub := subscription.NewSubscription("route-state-large-api-sub", "RouteStateLargeAPI", "https://example.invalid/route-state-large-api", true, false)
+	cp.SubMgr.Register(sub)
+	hashes := make([]node.Hash, 0, 1500)
+	for i := 0; i < 1500; i++ {
+		raw := []byte(fmt.Sprintf(`{"id":"route-state-large-api-%d","type":"ss","server":"198.51.100.1","port":443}`, i))
+		hash := node.HashFromRawOptions(raw)
+		hashes = append(hashes, hash)
+		cp.Pool.AddNodeFromSub(hash, raw, sub.ID)
+		sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{})
+		entry, ok := cp.Pool.GetEntry(hash)
+		if !ok {
+			t.Fatalf("large API fixture entry %d missing", i)
+		}
+		entry.CircuitOpenSince.Store(0)
+		entry.SetEgressIP(netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)}))
+		entry.LatencyTable.Update("cloudflare.com", time.Millisecond, time.Minute)
+		outbound := testutil.NewNoopOutbound()
+		entry.Outbound.Store(&outbound)
+	}
+	plat.FullRebuild(cp.Pool.Range, cp.Pool.MakeSubLookup(), func(netip.Addr) string { return "us" })
+
+	now := time.Now()
+	until := now.Add(time.Hour)
+	for i, hash := range hashes {
+		ip := netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)})
+		if err := cp.Router.UpsertLease(model.Lease{
+			PlatformID:     platformID,
+			Account:        fmt.Sprintf("route-state-large-api-account-%04d", i),
+			NodeHash:       hash.Hex(),
+			EgressIP:       ip.String(),
+			CreatedAtNs:    now.UnixNano(),
+			ExpiryNs:       until.UnixNano(),
+			LastAccessedNs: now.UnixNano(),
+		}); err != nil {
+			t.Fatalf("seed API lease %d: %v", i, err)
+		}
+	}
+	if _, err := cp.Router.WithPlatformResponseCooldownsContext(t.Context(), platformID, func(table *routing.ResponseCooldowns, _ uint64) error {
+		for _, hash := range hashes {
+			table.Mark(platform.ResponseRuleScopeNode, hash, netip.Addr{}, until)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed API cooldowns: %v", err)
+	}
+
+	rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=50&node_limit=50", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("large route-state API status: got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Body.Bytes()) > 120*1024 {
+		t.Fatalf("large route-state API body = %d bytes, want <= 122880", len(rec.Body.Bytes()))
+	}
+	body := decodeJSONMap(t, rec)
+	nodes, ok := body["nodes"].([]any)
+	if !ok || len(nodes) > 50 {
+		t.Fatalf("large route-state nodes payload: %#v", body["nodes"])
+	}
+	cooldowns, ok := body["cooldowns"].([]any)
+	if !ok || len(cooldowns) > 50 {
+		t.Fatalf("large route-state cooldown payload: %#v", body["cooldowns"])
+	}
+	leases, ok := body["leases"].(map[string]any)
+	if !ok {
+		t.Fatalf("large route-state leases payload: %#v", body["leases"])
+	}
+	leaseItems, ok := leases["items"].([]any)
+	if !ok || len(leaseItems) > 50 {
+		t.Fatalf("large route-state lease page: %#v", leases["items"])
+	}
+	if body["nodes_total"] != float64(1500) || body["cooldowns_total"] != float64(1500) || leases["total"] != float64(1500) {
+		t.Fatalf("large route-state totals: nodes=%v cooldowns=%v leases=%v", body["nodes_total"], body["cooldowns_total"], leases["total"])
+	}
+	if body["nodes_has_more"] != true || leases["has_more"] != true {
+		t.Fatalf("large route-state has_more: nodes=%v leases=%v", body["nodes_has_more"], leases["has_more"])
+	}
+	nodeCursor, ok := body["nodes_next_cursor"].(string)
+	if !ok || nodeCursor == "" {
+		t.Fatalf("large route-state next cursor: %#v", body["nodes_next_cursor"])
+	}
+	next := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=50&node_limit=50&node_cursor="+url.QueryEscape(nodeCursor), nil, true)
+	if next.Code != http.StatusOK {
+		t.Fatalf("large route-state cursor page status: got %d, body=%s", next.Code, next.Body.String())
+	}
+	nextBody := decodeJSONMap(t, next)
+	nextNodes, ok := nextBody["nodes"].([]any)
+	if !ok || len(nextNodes) != 50 {
+		t.Fatalf("large route-state cursor page nodes: %#v", nextBody["nodes"])
+	}
+	if strings.Contains(next.Body.String(), nodeCursor) {
+		t.Fatal("route-state response echoed node cursor")
+	}
+	lastCursorByte := nodeCursor[len(nodeCursor)-1]
+	if lastCursorByte == 'A' {
+		lastCursorByte = 'B'
+	} else {
+		lastCursorByte = 'A'
+	}
+	tampered := nodeCursor[:len(nodeCursor)-1] + string(lastCursorByte)
+	bad := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=50&node_limit=50&node_cursor="+url.QueryEscape(tampered), nil, true)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("tampered node cursor status: got %d, body=%s", bad.Code, bad.Body.String())
+	}
+	offset := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/route-state?limit=50&node_limit=50&node_offset=50", nil, true)
+	if offset.Code != http.StatusBadRequest {
+		t.Fatalf("legacy node offset status: got %d, body=%s", offset.Code, offset.Body.String())
 	}
 }

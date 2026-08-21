@@ -270,6 +270,7 @@ export function ResponseRulesEditor({ rules, onChange, onValidationChange, error
           const statusDraftKey = rowKey;
           const action = rule.action;
           const cooldown = actionNeedsCooldown(action.type);
+          const failureRule = Boolean(rule.match.failure_kinds?.length);
           const headers = rule.match.headers ?? [];
           const sources = action.expiry_sources ?? [];
           return (
@@ -372,6 +373,7 @@ export function ResponseRulesEditor({ rules, onChange, onValidationChange, error
                         <option value="egress_ip">{t("出口 IP")}</option>
                         <option value="route_entry">{t("当前路由节点")}</option>
                       </Select>
+                      {failureRule ? <p className="muted">{t("失败类别没有响应头或响应体，到期时间只能使用兜底策略。")}</p> : <>
                       <div className="response-rule-subsection-head">
                         <div>
                           <strong>{t("冷却到期时间（按优先级尝试）")}</strong>
@@ -398,6 +400,7 @@ export function ResponseRulesEditor({ rules, onChange, onValidationChange, error
                       {source.type === "body_regex" ? <div><div className="response-rule-condition"><div><label className="field-label">{t("正文正则表达式")}</label><Input aria-label={t("正文正则表达式")} placeholder={'例如 "resets_at":"([^"]+)"'} value={source.regex ?? ""} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "regex", event.target.value) : item) } }))} /></div><div><label className="field-label">{t("捕获组编号")}</label><Input aria-label={t("捕获组编号")} type="number" min={1} max={16} value={source.capture ?? 1} onChange={(event) => updateAt(index, (current) => ({ ...current, action: { ...current.action, expiry_sources: (current.action.expiry_sources ?? []).map((item, itemIndex) => itemIndex === sourceIndex ? updateSource(item, "capture", event.target.value) : item) } }))} /></div></div><p className="muted">{t("正则必须包含要解析的捕获组，捕获组编号从 1 开始。")}</p></div> : null}
                         </div>
                       ))}
+                      </>}
                       <label className="field-label">{t("无法解析时的兜底")}</label>
                       <Select value={action.fallback ?? "none"} onChange={(event) => updateAt(index, (current) => ({ ...current, action: normalizeResponseRuleFallback(current.action, event.target.value as NonNullable<PlatformResponseRule["action"]["fallback"]>) }))}>
                         <option value="next_utc_midnight">{t("次日 UTC 00:00")}</option>

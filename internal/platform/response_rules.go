@@ -58,6 +58,7 @@ type ResponseRule struct {
 	ID            string
 	Enabled       bool
 	Status        responseStatusMatcher
+	Failures      responseFailureMatcher
 	Headers       []responseHeaderMatcher
 	Body          *responseBodyMatcher
 	Action        ResponseRuleAction
@@ -71,6 +72,8 @@ type responseStatusMatcher struct {
 	codes  []int
 	ranges []model.PlatformResponseStatusRange
 }
+
+type responseFailureMatcher []string
 
 type responseHeaderMatcher struct {
 	name  string
@@ -131,7 +134,14 @@ func CompileResponseRules(platformID string, raw []model.PlatformResponseRule) (
 		}
 		seenIDs[id] = struct{}{}
 
-		status, err := compileResponseStatus(i, item.Match)
+		failureKinds, err := compileResponseFailureKinds(i, item.Match.FailureKinds)
+		if err != nil {
+			return nil, err
+		}
+		if len(failureKinds) > 0 && (len(item.Match.Headers) > 0 || item.Match.Body != nil) {
+			return nil, fmt.Errorf("response_rules[%d].match: failure_kinds cannot be combined with headers or body predicates", i)
+		}
+		status, err := compileResponseStatus(i, item.Match, len(failureKinds) != 0)
 		if err != nil {
 			return nil, err
 		}
@@ -147,6 +157,12 @@ func CompileResponseRules(platformID string, raw []model.PlatformResponseRule) (
 		if err != nil {
 			return nil, err
 		}
+		if len(failureKinds) > 0 && len(item.Action.ExpirySources) > 0 {
+			return nil, fmt.Errorf("response_rules[%d].action.expiry_sources: failure_kinds rules cannot use response expiry sources", i)
+		}
+		if len(failureKinds) > 0 && action.Type == ResponseRuleActionCooldown && action.Fallback == ResponseExpiryFallbackNone {
+			return nil, fmt.Errorf("response_rules[%d].action: cooldown failure rule needs retry or a cooldown deadline", i)
+		}
 		sources, err := compileResponseExpirySources(i, item.Action.ExpirySources)
 		if err != nil {
 			return nil, err
@@ -160,7 +176,7 @@ func CompileResponseRules(platformID string, raw []model.PlatformResponseRule) (
 
 		compiled = append(compiled, ResponseRule{
 			ID: id, Enabled: item.Enabled, Status: status, Headers: headers,
-			Body: body, Action: action.Type, Scope: action.Scope,
+			Failures: failureKinds, Body: body, Action: action.Type, Scope: action.Scope,
 			Sources: sources, Fallback: action.Fallback,
 			FixedDuration: action.FixedDuration,
 		})
@@ -168,9 +184,13 @@ func CompileResponseRules(platformID string, raw []model.PlatformResponseRule) (
 	return compiled, nil
 }
 
-func compileResponseStatus(index int, match model.PlatformResponseRuleMatch) (responseStatusMatcher, error) {
-	if len(match.StatusCodes) == 0 && len(match.StatusRange) == 0 {
-		return responseStatusMatcher{}, fmt.Errorf("response_rules[%d].match: status_codes or status_range is required", index)
+func compileResponseStatus(index int, match model.PlatformResponseRuleMatch, hasFailureKinds bool) (responseStatusMatcher, error) {
+	hasStatus := len(match.StatusCodes) != 0 || len(match.StatusRange) != 0
+	if !hasStatus && !hasFailureKinds {
+		return responseStatusMatcher{}, fmt.Errorf("response_rules[%d].match: status_codes, status_range, or failure_kinds is required", index)
+	}
+	if hasStatus && hasFailureKinds {
+		return responseStatusMatcher{}, fmt.Errorf("response_rules[%d].match: status predicates and failure_kinds are mutually exclusive", index)
 	}
 	if len(match.StatusCodes) > responseRuleMaxStatusCodes {
 		return responseStatusMatcher{}, fmt.Errorf("response_rules[%d].match.status_codes: at most %d values are allowed", index, responseRuleMaxStatusCodes)
@@ -196,6 +216,35 @@ func compileResponseStatus(index int, match model.PlatformResponseRuleMatch) (re
 		}
 	}
 	return responseStatusMatcher{codes: codes, ranges: ranges}, nil
+}
+
+func compileResponseFailureKinds(index int, raw []string) (responseFailureMatcher, error) {
+	if len(raw) > 8 {
+		return nil, fmt.Errorf("response_rules[%d].match.failure_kinds: at most 8 values are allowed", index)
+	}
+	allowed := map[string]struct{}{
+		"timeout":                 {},
+		"transport_timeout":       {},
+		"connect_timeout":         {},
+		"response_header_timeout": {},
+		"first_byte_timeout":      {},
+		"idle_timeout":            {},
+		"transport_error":         {},
+	}
+	seen := make(map[string]struct{}, len(raw))
+	result := make(responseFailureMatcher, 0, len(raw))
+	for i, value := range raw {
+		kind := strings.ToLower(strings.TrimSpace(value))
+		if _, ok := allowed[kind]; !ok {
+			return nil, fmt.Errorf("response_rules[%d].match.failure_kinds[%d]: unsupported %q", index, i, value)
+		}
+		if _, ok := seen[kind]; ok {
+			return nil, fmt.Errorf("response_rules[%d].match.failure_kinds[%d]: duplicate %q", index, i, value)
+		}
+		seen[kind] = struct{}{}
+		result = append(result, kind)
+	}
+	return result, nil
 }
 
 func compileResponseHeaders(index int, raw []model.PlatformResponseHeaderMatch) ([]responseHeaderMatcher, error) {
@@ -474,6 +523,54 @@ func (rules ResponseRules) Match(statusCode int, body []byte, bodyComplete bool,
 		return result, true
 	}
 	return ResponseRuleMatch{}, false
+}
+
+// MatchFailure applies the first enabled rule for a pre-response transport
+// failure. Failure rules are deliberately separate from HTTP response rules:
+// there is no response body or status to inspect, and callers must not retry
+// after response bytes have been exposed downstream.
+func (rules ResponseRules) MatchFailure(kind string, now time.Time) (ResponseRuleMatch, bool) {
+	for _, rule := range rules {
+		if !rule.Enabled || !rule.Failures.matches(kind) {
+			continue
+		}
+		result := ResponseRuleMatch{RuleID: rule.ID, Action: rule.Action, Scope: rule.Scope}
+		if actionNeedsCooldown(rule.Action) {
+			if until, ok := responseRuleFallback(rule.Fallback, rule.FixedDuration, now); ok {
+				result.Until, result.Cooldown = until, true
+			}
+		}
+		return result, true
+	}
+	return ResponseRuleMatch{}, false
+}
+
+func (matcher responseFailureMatcher) matches(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	for _, wanted := range matcher {
+		if wanted == kind {
+			return true
+		}
+		if (wanted == "timeout" || wanted == "transport_timeout") && isResponseTimeoutFailure(kind) {
+			return true
+		}
+		if (wanted == "first_byte_timeout" && kind == "response_header_timeout") ||
+			(wanted == "response_header_timeout" && kind == "first_byte_timeout") {
+			// No separate response-header milestone exists yet: both names mean
+			// the request was written and no first response byte arrived.
+			return true
+		}
+	}
+	return false
+}
+
+func isResponseTimeoutFailure(kind string) bool {
+	switch kind {
+	case "timeout", "transport_timeout", "connect_timeout", "response_header_timeout", "first_byte_timeout", "idle_timeout":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m responseStatusMatcher) matches(statusCode int) bool {

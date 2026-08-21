@@ -69,6 +69,9 @@ const malformedCases = [
   '[{"id":"x","enabled":true,"match":{},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"retry_after","format":"unix_seconds"}]}}]',
   '[{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"json_pointer","json_pointer":"/reset~2at","format":"unix_seconds"}]}}]',
   '[{"id":"x","enabled":true,"match":{"status_codes":[429]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none","expiry_sources":[{"type":"json_pointer","json_pointer":"/reset~","format":"unix_seconds"}]}}]',
+  '[{"id":"x","enabled":true,"match":{"failure_kinds":["connect_timeout"],"status_codes":[504]},"action":{"type":"retry_next"}}]',
+  '[{"id":"x","enabled":true,"match":{"failure_kinds":["transport_error"]},"action":{"type":"cooldown_then_retry_next","cooldown_scope":"egress_ip","fallback":"next_utc_midnight","expiry_sources":[{"type":"retry_after"}]}}]',
+  '[{"id":"x","enabled":true,"match":{"failure_kinds":["transport_error"]},"action":{"type":"cooldown","cooldown_scope":"egress_ip","fallback":"none"}}]',
   '[{"id":"x","enabled":true,"match":{},"action":{"type":"passthrough"},"unexpected":true}]',
 ];
 for (const input of malformedCases) {
@@ -95,6 +98,14 @@ for (const pointer of ["/reset~1at", "/reset~0at"]) {
 const roundTrip = parseResponseRulesText(formatResponseRules([validRule]));
 assert.deepEqual(roundTrip.rules, [validRule]);
 assert.equal(validateResponseRules([validRule]), undefined);
+const failureRule: PlatformResponseRule = {
+  id: "connect-timeout",
+  enabled: true,
+  match: { failure_kinds: ["connect_timeout", "response_header_timeout"] },
+  action: { type: "retry_next" },
+};
+assert.deepEqual(parseResponseRulesText(formatResponseRules([failureRule])).rules, [failureRule]);
+assert.equal(validateResponseRules([failureRule]), undefined);
 assert.match(validateResponseRules([{ ...validRule, id: "" }]) ?? "", /ID/);
 assert.match(validateResponseRules([{ ...validRule, match: { status_codes: [429, 429] } }]) ?? "", /重复/);
 

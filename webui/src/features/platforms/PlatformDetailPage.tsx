@@ -59,6 +59,7 @@ const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 const LEASE_MANAGEMENT_ANCHOR = "platform-lease-management";
 const LEASE_SEARCH_DEBOUNCE_MS = 300;
 const LEASE_PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
+const NODE_PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 const DETAIL_TABS: Array<{ key: PlatformDetailTab; label: string; hint: string }> = [
   { key: "monitor", label: "监控", hint: "平台运行态趋势和快照" },
   { key: "access", label: "接入", hint: "复制正向/反向代理地址" },
@@ -78,6 +79,9 @@ export function PlatformDetailPage() {
   const [leasePageSize, setLeasePageSize] = useState<number>(LEASE_PAGE_SIZE_OPTIONS[0]);
   const [leaseSearch, setLeaseSearch] = useState("");
   const [debouncedLeaseSearch, setDebouncedLeaseSearch] = useState("");
+  const [nodePage, setNodePage] = useState(0);
+  const [nodeCursorStack, setNodeCursorStack] = useState<string[]>([""]);
+  const [nodePageSize, setNodePageSize] = useState<number>(NODE_PAGE_SIZE_OPTIONS[1]);
   const [nodeStatusFilter, setNodeStatusFilter] = useState<PlatformRouteNode["status"] | "all">("all");
   const { toasts, showToast, dismissToast } = useToast();
   const queryClient = useQueryClient();
@@ -99,9 +103,10 @@ export function PlatformDetailPage() {
 
   const platform = dataForRender(platformQuery.data, platformQuery.isPlaceholderData) ?? null;
   const leaseCursor = leaseCursorStack[leasePage] ?? "";
+  const nodeCursor = nodeCursorStack[nodePage] ?? "";
 
   const routeStateQuery = useQuery({
-    queryKey: ["platform-route-state", platform?.id, leaseCursor, leasePageSize, debouncedLeaseSearch],
+    queryKey: ["platform-route-state", platform?.id, leaseCursor, leasePageSize, debouncedLeaseSearch, nodeCursor, nodePageSize, nodeStatusFilter],
     queryFn: () => {
       if (!platform) {
         throw new Error("平台不存在或已被删除");
@@ -113,10 +118,13 @@ export function PlatformDetailPage() {
         fuzzy: debouncedLeaseSearch ? true : undefined,
         sort_by: "expiry",
         sort_order: "asc",
+        node_limit: nodePageSize,
+        node_cursor: nodeCursor || undefined,
+        node_status: nodeStatusFilter === "all" ? undefined : nodeStatusFilter,
       });
     },
     enabled: Boolean(platform?.id) && activeTab === "route-state",
-    refetchInterval: leasePage === 0 ? 15_000 : false,
+    refetchInterval: leasePage === 0 && nodePage === 0 ? 15_000 : false,
     placeholderData: (previous) => previous,
   });
   const routeState = routeStateQuery.data;
@@ -131,7 +139,9 @@ export function PlatformDetailPage() {
   const isLeasePageTransitioning = routeStateQuery.isFetching && routeStateQuery.isPlaceholderData;
   const visibleLeases = isLeasePageTransitioning ? [] : leases;
   const routeNodes = visibleRouteState?.nodes ?? [];
-  const visibleRouteNodes = nodeStatusFilter === "all" ? routeNodes : routeNodes.filter((node) => node.status === nodeStatusFilter);
+  const visibleRouteNodes = isLeasePageTransitioning ? [] : routeNodes;
+  const routeNodesTotal = visibleRouteState?.nodes_total ?? 0;
+  const routeNodesHasMore = Boolean(visibleRouteState?.nodes_has_more);
 
   const editForm = useForm<PlatformFormValues>({
     resolver: zodResolver(platformFormSchema),
@@ -143,12 +153,18 @@ export function PlatformDetailPage() {
 
   useEffect(() => {
     const error = routeStateQuery.error;
-    if (!(error instanceof ApiError) || !shouldResetLeaseCursorOnError(error.status, leaseCursor)) {
+    if (!(error instanceof ApiError)) {
       return;
     }
-    setLeasePage(0);
-    setLeaseCursorStack([""]);
-  }, [leaseCursor, routeStateQuery.error]);
+    if (shouldResetLeaseCursorOnError(error.status, leaseCursor)) {
+      setLeasePage(0);
+      setLeaseCursorStack([""]);
+    }
+    if (shouldResetLeaseCursorOnError(error.status, nodeCursor)) {
+      setNodePage(0);
+      setNodeCursorStack([""]);
+    }
+  }, [leaseCursor, nodeCursor, routeStateQuery.error]);
 
   useEffect(() => {
     if (!platform) {
@@ -162,6 +178,8 @@ export function PlatformDetailPage() {
     setLeaseCursorStack([""]);
     setLeaseSearch("");
     setDebouncedLeaseSearch("");
+    setNodePage(0);
+    setNodeCursorStack([""]);
   }, [platformId]);
 
   useEffect(() => {
@@ -354,6 +372,29 @@ export function PlatformDetailPage() {
       return;
     }
     setLeasePage((current) => current - 1);
+  };
+
+  const changeNodePageSize = (next: number) => {
+    setNodePageSize(next);
+    setNodePage(0);
+    setNodeCursorStack([""]);
+  };
+
+  const moveNodeNext = () => {
+    const nextCursor = visibleRouteState?.nodes_next_cursor;
+    if (routeStateQuery.isFetching || !routeNodesHasMore || !nextCursor) {
+      return;
+    }
+    const nextPage = nodePage + 1;
+    setNodeCursorStack((current) => [...current.slice(0, nextPage), nextCursor]);
+    setNodePage(nextPage);
+  };
+
+  const moveNodePrevious = () => {
+    if (routeStateQuery.isFetching || nodePage <= 0) {
+      return;
+    }
+    setNodePage((current) => current - 1);
   };
 
   const leaseColumns: ColumnDef<PlatformLease>[] = [
@@ -787,7 +828,15 @@ export function PlatformDetailPage() {
                     </Button>
                   </div>
                   <div className="platform-route-state-toolbar">
-                    <Select value={nodeStatusFilter} onChange={(event) => setNodeStatusFilter(event.target.value as PlatformRouteNode["status"] | "all")} aria-label={t("节点状态过滤")}>
+                    <Select
+                      value={nodeStatusFilter}
+                      onChange={(event) => {
+                        setNodeStatusFilter(event.target.value as PlatformRouteNode["status"] | "all");
+                        setNodePage(0);
+                        setNodeCursorStack([""]);
+                      }}
+                      aria-label={t("节点状态过滤")}
+                    >
                       <option value="all">{t("全部状态")}</option>
                       <option value="available">{t("可用")}</option>
                       <option value="cooling">{t("冷却中")}</option>
@@ -802,8 +851,19 @@ export function PlatformDetailPage() {
                     <>
                       <p className="muted platform-route-state-observed">{t("快照时间：{{time}}", { time: formatDateTime(visibleRouteState.observed_at) })}</p>
                       {visibleRouteNodes.length ? <DataTable data={visibleRouteNodes} columns={routeNodeColumns} getRowId={(item) => item.node_hash} className="data-table-route-nodes" wrapClassName="platform-route-node-table-wrap" /> : <div className="empty-box"><Sparkles size={16} /><p>{t("当前筛选没有节点")}</p></div>}
+                      <CursorPagination
+                        pageIndex={nodePage}
+                        hasMore={routeNodesHasMore}
+                        pageSize={nodePageSize}
+                        pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
+                        totalItems={routeNodesTotal}
+                        disabled={routeStateQuery.isFetching}
+                        onPageSizeChange={changeNodePageSize}
+                        onPrev={moveNodePrevious}
+                        onNext={moveNodeNext}
+                      />
                       <div className="platform-cooldown-list">
-                        <div className="platform-drawer-section-head"><h4>{t("响应冷却")}</h4><p>{t("冷却是平台内存态，读取时会清理已到期项目，不会持久化。")}</p></div>
+                        <div className="platform-drawer-section-head"><h4>{t("响应冷却")}</h4><p>{t("冷却是平台内存态，读取时会清理已到期项目，不会持久化；当前页显示 {{count}} 条，平台共 {{total}} 条。", { count: visibleRouteState.cooldowns.length, total: visibleRouteState.cooldowns_total })}</p></div>
                         {visibleRouteState.cooldowns.length ? visibleRouteState.cooldowns.map((cooldown) => <div className="platform-cooldown-item" key={`${cooldown.scope}-${cooldown.node_hash ?? cooldown.egress_ip ?? "unbound"}`}><Badge variant="warning">{cooldown.scope === "egress_ip" ? t("出口 IP") : t("当前路由节点")}</Badge><span>{cooldown.node_hash || cooldown.egress_ip || t("未绑定当前节点")}</span><span>{t("恢复：{{time}}", { time: formatDateTime(cooldown.until) })}</span></div>) : <p className="muted">{t("当前没有活跃冷却")}</p>}
                       </div>
                     </>

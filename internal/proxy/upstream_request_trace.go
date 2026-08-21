@@ -13,10 +13,11 @@ type upstreamRequestTrace struct {
 }
 
 type upstreamRequestAttemptTrace struct {
-	gotConn              atomic.Bool
-	wroteRequest         atomic.Bool
-	egressCommitted      atomic.Bool
-	gotFirstResponseByte func()
+	gotConn               atomic.Bool
+	wroteRequest          atomic.Bool
+	firstResponseByteSeen atomic.Bool
+	egressCommitted       atomic.Bool
+	gotFirstResponseByte  func()
 }
 
 func newUpstreamRequestTrace(gotFirstResponseByte ...func()) *upstreamRequestTrace {
@@ -49,6 +50,7 @@ func (t *upstreamRequestAttemptTrace) clientTrace() *httptrace.ClientTrace {
 			}
 		},
 		GotFirstResponseByte: func() {
+			t.firstResponseByteSeen.Store(true)
 			if t.gotFirstResponseByte != nil {
 				t.gotFirstResponseByte()
 			}
@@ -58,6 +60,10 @@ func (t *upstreamRequestAttemptTrace) clientTrace() *httptrace.ClientTrace {
 
 func (t *upstreamRequestAttemptTrace) shouldCommitEgress() bool {
 	return t.gotConn.Load() && t.wroteRequest.Load()
+}
+
+func (t *upstreamRequestAttemptTrace) responseStarted() bool {
+	return t != nil && t.firstResponseByteSeen.Load()
 }
 
 // commitEgress acquires the one commit right for an attempt. A successful

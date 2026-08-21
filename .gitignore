@@ -14,4 +14,5 @@ webui/pnpm-workspace.yaml
 # Claude Code / OMC tooling and local runtime data
 .claude/
 .omc/
-.local/
+# Resin task-local artifacts (kept below the project root and never committed)
+/.local/codex/

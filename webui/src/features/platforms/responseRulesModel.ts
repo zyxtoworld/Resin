@@ -4,12 +4,22 @@ import type { PlatformResponseRule } from "./types";
 const MAX_RULES = 32;
 const MAX_STATUS_CODES = 64;
 const MAX_STATUS_RANGES = 16;
+const MAX_FAILURE_KINDS = 8;
 const MAX_HEADERS = 32;
 const MAX_EXPIRY_SOURCES = 16;
 const MAX_VALUE_LENGTH = 4096;
 
 const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const valueSchema = z.string().max(MAX_VALUE_LENGTH, "值过长");
+const failureKindSchema = z.enum([
+  "timeout",
+  "transport_timeout",
+  "connect_timeout",
+  "response_header_timeout",
+  "first_byte_timeout",
+  "idle_timeout",
+  "transport_error",
+]);
 
 function isValidJSONPointer(value: string): boolean {
   if (!value.startsWith("/")) return false;
@@ -52,11 +62,17 @@ const rangeSchema = z.object({
 const matchSchema = z.object({
   status_codes: z.array(z.number().int().min(100).max(599)).max(MAX_STATUS_CODES).optional(),
   status_range: z.array(rangeSchema).max(MAX_STATUS_RANGES).optional(),
+  failure_kinds: z.array(failureKindSchema).max(MAX_FAILURE_KINDS).optional(),
   headers: z.array(headerSchema).max(MAX_HEADERS).optional(),
   body: bodySchema.optional(),
 }).strict().superRefine((match, ctx) => {
-  if (!(match.status_codes?.length || match.status_range?.length || match.headers?.length || match.body)) {
+  const hasFailureKinds = Boolean(match.failure_kinds?.length);
+  const hasResponsePredicates = Boolean(match.status_codes?.length || match.status_range?.length || match.headers?.length || match.body);
+  if (!hasFailureKinds && !hasResponsePredicates) {
     ctx.addIssue({ code: "custom", path: [], message: "至少需要一个响应匹配条件" });
+  }
+  if (hasFailureKinds && hasResponsePredicates) {
+    ctx.addIssue({ code: "custom", path: ["failure_kinds"], message: "失败类别不能与状态码、Header 或响应体条件混用" });
   }
   const codes = match.status_codes ?? [];
   if (new Set(codes).size !== codes.length) {
@@ -129,7 +145,15 @@ const responseRuleSchema = z.object({
   enabled: z.boolean(),
   match: matchSchema,
   action: actionSchema,
-}).strict();
+}).strict().superRefine((rule, ctx) => {
+  const failureRule = Boolean(rule.match.failure_kinds?.length);
+  if (failureRule && rule.action.expiry_sources?.length) {
+    ctx.addIssue({ code: "custom", path: ["action", "expiry_sources"], message: "失败类别规则没有响应到期来源，只能使用兜底策略" });
+  }
+  if (failureRule && rule.action.type === "cooldown" && rule.action.fallback === "none") {
+    ctx.addIssue({ code: "custom", path: ["action", "fallback"], message: "仅冷却的失败规则必须有期限或改为冷却并重试" });
+  }
+});
 
 const responseRulesSchema = z.array(responseRuleSchema).max(MAX_RULES, `规则数量不能超过 ${MAX_RULES}`);
 
@@ -265,6 +289,7 @@ function isOneOf<T extends string>(value: unknown, values: readonly T[]): value 
 
 const editorHeaderOps = ["exists", "absent", "regex", "not_regex", "contains", "not_contains"] as const;
 const editorBodyOps = ["regex", "not_regex", "contains", "not_contains"] as const;
+const editorFailureKinds = ["timeout", "transport_timeout", "connect_timeout", "response_header_timeout", "first_byte_timeout", "idle_timeout", "transport_error"] as const;
 const editorExpiryTypes = ["retry_after", "header", "json_pointer", "body_regex"] as const;
 const editorExpiryFormats = ["rfc3339_utc", "unix_seconds", "unix_millis", "delta_seconds"] as const;
 const editorActionTypes = ["passthrough", "retry_next", "cooldown", "cooldown_then_retry_next"] as const;
@@ -300,6 +325,9 @@ function isEditorMatch(value: unknown): value is PlatformResponseRule["match"] {
     return false;
   }
   if (value.status_range !== undefined && (!Array.isArray(value.status_range) || !value.status_range.every(isEditorRange))) {
+    return false;
+  }
+  if (value.failure_kinds !== undefined && (!Array.isArray(value.failure_kinds) || !value.failure_kinds.every((item) => isOneOf(item, editorFailureKinds)))) {
     return false;
   }
   if (value.headers !== undefined && (!Array.isArray(value.headers) || !value.headers.every(isEditorHeader))) {

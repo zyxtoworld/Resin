@@ -383,6 +383,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	attemptedEntries := make(map[*node.NodeEntry]struct{})
 	var pending *routedOutbound
 	finalResponseAccepted := true
+	var finalAttemptCancel context.CancelFunc
 	for attempt := 0; attempt < retryBudget; attempt++ {
 		upstreamAttemptTrace := upstreamTrace.newAttempt()
 		var transport *http.Transport
@@ -427,6 +428,20 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			transport = p.outboundHTTPTransport(routed)
 		}
+		attemptCtx, cancelAttempt, bounded := attemptContextForRequest(r.Context(), attempt, retryBudget)
+		if bounded && attemptCtx == nil {
+			if err := r.Context().Err(); err != nil {
+				lifecycle.setNetOK(true)
+				return
+			}
+			lifecycle.setProxyError(ErrUpstreamRequestFailed)
+			lifecycle.setHTTPStatus(ErrUpstreamRequestFailed.HTTPCode)
+			writeProxyError(w, ErrUpstreamRequestFailed)
+			return
+		}
+		if attemptCtx == nil {
+			attemptCtx = r.Context()
+		}
 
 		var outReq *http.Request
 		if attempt == 0 {
@@ -434,7 +449,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			outReq = cloneForwardRequestForRetry(baseReq, bodyCapture.Bytes())
 		}
-		outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamAttemptTrace.clientTrace()))
+		outReq = outReq.WithContext(httptrace.WithClientTrace(attemptCtx, upstreamAttemptTrace.clientTrace()))
 		pendingEgressHeaderBytes := headerWireLen(outReq.Header)
 
 		// Forward the request. A response-rule retry is considered only before
@@ -442,16 +457,54 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		var bodyBytes int64
 		var bodyComplete bool
 		resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
-			r.Context(), transport, outReq,
+			attemptCtx, transport, outReq,
 		)
 		if !bodyComplete {
 			resp = nil
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
 		}
 		if bodyComplete && upstreamAttemptTrace.commitEgress(resp != nil && roundTripErr == nil, roundTripErr) {
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 			lifecycle.addEgressBytes(bodyBytes)
 		}
 		if roundTripErr != nil {
+			failureMatch, failureMatched, _ := applyTransportFailureRule(p.router, route, upstreamAttemptTrace, roundTripErr)
+			canRetry := hasRoute && failureMatched && failureMatch.RetryNext() && !upstreamAttemptTrace.responseStarted() && resp == nil && bounded &&
+				requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget && r.Context().Err() == nil
+			if canRetry {
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
+				exclusions := routing.RouteRetryExclusions{
+					Entries:   make([]*node.NodeEntry, 0, len(attemptedEntries)),
+					EgressIPs: make([]netip.Addr, 0, len(attemptedIPs)),
+				}
+				for entry := range attemptedEntries {
+					exclusions.Entries = append(exclusions.Entries, entry)
+				}
+				for rawIP := range attemptedIPs {
+					if ip, err := netip.ParseAddr(rawIP); err == nil {
+						exclusions.EgressIPs = append(exclusions.EgressIPs, ip)
+					}
+				}
+				nextRoute, nextErr := p.router.RouteRequestNext(route, exclusions)
+				if nextErr == nil {
+					candidate, bindErr := bindRoutedOutbound(nextRoute, p.pool)
+					if bindErr == nil {
+						if _, duplicateIP := attemptedIPs[candidate.Route.EgressIP.String()]; !duplicateIP {
+							if _, duplicateEntry := attemptedEntries[candidate.Entry]; !duplicateEntry {
+								pending = &candidate
+								continue
+							}
+						}
+					}
+				}
+			}
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
 			proxyErr := classifyUpstreamError(roundTripErr)
 			if proxyErr == nil {
 				// context.Canceled — skip health recording, close silently.
@@ -477,6 +530,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		if matchedRule && responseMatch.RetryNext() && requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget {
 			if r.Context().Err() != nil {
 				_ = resp.Body.Close()
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
 				lifecycle.setNetOK(true)
 				return
 			}
@@ -505,13 +561,20 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				_ = resp.Body.Close()
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
 				pending = &next
 				continue
 			}
 		}
+		finalAttemptCancel = cancelAttempt
 		break
 	}
 	if resp == nil {
+		if finalAttemptCancel != nil {
+			finalAttemptCancel()
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -532,6 +595,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	copiedBytes, copyErr := io.Copy(w, resp.Body)
 	lifecycle.addIngressBytes(copiedBytes)
+	if finalAttemptCancel != nil {
+		finalAttemptCancel()
+	}
 	if copyErr != nil {
 		if shouldRecordForwardCopyFailure(r, copyErr) {
 			lifecycle.setProxyError(ErrUpstreamRequestFailed)

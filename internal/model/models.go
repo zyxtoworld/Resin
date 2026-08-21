@@ -34,10 +34,11 @@ type PlatformResponseRule struct {
 }
 
 type PlatformResponseRuleMatch struct {
-	StatusCodes []int                         `json:"status_codes,omitempty"`
-	StatusRange []PlatformResponseStatusRange `json:"status_range,omitempty"`
-	Headers     []PlatformResponseHeaderMatch `json:"headers,omitempty"`
-	Body        *PlatformResponseBodyMatch    `json:"body,omitempty"`
+	StatusCodes  []int                         `json:"status_codes,omitempty"`
+	StatusRange  []PlatformResponseStatusRange `json:"status_range,omitempty"`
+	FailureKinds []string                      `json:"failure_kinds,omitempty"`
+	Headers      []PlatformResponseHeaderMatch `json:"headers,omitempty"`
+	Body         *PlatformResponseBodyMatch    `json:"body,omitempty"`
 }
 
 type PlatformResponseStatusRange struct {

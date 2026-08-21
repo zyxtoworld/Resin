@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 type retryLatencyIdentityRecorder struct {
@@ -187,6 +190,259 @@ func TestReverseRetryRoundTripper_SuccessResponseWithoutHTTPTraceCommitsOnce(t *
 	_ = resp.Body.Close()
 	if got := commits.Load(); got != 1 {
 		t.Fatalf("egress commits: got %d, want 1", got)
+	}
+}
+
+type responseHeaderTimeoutError struct{}
+
+func (responseHeaderTimeoutError) Error() string   { return "response header timeout" }
+func (responseHeaderTimeoutError) Timeout() bool   { return true }
+func (responseHeaderTimeoutError) Temporary() bool { return true }
+
+func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			FailureKinds: []string{"response_header_timeout"},
+		},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/timeout")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	entry := initial.SelectedEntry()
+	if entry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+	initial.RetryBudget = 3
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var attempts []node.Hash
+	var attemptIPs []netip.Addr
+	var egressCommits atomic.Int32
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: entry},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts = append(attempts, candidate.Entry.Hash)
+				attemptIPs = append(attemptIPs, candidate.Route.EgressIP)
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+					t.Fatal("transport failure attempt missing request trace")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				if len(attempts) < 3 {
+					return nil, responseHeaderTimeoutError{}
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+		onAttemptEgress: func(_, _ int64) {
+			egressCommits.Add(1)
+		},
+	}
+
+	resp, err := retry.RoundTrip(httptest.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/timeout", nil))
+	if err != nil {
+		t.Fatalf("transport-policy retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("transport-policy response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if len(attempts) != 3 {
+		t.Fatalf("attempt count: got %d, want 3", len(attempts))
+	}
+	if attempts[0] == attempts[1] || attempts[0] == attempts[2] || attempts[1] == attempts[2] {
+		t.Fatalf("attempts reused an entry: %v", attempts)
+	}
+	if got := egressCommits.Load(); got != 3 {
+		t.Fatalf("egress commits: got %d, want 3", got)
+	}
+	if !retry.promotable {
+		t.Fatal("successful final attempt was not promotable")
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok {
+		t.Fatal("platform cooldown snapshot unavailable")
+	}
+	cooled := make(map[netip.Addr]bool, len(cooldowns))
+	for _, cooldown := range cooldowns {
+		if cooldown.Scope == platform.ResponseRuleScopeEgressIP {
+			cooled[cooldown.EgressIP] = true
+		}
+	}
+	if len(cooldowns) != 2 || !cooled[attemptIPs[0]] || !cooled[attemptIPs[1]] || cooled[attemptIPs[2]] {
+		t.Fatalf("platform cooldowns: got %v, attempts=%v ips=%v", cooled, attempts, attemptIPs)
+	}
+}
+
+func TestReverseRetryRoundTripper_StartedResponseCoolsWithoutRetry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "idle-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"idle_timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/idle-timeout")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RetryBudget = 2
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := newUpstreamRequestTrace().newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil || trace.GotFirstResponseByte == nil {
+					t.Fatal("idle timeout attempt missing request/response trace")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				trace.GotFirstResponseByte()
+				attempts.Add(1)
+				return nil, responseHeaderTimeoutError{}
+			})
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = retry.RoundTrip(httptest.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/idle-timeout", nil))
+	if err == nil {
+		t.Fatal("started-response transport failure unexpectedly succeeded")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("started-response failure retried: got %d attempts, want 1", got)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("started-response cooldowns: ok=%v cooldowns=%v", ok, cooldowns)
+	}
+}
+
+func TestForwardProxy_TransportFailureRuleRetriesAfterConnectTimeout(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "connect-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			FailureKinds: []string{"connect_timeout"},
+		},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	initial, err := env.router.RouteRequest("plat", "account", "https://example.com/connect-timeout")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if !env.router.CommitRouteForAccount(initial, "account") {
+		t.Fatal("failed to establish deterministic sticky initial route")
+	}
+	var dialed []node.Hash
+	env.pool.Range(func(_ node.Hash, entry *node.NodeEntry) bool {
+		if entry == initial.SelectedEntry() {
+			setProxyE2EEntryDialFunc(t, entry, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+				dialed = append(dialed, entry.Hash)
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: responseHeaderTimeoutError{}}
+			})
+			return true
+		}
+		setProxyE2EEntryDialTarget(t, entry, upstream.Listener.Addr().String())
+		return true
+	})
+
+	proxy := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	request := httptest.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/connect-timeout", nil)
+	request.Header.Set("Proxy-Authorization", basicAuth("plat.account", "tok"))
+	writer := httptest.NewRecorder()
+	proxy.ServeHTTP(writer, request)
+	if writer.Code != http.StatusOK || writer.Body.String() != "ok" {
+		t.Fatalf("forward transport retry: status=%d body=%q", writer.Code, writer.Body.String())
+	}
+	if len(dialed) != 1 || dialed[0] != initial.NodeHash {
+		t.Fatalf("dial attempts: got %v, want only initial timeout %s", dialed, initial.NodeHash.Hex())
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("connect-timeout cooldowns: ok=%v cooldowns=%v", ok, cooldowns)
 	}
 }
 

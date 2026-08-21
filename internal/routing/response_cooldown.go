@@ -34,6 +34,15 @@ type ResponseCooldownSnapshot struct {
 	Until    time.Time
 }
 
+// ResponseCooldownReadSnapshot is an immutable, lock-free view produced by
+// one cooldown-owner read. Callers may classify many nodes against it without
+// re-entering the cooldown mutex for every node.
+type ResponseCooldownReadSnapshot struct {
+	items    []ResponseCooldownSnapshot
+	byNode   map[node.Hash]ResponseCooldownSnapshot
+	byEgress map[netip.Addr]ResponseCooldownSnapshot
+}
+
 type nodeCooldownExpiry struct {
 	hash  node.Hash
 	until time.Time
@@ -164,46 +173,210 @@ func (c *ResponseCooldowns) IsCoolingForEntry(hash node.Hash, entry *node.NodeEn
 // same read. Callers should pass the timestamp of the surrounding runtime
 // snapshot so the returned remaining durations are generation-consistent.
 func (c *ResponseCooldowns) Snapshot(now time.Time) []ResponseCooldownSnapshot {
+	return c.ReadSnapshot(now).Items()
+}
+
+// ReadSnapshot prunes and copies the active cooldowns under one owner lock.
+// The returned value is immutable and safe for repeated node classification.
+func (c *ResponseCooldowns) ReadSnapshot(now time.Time) ResponseCooldownReadSnapshot {
+	result := ResponseCooldownReadSnapshot{
+		items:    []ResponseCooldownSnapshot{},
+		byNode:   make(map[node.Hash]ResponseCooldownSnapshot),
+		byEgress: make(map[netip.Addr]ResponseCooldownSnapshot),
+	}
 	if c == nil {
-		return []ResponseCooldownSnapshot{}
+		return result
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pruneExpiredLocked(now)
-
-	result := make([]ResponseCooldownSnapshot, 0, len(c.byNode)+len(c.byEgress))
+	result.items = make([]ResponseCooldownSnapshot, 0, len(c.byNode)+len(c.byEgress))
 	for hash, until := range c.byNode {
 		if until.After(now) {
-			result = append(result, ResponseCooldownSnapshot{
+			item := ResponseCooldownSnapshot{
 				Scope:    platform.ResponseRuleScopeNode,
 				NodeHash: hash,
 				Entry:    c.nodeEntry[hash],
 				Until:    until,
-			})
+			}
+			result.items = append(result.items, item)
+			result.byNode[hash] = item
 		}
 	}
 	for ip, until := range c.byEgress {
 		if until.After(now) {
-			result = append(result, ResponseCooldownSnapshot{
+			item := ResponseCooldownSnapshot{
 				Scope:    platform.ResponseRuleScopeEgressIP,
 				EgressIP: ip,
 				Until:    until,
-			})
+			}
+			result.items = append(result.items, item)
+			result.byEgress[ip] = item
 		}
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Scope != result[j].Scope {
-			return result[i].Scope < result[j].Scope
-		}
-		if result[i].NodeHash != node.Zero || result[j].NodeHash != node.Zero {
-			return result[i].NodeHash.Hex() < result[j].NodeHash.Hex()
-		}
-		if result[i].EgressIP != result[j].EgressIP {
-			return result[i].EgressIP.String() < result[j].EgressIP.String()
-		}
-		return result[i].Until.Before(result[j].Until)
+	sort.Slice(result.items, func(i, j int) bool {
+		return compareResponseCooldownSnapshots(result.items[i], result.items[j]) < 0
 	})
 	return result
+}
+
+// Items returns a detached, deterministically ordered list from the read view.
+func (s ResponseCooldownReadSnapshot) Items() []ResponseCooldownSnapshot {
+	return append([]ResponseCooldownSnapshot(nil), s.items...)
+}
+
+// Filter evaluates include exactly once per item and returns another detached
+// immutable view. Callers that need both an exact total and a bounded page can
+// filter generation validity once, then page the filtered view without
+// repeating expensive entry/view-owner checks.
+func (s ResponseCooldownReadSnapshot) Filter(include func(ResponseCooldownSnapshot) bool) ResponseCooldownReadSnapshot {
+	if include == nil {
+		return s
+	}
+	filtered := ResponseCooldownReadSnapshot{
+		items:    make([]ResponseCooldownSnapshot, 0, len(s.items)),
+		byNode:   make(map[node.Hash]ResponseCooldownSnapshot),
+		byEgress: make(map[netip.Addr]ResponseCooldownSnapshot),
+	}
+	for _, item := range s.items {
+		if !include(item) {
+			continue
+		}
+		filtered.items = append(filtered.items, item)
+		if item.Scope == platform.ResponseRuleScopeNode {
+			filtered.byNode[item.NodeHash] = item
+		} else if item.EgressIP.IsValid() {
+			filtered.byEgress[item.EgressIP] = item
+		}
+	}
+	return filtered
+}
+
+// IsCoolingForEntry classifies a node without taking a lock. Node-scope
+// cooldowns with a nil Entry are legacy hash-scoped values; generation-bound
+// values require exact entry identity.
+func (s ResponseCooldownReadSnapshot) IsCoolingForEntry(hash node.Hash, entry *node.NodeEntry, egressIP netip.Addr) bool {
+	if item, ok := s.byNode[hash]; ok && (item.Entry == nil || item.Entry == entry) {
+		return true
+	}
+	if _, ok := s.byEgress[egressIP]; ok {
+		return true
+	}
+	return false
+}
+
+type responseCooldownPageHeap struct {
+	items []ResponseCooldownSnapshot
+}
+
+func (h responseCooldownPageHeap) Len() int { return len(h.items) }
+
+// Less keeps the worst retained item at the root, so a page scan retains only
+// offset+limit+1 candidates instead of materializing the whole cooldown table.
+func (h responseCooldownPageHeap) Less(i, j int) bool {
+	return compareResponseCooldownSnapshots(h.items[i], h.items[j]) > 0
+}
+
+func (h responseCooldownPageHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+func (h *responseCooldownPageHeap) Push(value any) {
+	h.items = append(h.items, value.(ResponseCooldownSnapshot))
+}
+
+func (h *responseCooldownPageHeap) Pop() any {
+	last := len(h.items) - 1
+	value := h.items[last]
+	h.items = h.items[:last]
+	return value
+}
+
+func compareResponseCooldownSnapshots(left, right ResponseCooldownSnapshot) int {
+	if left.Scope != right.Scope {
+		if left.Scope < right.Scope {
+			return -1
+		}
+		return 1
+	}
+	if left.NodeHash != right.NodeHash {
+		if left.NodeHash.Hex() < right.NodeHash.Hex() {
+			return -1
+		}
+		return 1
+	}
+	if left.EgressIP != right.EgressIP {
+		if left.EgressIP.String() < right.EgressIP.String() {
+			return -1
+		}
+		return 1
+	}
+	if left.Until.Before(right.Until) {
+		return -1
+	}
+	if left.Until.After(right.Until) {
+		return 1
+	}
+	return 0
+}
+
+// SnapshotPage returns a stable, bounded page of active entries accepted by
+// include. It first takes one immutable read snapshot, then performs exact
+// counting while retaining only the requested top-k candidates. include runs
+// after the cooldown owner is released and must remain read-only.
+func (c *ResponseCooldowns) SnapshotPage(now time.Time, offset, limit int, include func(ResponseCooldownSnapshot) bool) ([]ResponseCooldownSnapshot, int, bool) {
+	return c.ReadSnapshot(now).SnapshotPageWithCount(offset, limit, include, include)
+}
+
+// SnapshotPageWithCount scans the immutable cooldown read once. countInclude
+// defines the exact total, while pageInclude defines the bounded page
+// contents. This is useful when a page shows only the currently visible nodes
+// but its total describes the whole platform.
+func (s ResponseCooldownReadSnapshot) SnapshotPageWithCount(
+	offset, limit int,
+	countInclude func(ResponseCooldownSnapshot) bool,
+	pageInclude func(ResponseCooldownSnapshot) bool,
+) ([]ResponseCooldownSnapshot, int, bool) {
+	if limit <= 0 || offset < 0 {
+		return []ResponseCooldownSnapshot{}, 0, false
+	}
+	window := offset + limit + 1
+	selected := &responseCooldownPageHeap{}
+	heap.Init(selected)
+	total := 0
+	visit := func(item ResponseCooldownSnapshot) {
+		if countInclude == nil || countInclude(item) {
+			total++
+		}
+		if pageInclude != nil && !pageInclude(item) {
+			return
+		}
+		if selected.Len() < window {
+			heap.Push(selected, item)
+			return
+		}
+		if compareResponseCooldownSnapshots(item, selected.items[0]) < 0 {
+			heap.Pop(selected)
+			heap.Push(selected, item)
+		}
+	}
+	for _, item := range s.items {
+		visit(item)
+	}
+	items := make([]ResponseCooldownSnapshot, 0, selected.Len())
+	for selected.Len() > 0 {
+		items = append(items, heap.Pop(selected).(ResponseCooldownSnapshot))
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return compareResponseCooldownSnapshots(items[i], items[j]) < 0
+	})
+	if offset >= len(items) {
+		return []ResponseCooldownSnapshot{}, total, false
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	page := items[offset:end]
+	return page, total, end < total
 }
 
 func (c *ResponseCooldowns) isCooling(

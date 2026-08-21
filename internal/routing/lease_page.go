@@ -52,6 +52,10 @@ type LeasePageQuery struct {
 	SortBy         string
 	Desc           bool
 	Cursor         string
+	// CountNodeHashes limits the per-node lease counts produced for a caller
+	// that already selected a bounded node page. A nil map preserves the
+	// existing all-node count behavior for other callers.
+	CountNodeHashes map[node.Hash]struct{}
 }
 
 type LeasePageItem struct {
@@ -308,7 +312,11 @@ func (r *Router) SnapshotLeasePageForPlatformContext(ctx context.Context, platfo
 	selected := &leasePageHeap{query: query}
 	heap.Init(selected)
 	state.Leases.Range(func(account string, lease Lease) bool {
-		page.Counts[lease.NodeHash]++
+		if query.CountNodeHashes == nil {
+			page.Counts[lease.NodeHash]++
+		} else if _, wanted := query.CountNodeHashes[lease.NodeHash]; wanted {
+			page.Counts[lease.NodeHash]++
+		}
 		if !leaseMatchesQuery(account, query) {
 			return true
 		}

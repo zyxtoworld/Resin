@@ -1,6 +1,14 @@
 export type PlatformMissAction = "TREAT_AS_EMPTY" | "REJECT";
 export type PlatformEmptyAccountBehavior = "RANDOM" | "FIXED_HEADER" | "ACCOUNT_HEADER_RULE";
 export type PlatformAllocationPolicy = "BALANCED" | "PREFER_LOW_LATENCY" | "PREFER_IDLE_IP";
+export type PlatformResponseFailureKind =
+  | "timeout"
+  | "transport_timeout"
+  | "connect_timeout"
+  | "response_header_timeout"
+  | "first_byte_timeout"
+  | "idle_timeout"
+  | "transport_error";
 
 export type PlatformResponseRule = {
   id: string;
@@ -8,6 +16,7 @@ export type PlatformResponseRule = {
   match: {
     status_codes?: number[];
     status_range?: Array<{ min: number; max: number }>;
+    failure_kinds?: PlatformResponseFailureKind[];
     headers?: Array<{
       name: string;
       op: "exists" | "absent" | "regex" | "not_regex" | "contains" | "not_contains";
@@ -137,6 +146,10 @@ export type PlatformRouteState = {
   platform_id: string;
   observed_at: string;
   nodes: PlatformRouteNode[];
+  nodes_total: number;
+  nodes_limit: number;
+  nodes_has_more: boolean;
+  nodes_next_cursor?: string;
   leases: {
     items: PlatformLease[];
     total: number;
@@ -145,6 +158,7 @@ export type PlatformRouteState = {
     next_cursor?: string;
   };
   cooldowns: PlatformCooldownSnapshot[];
+  cooldowns_total: number;
 };
 
 export type ListPlatformLeasesInput = {

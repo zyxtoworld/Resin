@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"testing"
@@ -39,6 +40,73 @@ func TestResponseCooldownsScopesUseIndependentKeys(t *testing.T) {
 	}
 	if cooldowns.IsCooling(nodeA, ipA, until) {
 		t.Fatal("cooldown remained active at its exact deadline")
+	}
+}
+
+func TestResponseCooldownReadSnapshotClassifiesWithoutReacquiringOwner(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	hash := node.HashFromRawOptions([]byte(`{"id":"snapshot-owner"}`))
+	entry := node.NewNodeEntry(hash, nil, time.Now(), 0)
+	cooldowns.Mark(platform.ResponseRuleScopeNode, hash, netip.Addr{}, time.Now().Add(time.Minute))
+
+	cooldowns.mu.Lock()
+	snapshotDone := make(chan struct{})
+	var snapshot ResponseCooldownReadSnapshot
+	go func() {
+		snapshot = cooldowns.ReadSnapshot(time.Now())
+		close(snapshotDone)
+	}()
+	select {
+	case <-snapshotDone:
+		cooldowns.mu.Unlock()
+		t.Fatal("snapshot bypassed the cooldown owner")
+	default:
+	}
+	cooldowns.mu.Unlock()
+	select {
+	case <-snapshotDone:
+	case <-time.After(time.Second):
+		t.Fatal("cooldown snapshot did not complete")
+	}
+
+	cooldowns.mu.Lock()
+	classificationDone := make(chan struct{})
+	go func() {
+		for i := 0; i < 1500; i++ {
+			if !snapshot.IsCoolingForEntry(hash, entry, netip.Addr{}) {
+				return
+			}
+		}
+		close(classificationDone)
+	}()
+	select {
+	case <-classificationDone:
+		cooldowns.mu.Unlock()
+	case <-time.After(time.Second):
+		cooldowns.mu.Unlock()
+		t.Fatal("immutable cooldown classification tried to reacquire the owner")
+	}
+}
+
+func TestResponseCooldownReadSnapshotFilterChecksEachItemOnce(t *testing.T) {
+	cooldowns := NewResponseCooldowns()
+	now := time.Now()
+	for i := 0; i < 1500; i++ {
+		hash := node.HashFromRawOptions([]byte(fmt.Sprintf(`{"id":"snapshot-filter-%d"}`, i)))
+		cooldowns.Mark(platform.ResponseRuleScopeNode, hash, netip.Addr{}, now.Add(time.Hour))
+	}
+	snapshot := cooldowns.ReadSnapshot(now)
+	calls := 0
+	filtered := snapshot.Filter(func(item ResponseCooldownSnapshot) bool {
+		calls++
+		return item.Scope == platform.ResponseRuleScopeNode
+	})
+	if calls != len(snapshot.Items()) {
+		t.Fatalf("filter calls = %d, want one per item %d", calls, len(snapshot.Items()))
+	}
+	page, total, _ := filtered.SnapshotPageWithCount(0, 50, nil, nil)
+	if total != 1500 || len(page) != 50 {
+		t.Fatalf("filtered page = total %d/items %d, want 1500/50", total, len(page))
 	}
 }
 

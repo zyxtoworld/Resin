@@ -1577,6 +1577,36 @@ func (r *Router) SnapshotResponseCooldownsForPlatformContext(ctx context.Context
 	return filtered, true, nil
 }
 
+// WithPlatformResponseCooldownsContext runs fn while the platform routing
+// lifetime and its cooldown table are read-owned. The callback receives the
+// routing-state generation so a cursor can be bound to the same state that
+// supplied its page. Production read callers must take one ReadSnapshot and
+// classify from that immutable value; they must not re-enter the cooldown
+// mutex for every node.
+func (r *Router) WithPlatformResponseCooldownsContext(
+	ctx context.Context,
+	platformID string,
+	fn func(*ResponseCooldowns, uint64) error,
+) (bool, error) {
+	if r == nil {
+		return false, nil
+	}
+	if err := r.lifecycleMu.rLockContext(ctx); err != nil {
+		return false, err
+	}
+	defer r.lifecycleMu.RUnlock()
+	if r.stopped || !r.platformExistsLocked(platformID) {
+		return false, nil
+	}
+	state := r.ensurePlatformState(platformID)
+	cooldowns := state.ResponseCooldowns
+	generation := state.generation
+	if fn == nil {
+		return true, nil
+	}
+	return true, fn(cooldowns, generation)
+}
+
 // InheritLeaseForPlatform validates the parent and creates/replaces the child
 // inside one lifecycle read section. The platform check and the lease mutation
 // therefore cannot be split by platform removal.

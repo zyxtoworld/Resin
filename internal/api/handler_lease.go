@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Resinat/Resin/internal/observability"
@@ -223,6 +224,10 @@ func HandlePlatformRouteState(cp *service.ControlPlaneService) http.HandlerFunc 
 		if !ok {
 			return
 		}
+		nodeLimit, ok := parseRouteStateNodePage(w, r)
+		if !ok {
+			return
+		}
 		state, err := cp.GetPlatformRouteStateContext(r.Context(), platformID, service.PlatformRouteStateQuery{
 			LeaseAccount: r.URL.Query().Get("account"),
 			LeaseFuzzy:   fuzzy != nil && *fuzzy,
@@ -230,6 +235,9 @@ func HandlePlatformRouteState(cp *service.ControlPlaneService) http.HandlerFunc 
 			LeaseCursor:  r.URL.Query().Get("cursor"),
 			LeaseSortBy:  sorting.SortBy,
 			LeaseOrder:   sorting.SortOrder,
+			NodeStatus:   r.URL.Query().Get("node_status"),
+			NodeLimit:    nodeLimit,
+			NodeCursor:   r.URL.Query().Get("node_cursor"),
 		})
 		if err != nil {
 			writeServiceError(w, err)
@@ -237,4 +245,28 @@ func HandlePlatformRouteState(cp *service.ControlPlaneService) http.HandlerFunc 
 		}
 		WriteJSON(w, http.StatusOK, state)
 	}
+}
+
+func parseRouteStateNodePage(w http.ResponseWriter, r *http.Request) (int, bool) {
+	if r.URL.Query().Get("node_offset") != "" {
+		writeInvalidArgument(w, "node_offset: not supported; use node_cursor")
+		return 0, false
+	}
+	limit := 50
+	if value := r.URL.Query().Get("node_limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			writeInvalidArgument(w, "node_limit: must be a non-negative integer")
+			return 0, false
+		}
+		if parsed > 200 {
+			writeInvalidArgument(w, "node_limit: must be <= 200")
+			return 0, false
+		}
+		limit = parsed
+	}
+	if limit == 0 {
+		limit = 50
+	}
+	return limit, true
 }
