@@ -158,6 +158,7 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	}
 	current.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
 	makeRoutableNode(t, pool, subMgr, `{"budget-generation":"1"}`, "1.2.3.6", "cloudflare.com", 50*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"budget-generation":"2"}`, "1.2.3.7", "cloudflare.com", 50*time.Millisecond)
 	router := makeRouter(pool, nil)
 
 	oldRoute, err := router.RouteRequestForProxy(platName, "account", "example.com")
@@ -166,6 +167,9 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	}
 	if oldRoute.RequestTotalTimeout != 2*time.Second {
 		t.Fatalf("old route budget = %s, want 2s", oldRoute.RequestTotalTimeout)
+	}
+	if oldRoute.RetryBudget < 2 {
+		t.Fatalf("old route retry budget = %d, want at least 2 routable candidates", oldRoute.RetryBudget)
 	}
 
 	replacement := platform.NewPlatform(platID, platName, nil, nil)
@@ -180,6 +184,9 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	}
 	if newRoute.RequestTotalTimeout != 5*time.Second {
 		t.Fatalf("new route budget = %s, want 5s", newRoute.RequestTotalTimeout)
+	}
+	if newRoute.RetryBudget < 2 {
+		t.Fatalf("new route retry budget = %d, want at least 2 routable candidates", newRoute.RetryBudget)
 	}
 	if oldRoute.RequestTotalTimeout != 2*time.Second {
 		t.Fatalf("old in-flight route budget changed after replacement: %s", oldRoute.RequestTotalTimeout)

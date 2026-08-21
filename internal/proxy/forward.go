@@ -245,18 +245,23 @@ const responseRuleRetryBodyLimit = 8 << 20
 // consumes it. A retry is allowed only when the entire body was read without
 // an error and stayed within the bounded memory limit.
 type replayBodyCapture struct {
-	src       io.ReadCloser
-	data      bytes.Buffer
-	limit     int
-	mu        sync.Mutex
-	abandoned bool
-	overflow  bool
-	complete  bool
-	failed    bool
+	src            io.ReadCloser
+	data           bytes.Buffer
+	limit          int
+	expectedLength int64
+	mu             sync.Mutex
+	abandoned      bool
+	overflow       bool
+	complete       bool
+	failed         bool
 }
 
-func newReplayBodyCapture(src io.ReadCloser) *replayBodyCapture {
-	return &replayBodyCapture{src: src, limit: responseRuleRetryBodyLimit}
+func newReplayBodyCapture(src io.ReadCloser, expectedLength int64) *replayBodyCapture {
+	return &replayBodyCapture{
+		src:            src,
+		limit:          responseRuleRetryBodyLimit,
+		expectedLength: expectedLength,
+	}
 }
 
 func (c *replayBodyCapture) Read(p []byte) (int, error) {
@@ -288,7 +293,13 @@ func (c *replayBodyCapture) Read(p []byte) (int, error) {
 	}
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			c.complete = true
+			if !c.abandoned && !c.failed && !c.overflow {
+				if c.expectedLength > 0 {
+					c.complete = int64(c.data.Len()) == c.expectedLength
+				} else {
+					c.complete = true
+				}
+			}
 		} else {
 			c.failed = true
 		}
@@ -300,7 +311,16 @@ func (c *replayBodyCapture) Close() error {
 	if c == nil || c.src == nil {
 		return nil
 	}
-	return c.src.Close()
+	err := c.src.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		c.failed = true
+	}
+	if !c.abandoned && !c.failed && !c.overflow && c.expectedLength > 0 && int64(c.data.Len()) == c.expectedLength {
+		c.complete = true
+	}
+	return err
 }
 
 func (c *replayBodyCapture) abandon() {
@@ -377,7 +397,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	baseReq := prepareForwardOutboundRequest(r)
 	var bodyCapture *replayBodyCapture
 	if baseReq.Body != nil && baseReq.Body != http.NoBody {
-		bodyCapture = newReplayBodyCapture(baseReq.Body)
+		bodyCapture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
 		baseReq.Body = bodyCapture
 	}
 	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)

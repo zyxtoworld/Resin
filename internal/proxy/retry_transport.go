@@ -39,7 +39,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	baseReq := req
 	var capture *replayBodyCapture
 	if baseReq.Body != nil && baseReq.Body != http.NoBody {
-		capture = newReplayBodyCapture(baseReq.Body)
+		capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
 		baseReq = baseReq.Clone(baseReq.Context())
 		baseReq.Body = capture
 	}

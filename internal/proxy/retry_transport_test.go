@@ -201,6 +201,130 @@ func (responseHeaderTimeoutError) Error() string   { return "response header tim
 func (responseHeaderTimeoutError) Timeout() bool   { return true }
 func (responseHeaderTimeoutError) Temporary() bool { return true }
 
+type closeWithoutEOFBody struct {
+	payload []byte
+	read    atomic.Bool
+}
+
+func (b *closeWithoutEOFBody) Read(p []byte) (int, error) {
+	if b.read.Swap(true) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.payload)
+	return n, nil
+}
+
+func (b *closeWithoutEOFBody) Close() error { return nil }
+
+type closeErrorBody struct {
+	closeWithoutEOFBody
+}
+
+func (*closeErrorBody) Close() error { return errors.New("request body close failed") }
+
+func captureBodyForTest(t *testing.T, body io.ReadCloser, expectedLength int64, readToEOF bool) *replayBodyCapture {
+	t.Helper()
+	capture := newReplayBodyCapture(body, expectedLength)
+	buf := make([]byte, 64)
+	if _, err := capture.Read(buf); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("capture body read: %v", err)
+	}
+	if readToEOF {
+		for {
+			_, err := capture.Read(buf)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("capture body read: %v", err)
+			}
+		}
+	}
+	if err := capture.Close(); err != nil {
+		t.Fatalf("capture body close: %v", err)
+	}
+	return capture
+}
+
+func TestReplayBodyCapture_CloseCompletionRequiresTrustedLength(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           io.ReadCloser
+		expectedLength int64
+		readToEOF      bool
+		wantReplayable bool
+	}{
+		{
+			name:           "zero length is unknown",
+			body:           &closeWithoutEOFBody{payload: []byte("body")},
+			expectedLength: 0,
+			wantReplayable: false,
+		},
+		{
+			name:           "negative length is unknown",
+			body:           &closeWithoutEOFBody{payload: []byte("body")},
+			expectedLength: -1,
+			wantReplayable: false,
+		},
+		{
+			name:           "short body",
+			body:           &closeWithoutEOFBody{payload: []byte("short")},
+			expectedLength: int64(len("short-long")),
+			readToEOF:      true,
+			wantReplayable: false,
+		},
+		{
+			name:           "long body",
+			body:           &closeWithoutEOFBody{payload: []byte("short-long")},
+			expectedLength: int64(len("short")),
+			wantReplayable: false,
+		},
+		{
+			name:           "positive exact length",
+			body:           &closeWithoutEOFBody{payload: []byte("body")},
+			expectedLength: int64(len("body")),
+			wantReplayable: true,
+		},
+		{
+			name:           "positive exact length reaches eof",
+			body:           io.NopCloser(strings.NewReader("body")),
+			expectedLength: int64(len("body")),
+			readToEOF:      true,
+			wantReplayable: true,
+		},
+		{
+			name:           "unknown length reaches eof",
+			body:           io.NopCloser(strings.NewReader("body")),
+			expectedLength: -1,
+			readToEOF:      true,
+			wantReplayable: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := captureBodyForTest(t, tt.body, tt.expectedLength, tt.readToEOF)
+			if got := capture.Replayable(); got != tt.wantReplayable {
+				t.Fatalf("Replayable() = %v, want %v", got, tt.wantReplayable)
+			}
+		})
+	}
+}
+
+func TestReplayBodyCapture_CloseErrorIsNotReplayable(t *testing.T) {
+	capture := newReplayBodyCapture(&closeErrorBody{closeWithoutEOFBody{payload: []byte("body")}}, int64(len("body")))
+	buf := make([]byte, len("body"))
+	if n, err := capture.Read(buf); err != nil || n != len(buf) {
+		t.Fatalf("capture body read: n=%d err=%v", n, err)
+	}
+	if err := capture.Close(); err == nil {
+		t.Fatal("capture body close unexpectedly succeeded")
+	}
+	if capture.Replayable() {
+		t.Fatal("capture with close error is replayable")
+	}
+}
+
 func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
@@ -231,11 +355,13 @@ func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *te
 	if err != nil {
 		t.Fatalf("initial route: %v", err)
 	}
+	if initial.RetryBudget < 3 {
+		t.Fatalf("initial route retry budget: got %d, want at least 3 distinct candidates", initial.RetryBudget)
+	}
 	entry := initial.SelectedEntry()
 	if entry == nil {
 		t.Fatal("initial route did not expose selected entry")
 	}
-	initial.RetryBudget = 3
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -309,6 +435,111 @@ func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *te
 	}
 	if len(cooldowns) != 2 || !cooled[attemptIPs[0]] || !cooled[attemptIPs[1]] || cooled[attemptIPs[2]] {
 		t.Fatalf("platform cooldowns: got %v, attempts=%v ips=%v", cooled, attempts, attemptIPs)
+	}
+}
+
+func TestReverseRetryRoundTripper_RetriesBodyClosedAtContentLength(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "body-account", "https://example.com/body-timeout")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2 distinct candidates", initial.RetryBudget)
+	}
+	entry := initial.SelectedEntry()
+	if entry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	payload := []byte("request-body-with-known-length")
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	var readBodies [][]byte
+	var bodyMu sync.Mutex
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: entry},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+					t.Fatal("body retry attempt missing request trace")
+				}
+				trace.GotConn(httptrace.GotConnInfo{})
+				body := make([]byte, len(payload))
+				n, readErr := req.Body.Read(body)
+				if readErr != nil || n != len(payload) {
+					t.Fatalf("request body read: n=%d err=%v", n, readErr)
+				}
+				bodyMu.Lock()
+				readBodies = append(readBodies, append([]byte(nil), body...))
+				bodyMu.Unlock()
+				if closeErr := req.Body.Close(); closeErr != nil {
+					t.Fatalf("request body close: %v", closeErr)
+				}
+				trace.WroteRequest(httptrace.WroteRequestInfo{})
+				if attempts.Load() == 1 {
+					return nil, responseHeaderTimeoutError{}
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/body-timeout", &closeWithoutEOFBody{payload: payload})
+	req.ContentLength = int64(len(payload))
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("body retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("body retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want 2", got)
+	}
+	if attempted[0] == attempted[1] {
+		t.Fatalf("retry reused entry %s", attempted[0].Hex())
+	}
+	if len(readBodies) != 2 || string(readBodies[0]) != string(payload) || string(readBodies[1]) != string(payload) {
+		t.Fatalf("request bodies: got %q, want two complete copies", readBodies)
 	}
 }
 
