@@ -36,6 +36,8 @@ type PlatformResponse struct {
 	AllocationPolicy                 string                       `json:"allocation_policy"`
 	PassiveCircuitBreakerDisabled    bool                         `json:"passive_circuit_breaker_disabled"`
 	ProxyRequestTotalTimeout         string                       `json:"proxy_request_total_timeout"`
+	ProxyRequestAttemptTimeout       string                       `json:"proxy_request_attempt_timeout"`
+	ProxyRequestMaxAttempts          int                          `json:"proxy_request_max_attempts"`
 	UpdatedAt                        string                       `json:"updated_at"`
 }
 
@@ -57,6 +59,8 @@ func platformToResponse(p model.Platform) PlatformResponse {
 		AllocationPolicy:                 p.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    p.PassiveCircuitBreakerDisabled,
 		ProxyRequestTotalTimeout:         platformProxyRequestTotalTimeoutString(p.ProxyRequestTotalTimeoutNs),
+		ProxyRequestAttemptTimeout:       platformProxyRequestTotalTimeoutString(p.ProxyRequestAttemptTimeoutNs),
+		ProxyRequestMaxAttempts:          p.ProxyRequestMaxAttempts,
 		UpdatedAt:                        time.Unix(0, p.UpdatedAtNs).UTC().Format(time.RFC3339Nano),
 	}
 }
@@ -100,6 +104,8 @@ type platformConfig struct {
 	AllocationPolicy                 string
 	PassiveCircuitBreakerDisabled    bool
 	ProxyRequestTotalTimeoutNs       int64
+	ProxyRequestAttemptTimeoutNs     int64
+	ProxyRequestMaxAttempts          int
 }
 
 func normalizePlatformMissAction(raw string) string {
@@ -130,8 +136,10 @@ func (s *ControlPlaneService) defaultPlatformConfig(name string) platformConfig 
 		ReverseProxyFixedAccountHeader: normalizeHeaderFieldName(
 			s.EnvCfg.DefaultPlatformReverseProxyFixedAccountHeader,
 		),
-		AllocationPolicy:           s.EnvCfg.DefaultPlatformAllocationPolicy,
-		ProxyRequestTotalTimeoutNs: 0,
+		AllocationPolicy:             s.EnvCfg.DefaultPlatformAllocationPolicy,
+		ProxyRequestTotalTimeoutNs:   0,
+		ProxyRequestAttemptTimeoutNs: 0,
+		ProxyRequestMaxAttempts:      0,
 	}
 }
 
@@ -148,6 +156,8 @@ func platformConfigFromModel(mp model.Platform) platformConfig {
 		AllocationPolicy:                 mp.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    mp.PassiveCircuitBreakerDisabled,
 		ProxyRequestTotalTimeoutNs:       mp.ProxyRequestTotalTimeoutNs,
+		ProxyRequestAttemptTimeoutNs:     mp.ProxyRequestAttemptTimeoutNs,
+		ProxyRequestMaxAttempts:          mp.ProxyRequestMaxAttempts,
 	}
 }
 
@@ -166,6 +176,8 @@ func (cfg platformConfig) toModel(id string, updatedAtNs int64) model.Platform {
 		AllocationPolicy:                 cfg.AllocationPolicy,
 		PassiveCircuitBreakerDisabled:    cfg.PassiveCircuitBreakerDisabled,
 		ProxyRequestTotalTimeoutNs:       cfg.ProxyRequestTotalTimeoutNs,
+		ProxyRequestAttemptTimeoutNs:     cfg.ProxyRequestAttemptTimeoutNs,
+		ProxyRequestMaxAttempts:          cfg.ProxyRequestMaxAttempts,
 		UpdatedAtNs:                      updatedAtNs,
 	}
 }
@@ -188,6 +200,8 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 		cfg.PassiveCircuitBreakerDisabled,
 	)
 	plat.ProxyRequestTotalTimeoutNs = cfg.ProxyRequestTotalTimeoutNs
+	plat.ProxyRequestAttemptTimeoutNs = cfg.ProxyRequestAttemptTimeoutNs
+	plat.ProxyRequestMaxAttempts = cfg.ProxyRequestMaxAttempts
 	responseRules, err := platform.CompileResponseRules(id, cfg.ResponseRules)
 	if err != nil {
 		return nil, err
@@ -306,6 +320,25 @@ func setPlatformProxyRequestTotalTimeout(cfg *platformConfig, d time.Duration) *
 	return nil
 }
 
+func setPlatformProxyRequestAttemptTimeout(cfg *platformConfig, d time.Duration) *ServiceError {
+	if d < 0 {
+		return invalidArg("proxy_request_attempt_timeout: must be non-negative")
+	}
+	if err := platform.ValidateProxyRequestAttemptTimeoutNs(int64(d)); err != nil {
+		return invalidArg(err.Error())
+	}
+	cfg.ProxyRequestAttemptTimeoutNs = int64(d)
+	return nil
+}
+
+func setPlatformProxyRequestMaxAttempts(cfg *platformConfig, attempts int) *ServiceError {
+	if err := platform.ValidateProxyRequestMaxAttempts(attempts); err != nil {
+		return invalidArg(err.Error())
+	}
+	cfg.ProxyRequestMaxAttempts = attempts
+	return nil
+}
+
 func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *ServiceError {
 	if cfg == nil {
 		return invalidArg("platform config is required")
@@ -324,6 +357,12 @@ func validatePlatformConfig(cfg *platformConfig, validateRegionFilters bool) *Se
 		return err
 	}
 	if err := platform.ValidateProxyRequestTotalTimeoutNs(cfg.ProxyRequestTotalTimeoutNs); err != nil {
+		return invalidArg(err.Error())
+	}
+	if err := platform.ValidateProxyRequestAttemptTimeoutNs(cfg.ProxyRequestAttemptTimeoutNs); err != nil {
+		return invalidArg(err.Error())
+	}
+	if err := platform.ValidateProxyRequestMaxAttempts(cfg.ProxyRequestMaxAttempts); err != nil {
 		return invalidArg(err.Error())
 	}
 	if _, err := platform.CompileResponseRules("config", cfg.ResponseRules); err != nil {
@@ -570,6 +609,8 @@ type CreatePlatformRequest struct {
 	AllocationPolicy                 *string                      `json:"allocation_policy"`
 	PassiveCircuitBreakerDisabled    *bool                        `json:"passive_circuit_breaker_disabled"`
 	ProxyRequestTotalTimeout         *string                      `json:"proxy_request_total_timeout"`
+	ProxyRequestAttemptTimeout       *string                      `json:"proxy_request_attempt_timeout"`
+	ProxyRequestMaxAttempts          *int                         `json:"proxy_request_max_attempts"`
 	ResponseRules                    []model.PlatformResponseRule `json:"response_rules"`
 }
 
@@ -648,6 +689,20 @@ func (s *ControlPlaneService) CreatePlatformContext(ctx context.Context, req Cre
 			return nil, invalidArg("proxy_request_total_timeout: " + err.Error())
 		}
 		if err := setPlatformProxyRequestTotalTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
+	}
+	if req.ProxyRequestAttemptTimeout != nil {
+		d, err := time.ParseDuration(strings.TrimSpace(*req.ProxyRequestAttemptTimeout))
+		if err != nil {
+			return nil, invalidArg("proxy_request_attempt_timeout: " + err.Error())
+		}
+		if err := setPlatformProxyRequestAttemptTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
+	}
+	if req.ProxyRequestMaxAttempts != nil {
+		if err := setPlatformProxyRequestMaxAttempts(&cfg, *req.ProxyRequestMaxAttempts); err != nil {
 			return nil, err
 		}
 	}
@@ -807,6 +862,20 @@ func (s *ControlPlaneService) UpdatePlatformContext(ctx context.Context, id stri
 		return nil, err
 	} else if ok {
 		if err := setPlatformProxyRequestTotalTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
+	}
+	if d, ok, err := patch.optionalNonNegativeDurationString("proxy_request_attempt_timeout"); err != nil {
+		return nil, err
+	} else if ok {
+		if err := setPlatformProxyRequestAttemptTimeout(&cfg, d); err != nil {
+			return nil, err
+		}
+	}
+	if attempts, ok, err := patch.optionalInt("proxy_request_max_attempts"); err != nil {
+		return nil, err
+	} else if ok {
+		if err := setPlatformProxyRequestMaxAttempts(&cfg, attempts); err != nil {
 			return nil, err
 		}
 	}

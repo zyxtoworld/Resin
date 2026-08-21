@@ -157,6 +157,8 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 		t.Fatal("platform not found")
 	}
 	current.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	current.ProxyRequestAttemptTimeoutNs = int64(750 * time.Millisecond)
+	current.ProxyRequestMaxAttempts = 7
 	makeRoutableNode(t, pool, subMgr, `{"budget-generation":"1"}`, "1.2.3.6", "cloudflare.com", 50*time.Millisecond)
 	makeRoutableNode(t, pool, subMgr, `{"budget-generation":"2"}`, "1.2.3.7", "cloudflare.com", 50*time.Millisecond)
 	router := makeRouter(pool, nil)
@@ -168,6 +170,9 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	if oldRoute.RequestTotalTimeout != 2*time.Second {
 		t.Fatalf("old route budget = %s, want 2s", oldRoute.RequestTotalTimeout)
 	}
+	if oldRoute.RequestAttemptTimeout != 750*time.Millisecond || oldRoute.MaxAttempts != 7 {
+		t.Fatalf("old route attempt controls = timeout %s max %d, want 750ms/7", oldRoute.RequestAttemptTimeout, oldRoute.MaxAttempts)
+	}
 	if oldRoute.RetryBudget < 2 {
 		t.Fatalf("old route retry budget = %d, want at least 2 routable candidates", oldRoute.RetryBudget)
 	}
@@ -175,6 +180,8 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	replacement := platform.NewPlatform(platID, platName, nil, nil)
 	replacement.StickyTTLNs = current.StickyTTLNs
 	replacement.ProxyRequestTotalTimeoutNs = int64(5 * time.Second)
+	replacement.ProxyRequestAttemptTimeoutNs = int64(1500 * time.Millisecond)
+	replacement.ProxyRequestMaxAttempts = 11
 	if err := pool.ReplacePlatform(replacement); err != nil {
 		t.Fatalf("ReplacePlatform: %v", err)
 	}
@@ -184,6 +191,9 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	}
 	if newRoute.RequestTotalTimeout != 5*time.Second {
 		t.Fatalf("new route budget = %s, want 5s", newRoute.RequestTotalTimeout)
+	}
+	if newRoute.RequestAttemptTimeout != 1500*time.Millisecond || newRoute.MaxAttempts != 11 {
+		t.Fatalf("new route attempt controls = timeout %s max %d, want 1.5s/11", newRoute.RequestAttemptTimeout, newRoute.MaxAttempts)
 	}
 	if newRoute.RetryBudget < 2 {
 		t.Fatalf("new route retry budget = %d, want at least 2 routable candidates", newRoute.RetryBudget)
@@ -204,6 +214,9 @@ func TestRouteResultCapturesPlatformRetryBudgetByGeneration(t *testing.T) {
 	}
 	if recreatedRoute.RequestTotalTimeout != 0 {
 		t.Fatalf("recreated platform inherited retry budget: %s", recreatedRoute.RequestTotalTimeout)
+	}
+	if recreatedRoute.RequestAttemptTimeout != 0 || recreatedRoute.MaxAttempts != 0 {
+		t.Fatalf("recreated platform inherited attempt controls: timeout %s max %d", recreatedRoute.RequestAttemptTimeout, recreatedRoute.MaxAttempts)
 	}
 }
 

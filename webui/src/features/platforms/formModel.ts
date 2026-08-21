@@ -33,6 +33,8 @@ export const platformFormSchema = z.object({
     }),
   sticky_ttl: z.string().optional(),
   proxy_request_total_timeout: z.string().optional(),
+  proxy_request_attempt_timeout: z.string().optional(),
+  proxy_request_max_attempts: z.number().int().min(0).optional(),
   regex_filters_text: z.string().optional(),
   region_filters_text: z.string().optional(),
   response_rules_text: z.string(),
@@ -65,6 +67,8 @@ export const defaultPlatformFormValues: PlatformFormValues = {
   name: "",
   sticky_ttl: "",
   proxy_request_total_timeout: "",
+  proxy_request_attempt_timeout: "",
+  proxy_request_max_attempts: 0,
   regex_filters_text: "",
   region_filters_text: "",
   response_rules_text: "",
@@ -83,6 +87,8 @@ export function platformToFormValues(platform: Platform): PlatformFormValues {
     name: platform.name,
     sticky_ttl: platform.sticky_ttl,
     proxy_request_total_timeout: platform.proxy_request_total_timeout ?? "",
+    proxy_request_attempt_timeout: platform.proxy_request_attempt_timeout ?? "",
+    proxy_request_max_attempts: platform.proxy_request_max_attempts ?? 0,
     regex_filters_text: regexFilters.join("\n"),
     region_filters_text: regionFilters.join("\n"),
     response_rules_text: JSON.stringify(platform.response_rules ?? [], null, 2),
@@ -99,6 +105,8 @@ function toPlatformPayloadBase(values: PlatformFormValues) {
   return {
     name: values.name.trim(),
     proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() ?? "",
+    proxy_request_attempt_timeout: values.proxy_request_attempt_timeout?.trim() ?? "",
+    proxy_request_max_attempts: values.proxy_request_max_attempts ?? 0,
     regex_filters: parseLinesToList(values.regex_filters_text),
     region_filters: parseLinesToList(values.region_filters_text, (value) => value.toLowerCase()),
     response_rules: responseRules,
@@ -115,6 +123,8 @@ export function toPlatformCreateInput(values: PlatformFormValues): PlatformCreat
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || undefined,
     proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() || undefined,
+    proxy_request_attempt_timeout: values.proxy_request_attempt_timeout?.trim() || undefined,
+    proxy_request_max_attempts: values.proxy_request_max_attempts || undefined,
   };
 }
 
@@ -123,5 +133,7 @@ export function toPlatformUpdateInput(values: PlatformFormValues): PlatformUpdat
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || "",
     proxy_request_total_timeout: values.proxy_request_total_timeout?.trim() || "",
+    proxy_request_attempt_timeout: values.proxy_request_attempt_timeout?.trim() || "",
+    proxy_request_max_attempts: values.proxy_request_max_attempts ?? 0,
   };
 }

@@ -3394,3 +3394,249 @@ func TestForwardProxy_CONNECTHalfTrafficNotMarkedZeroTraffic(t *testing.T) {
 	}
 	t.Fatal("expected RecordResult call for CONNECT half-traffic failure")
 }
+
+func TestForwardProxy_RetriesPastTenDistinct429NodesAndKeepsSuccessSticky(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "fixed_duration", FixedDuration: "1m"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(5 * time.Second)
+	plat.ProxyRequestMaxAttempts = 0
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) <= 10 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	upstreamAddr := upstream.Listener.Addr().String()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstreamAddr)
+	for i := 0; i < 10; i++ {
+		setupResponseRetryNode(t, env,
+			fmt.Sprintf(`{"type":"stub","server":"127.0.1.%d","server_port":%d}`, i+1, i+2),
+			fmt.Sprintf("203.0.113.%d", i+11), upstreamAddr)
+	}
+
+	routes := make([]netip.Addr, 0, 12)
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok", Router: env.router, Pool: env.pool,
+		onRoute: func(route routing.RouteResult, _ *node.NodeEntry) { routes = append(routes, route.EgressIP) },
+	})
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/api", nil)
+		req.Header.Set("Proxy-Authorization", basicAuth("plat.eleven-account", "tok"))
+		return req
+	}
+	first := httptest.NewRecorder()
+	fp.ServeHTTP(first, newRequest())
+	if first.Code != http.StatusOK {
+		t.Fatalf("first forward status: got %d body=%s", first.Code, first.Body.String())
+	}
+	if got := requests.Load(); got != 11 {
+		t.Fatalf("upstream attempts: got %d, want 11", got)
+	}
+	if len(routes) != 11 {
+		t.Fatalf("forward route observations: got %d, want 11", len(routes))
+	}
+	seen := make(map[netip.Addr]struct{}, len(routes))
+	for _, ip := range routes {
+		if _, exists := seen[ip]; exists {
+			t.Fatalf("forward reused egress IP %s: %v", ip, routes)
+		}
+		seen[ip] = struct{}{}
+	}
+	if len(seen) != 11 {
+		t.Fatalf("forward distinct egress IPs: got %d, want 11", len(seen))
+	}
+
+	second := httptest.NewRecorder()
+	fp.ServeHTTP(second, newRequest())
+	if second.Code != http.StatusOK {
+		t.Fatalf("sticky forward status: got %d body=%s", second.Code, second.Body.String())
+	}
+	if len(routes) != 12 || routes[len(routes)-1] != routes[10] {
+		t.Fatalf("successful forward egress was not sticky: routes=%v", routes)
+	}
+}
+
+func TestForwardProxy_ExplicitAttemptTimeoutAdvances(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	plat.ProxyRequestAttemptTimeoutNs = int64(25 * time.Millisecond)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if requests.Add(1) == 1 {
+			<-req.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	secondHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.2","server_port":2}`))
+	secondEntry, ok := env.pool.GetEntry(secondHash)
+	if !ok {
+		t.Fatal("second node not found")
+	}
+	setProxyE2EEntryDialTarget(t, secondEntry, upstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/attempt-timeout", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.attempt-timeout", "tok"))
+	w := httptest.NewRecorder()
+	started := time.Now()
+	fp.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("forward attempt timeout status: got %d body=%s", w.Code, w.Body.String())
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("forward attempt timeout requests: got %d, want 2", requests.Load())
+	}
+	if elapsed := time.Since(started); elapsed < 15*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("forward attempt timeout elapsed=%s, want explicit bounded retry", elapsed)
+	}
+}
+
+func TestForwardProxy_ExplicitMaxAttemptsStopsExactly(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	plat.ProxyRequestMaxAttempts = 2
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limited"))
+	}))
+	defer upstream.Close()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", upstream.Listener.Addr().String())
+
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/max-attempts", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.max-attempts", "tok"))
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("forward max attempts status: got %d, want 429", w.Code)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("forward max attempts upstream requests: got %d, want 2", requests.Load())
+	}
+}
+
+func TestForwardProxy_1444CandidatesDoNotDivideFirstAttemptBudget(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(8 * time.Second)
+	plat.ProxyRequestAttemptTimeoutNs = 0
+	plat.ProxyRequestMaxAttempts = 0
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		timer := time.NewTimer(75 * time.Millisecond)
+		defer timer.Stop()
+		<-timer.C
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	for i := 0; i < 1443; i++ {
+		raw := json.RawMessage(fmt.Sprintf(`{"type":"stub","server":"node-%d","server_port":%d}`, i+1, i+2))
+		hash := node.HashFromRawOptions(raw)
+		env.sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+		env.pool.AddNodeFromSub(hash, raw, env.sub.ID)
+		entry, ok := env.pool.GetEntry(hash)
+		if !ok {
+			t.Fatalf("large candidate node %d not found", i)
+		}
+		entry.SetEgressIP(netip.MustParseAddr(fmt.Sprintf("198.18.%d.%d", (i+1)/256, (i+1)%256)))
+		entry.LatencyTable.Update("example.com", 20*time.Millisecond, 10*time.Minute)
+		setProxyE2EEntryDialTarget(t, entry, upstream.Listener.Addr().String())
+		env.pool.RecordResult(hash, true)
+		env.pool.NotifyNodeDirty(hash)
+	}
+	if got := plat.View().Size(); got < 1444 {
+		t.Fatalf("large platform view size: got %d, want at least 1444", got)
+	}
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok", Router: env.router, Pool: env.pool,
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/large-candidates", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.large-candidates", "tok"))
+	w := httptest.NewRecorder()
+	fp.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("large candidate forward status: got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("large candidate first attempt requests: got %d, want exactly 1", got)
+	}
+}

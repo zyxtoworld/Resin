@@ -440,7 +440,7 @@ func TestReverseRetryRoundTripper_TransportFailureRuleRetriesDistinctNodes(t *te
 	}
 }
 
-func TestReverseRetryRoundTripperLargeCandidateBudgetUsesBoundedAttempts(t *testing.T) {
+func TestReverseRetryRoundTripperLargeCandidateBudgetDoesNotDivideFirstAttempt(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
 	if !ok {
@@ -517,6 +517,218 @@ func TestReverseRetryRoundTripperLargeCandidateBudgetUsesBoundedAttempts(t *test
 	}
 	if firstAttemptBudget < time.Second {
 		t.Fatalf("first attempt budget = %s, candidate count must not create a millisecond deadline", firstAttemptBudget)
+	}
+}
+
+func TestReverseRetryRoundTripper_RetriesPastTenDistinct429NodesAndPromotesSticky(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{
+			Type: "cooldown_then_retry_next", CooldownScope: "egress_ip",
+			Fallback: "fixed_duration", FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(5 * time.Second)
+	plat.ProxyRequestMaxAttempts = 0
+	for i := 0; i < 10; i++ {
+		setupResponseRetryNode(t, env,
+			fmt.Sprintf(`{"type":"stub","server":"127.0.1.%d","server_port":%d}`, i+1, i+2),
+			fmt.Sprintf("203.0.113.%d", i+11), "127.0.0.1:1")
+	}
+	initial, err := env.router.RouteRequest("plat", "eleven-node-account", "https://example.com/eleven")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 11 {
+		t.Fatalf("initial retry budget: got %d, want at least 11", initial.RetryBudget)
+	}
+
+	var attempts atomic.Int32
+	attemptedIPs := make([]netip.Addr, 0, 11)
+	var lastRoute routing.RouteResult
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		onRoute: func(route routing.RouteResult, _ *node.NodeEntry) { lastRoute = route },
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			trace := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), trace.clientTrace())), trace
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attemptedIPs = append(attemptedIPs, candidate.Route.EgressIP)
+				attempt := attempts.Add(1)
+				if attempt <= 10 {
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader("rate limited")),
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/eleven", nil))
+	if err != nil {
+		t.Fatalf("eleven-node retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("eleven-node response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 11 {
+		t.Fatalf("attempt count: got %d, want 11", got)
+	}
+	seen := make(map[netip.Addr]struct{}, len(attemptedIPs))
+	for _, ip := range attemptedIPs {
+		if _, exists := seen[ip]; exists {
+			t.Fatalf("retry reused egress IP %s: %v", ip, attemptedIPs)
+		}
+		seen[ip] = struct{}{}
+	}
+	if len(seen) != 11 {
+		t.Fatalf("distinct egress IPs: got %d, want 11", len(seen))
+	}
+	if lastRoute.EgressIP != attemptedIPs[len(attemptedIPs)-1] {
+		t.Fatalf("last route IP = %s, final attempt IP = %s", lastRoute.EgressIP, attemptedIPs[len(attemptedIPs)-1])
+	}
+	if !env.router.CommitRouteForAccount(lastRoute, "eleven-node-account") {
+		t.Fatal("final successful route was not committed as sticky")
+	}
+	sticky, err := env.router.RouteRequest("plat", "eleven-node-account", "https://example.com/eleven")
+	if err != nil {
+		t.Fatalf("sticky route: %v", err)
+	}
+	if sticky.EgressIP != lastRoute.EgressIP {
+		t.Fatalf("sticky egress IP = %s, want %s", sticky.EgressIP, lastRoute.EgressIP)
+	}
+}
+
+func TestReverseRetryRoundTripper_ExplicitAttemptTimeoutAdvances(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	plat.ProxyRequestAttemptTimeoutNs = int64(25 * time.Millisecond)
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "attempt-timeout", "https://example.com/attempt-timeout")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	var attempts atomic.Int32
+	var firstElapsed time.Duration
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				started := time.Now()
+				if attempt == 1 {
+					trace := httptrace.ContextClientTrace(req.Context())
+					if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+						t.Fatal("attempt missing request trace")
+					}
+					trace.GotConn(httptrace.GotConnInfo{})
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+					<-req.Context().Done()
+					firstElapsed = time.Since(started)
+					return nil, responseHeaderTimeoutError{}
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+			})
+		},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			trace := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), trace.clientTrace())), trace
+		},
+	}
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/attempt-timeout", nil))
+	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("attempt timeout retry: resp=%#v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+	if attempts.Load() != 2 {
+		t.Fatalf("attempt count: got %d, want 2", attempts.Load())
+	}
+	if firstElapsed < 15*time.Millisecond || firstElapsed > 250*time.Millisecond {
+		t.Fatalf("first attempt duration = %s, want explicit per-attempt timeout", firstElapsed)
+	}
+}
+
+func TestReverseRetryRoundTripper_ExplicitMaxAttemptsStopsExactly(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	plat.ProxyRequestMaxAttempts = 2
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.3","server_port":3}`, "203.0.113.12", "127.0.0.1:1")
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retry-429", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	initial, err := env.router.RouteRequest("plat", "max-attempts", "https://example.com/max-attempts")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router: env.router, pool: env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("retry")), Request: req}, nil
+			})
+		},
+	}
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/max-attempts", nil))
+	if err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("max attempts result: resp=%#v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want exactly 2", got)
 	}
 }
 

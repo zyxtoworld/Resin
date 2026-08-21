@@ -728,11 +728,39 @@ export function PlatformDetailPage() {
                       {...editForm.register("proxy_request_total_timeout")}
                     />
                     <p className="field-hint">
-                      {t("只用于响应开始前的重试；每次尝试按剩余槽位切片，并受全局上限约束。响应开始后不会换节点。")}
+                      {t("只用于响应开始前的重试；总预算不会按节点数切碎，并受全局上限约束。响应开始后不会换节点。")}
                     </p>
                     {editForm.formState.errors.proxy_request_total_timeout ? (
                       <p className="field-error">{editForm.formState.errors.proxy_request_total_timeout.message}</p>
                     ) : null}
+                  </div>
+
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="detail-edit-proxy-request-attempt-timeout">
+                      {t("单次尝试超时（可选）")}
+                    </label>
+                    <Input
+                      id="detail-edit-proxy-request-attempt-timeout"
+                      placeholder={t("例如 2s；留空使用总预算")}
+                      invalid={Boolean(editForm.formState.errors.proxy_request_attempt_timeout)}
+                      {...editForm.register("proxy_request_attempt_timeout")}
+                    />
+                    <p className="field-hint">{t("每个节点的连接/响应前尝试最多等待此时长；不填则由平台总预算控制。")}</p>
+                  </div>
+
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="detail-edit-proxy-request-max-attempts">
+                      {t("最大尝试次数（可选）")}
+                    </label>
+                    <Input
+                      id="detail-edit-proxy-request-max-attempts"
+                      type="number"
+                      min={0}
+                      step={1}
+                      invalid={Boolean(editForm.formState.errors.proxy_request_max_attempts)}
+                      {...editForm.register("proxy_request_max_attempts", { setValueAs: (value) => value === "" ? undefined : Number(value) })}
+                    />
+                    <p className="field-hint">{t("0 表示在总预算和候选节点范围内继续尝试；设置后严格按该次数限制。")}</p>
                   </div>
 
                   <div className="field-group">

@@ -492,7 +492,9 @@ func TestCreatePlatform_BuildsRoutableViewBeforePublish(t *testing.T) {
 
 	name := "new-platform"
 	totalTimeout := "45s"
-	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name, ProxyRequestTotalTimeout: &totalTimeout})
+	attemptTimeout := "2s"
+	maxAttempts := 11
+	created, err := cp.CreatePlatform(CreatePlatformRequest{Name: &name, ProxyRequestTotalTimeout: &totalTimeout, ProxyRequestAttemptTimeout: &attemptTimeout, ProxyRequestMaxAttempts: &maxAttempts})
 	if err != nil {
 		t.Fatalf("CreatePlatform: %v", err)
 	}
@@ -516,8 +518,14 @@ func TestCreatePlatform_BuildsRoutableViewBeforePublish(t *testing.T) {
 	if created.ProxyRequestTotalTimeout != totalTimeout {
 		t.Fatalf("created platform proxy request total timeout = %q, want %q", created.ProxyRequestTotalTimeout, totalTimeout)
 	}
+	if created.ProxyRequestAttemptTimeout != attemptTimeout || created.ProxyRequestMaxAttempts != maxAttempts {
+		t.Fatalf("created platform attempt controls = timeout %q max %d, want %q/%d", created.ProxyRequestAttemptTimeout, created.ProxyRequestMaxAttempts, attemptTimeout, maxAttempts)
+	}
 	if plat.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
 		t.Fatalf("runtime platform proxy request total timeout = %d, want %d", plat.ProxyRequestTotalTimeoutNs, 45*time.Second)
+	}
+	if plat.ProxyRequestAttemptTimeoutNs != int64(2*time.Second) || plat.ProxyRequestMaxAttempts != maxAttempts {
+		t.Fatalf("runtime platform attempt controls = timeout %d max %d", plat.ProxyRequestAttemptTimeoutNs, plat.ProxyRequestMaxAttempts)
 	}
 	persisted, err := engine.GetPlatform(created.ID)
 	if err != nil {
@@ -526,17 +534,26 @@ func TestCreatePlatform_BuildsRoutableViewBeforePublish(t *testing.T) {
 	if persisted.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
 		t.Fatalf("persisted platform proxy request total timeout = %d, want %d", persisted.ProxyRequestTotalTimeoutNs, 45*time.Second)
 	}
+	if persisted.ProxyRequestAttemptTimeoutNs != int64(2*time.Second) || persisted.ProxyRequestMaxAttempts != maxAttempts {
+		t.Fatalf("persisted platform attempt controls = timeout %d max %d", persisted.ProxyRequestAttemptTimeoutNs, persisted.ProxyRequestMaxAttempts)
+	}
 
-	updated, err := cp.UpdatePlatform(created.ID, []byte(`{"proxy_request_total_timeout":"90s"}`))
+	updated, err := cp.UpdatePlatform(created.ID, []byte(`{"proxy_request_total_timeout":"90s","proxy_request_attempt_timeout":"3s","proxy_request_max_attempts":12}`))
 	if err != nil {
 		t.Fatalf("UpdatePlatform proxy request total timeout: %v", err)
 	}
 	if updated.ProxyRequestTotalTimeout != "1m30s" {
 		t.Fatalf("updated platform proxy request total timeout = %q, want 1m30s", updated.ProxyRequestTotalTimeout)
 	}
+	if updated.ProxyRequestAttemptTimeout != "3s" || updated.ProxyRequestMaxAttempts != 12 {
+		t.Fatalf("updated platform attempt controls = timeout %q max %d", updated.ProxyRequestAttemptTimeout, updated.ProxyRequestMaxAttempts)
+	}
 	updatedRuntime, ok := pool.GetPlatform(created.ID)
 	if !ok || updatedRuntime.ProxyRequestTotalTimeoutNs != int64(90*time.Second) {
 		t.Fatalf("updated runtime platform proxy request total timeout = %v, want 90s", updatedRuntime)
+	}
+	if updatedRuntime.ProxyRequestAttemptTimeoutNs != int64(3*time.Second) || updatedRuntime.ProxyRequestMaxAttempts != 12 {
+		t.Fatalf("updated runtime attempt controls = timeout %d max %d", updatedRuntime.ProxyRequestAttemptTimeoutNs, updatedRuntime.ProxyRequestMaxAttempts)
 	}
 
 }

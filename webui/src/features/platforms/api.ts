@@ -37,6 +37,12 @@ function normalizePlatform(raw: ApiPlatform): Platform {
     ...raw,
     proxy_request_total_timeout:
       typeof raw.proxy_request_total_timeout === "string" ? raw.proxy_request_total_timeout : "",
+    proxy_request_attempt_timeout:
+      typeof raw.proxy_request_attempt_timeout === "string" ? raw.proxy_request_attempt_timeout : "",
+    proxy_request_max_attempts:
+      typeof raw.proxy_request_max_attempts === "number" && Number.isInteger(raw.proxy_request_max_attempts) && raw.proxy_request_max_attempts >= 0
+        ? raw.proxy_request_max_attempts
+        : 0,
     reverse_proxy_miss_action: parseMissAction(raw.reverse_proxy_miss_action),
     regex_filters: Array.isArray(raw.regex_filters) ? raw.regex_filters : [],
     region_filters: Array.isArray(raw.region_filters) ? raw.region_filters : [],

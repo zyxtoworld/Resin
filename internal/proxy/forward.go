@@ -33,9 +33,12 @@ type ForwardProxyConfig struct {
 	// onRequestBudgetCreated is a package-private test seam for proving that
 	// early handler exits release the platform budget immediately.
 	onRequestBudgetCreated func(context.Context)
-	OutboundTransport      OutboundTransportConfig
-	TransportPool          *OutboundTransportPool
-	ProxyBypassRules       []string
+	// onRoute is a package-private observation seam used by handler tests to
+	// assert candidate identity without changing routing behavior.
+	onRoute           func(routing.RouteResult, *node.NodeEntry)
+	OutboundTransport OutboundTransportConfig
+	TransportPool     *OutboundTransportPool
+	ProxyBypassRules  []string
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
@@ -49,6 +52,7 @@ type ForwardProxy struct {
 	metricsSink            MetricsEventSink
 	requestTotalTimeout    time.Duration
 	onRequestBudgetCreated func(context.Context)
+	onRoute                func(routing.RouteResult, *node.NodeEntry)
 	transportConfig        OutboundTransportConfig
 	transportPool          *OutboundTransportPool
 	transportPoolOnce      sync.Once
@@ -77,6 +81,7 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		metricsSink:            cfg.MetricsSink,
 		requestTotalTimeout:    cfg.RequestTotalTimeout,
 		onRequestBudgetCreated: cfg.onRequestBudgetCreated,
+		onRoute:                cfg.onRoute,
 		transportConfig:        transportCfg,
 		transportPool:          transportPool,
 		bypass:                 NewTargetBypassMatcher(cfg.ProxyBypassRules),
@@ -582,8 +587,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if attempt == 0 {
-				retryBudget = routed.Route.RetryBudget
-				retryBudget = proxyAttemptLimit(retryBudget)
+				retryBudget = routeAttemptLimit(routed.Route)
 				budget, enabled := effectiveProxyRequestBudget(routed.Route.RequestTotalTimeout, p.requestTotalTimeout)
 				budgetEnabled = enabled
 				if enabled {
@@ -604,6 +608,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			route = routed.Route
 			routeEntry = routed.Entry
 			hasRoute = true
+			if p.onRoute != nil {
+				p.onRoute(route, routeEntry)
+			}
 			lifecycle.setRouteResult(route)
 			if p.health != nil {
 				recordLatencyAsync(p.health, route.NodeHash, routeEntry, netutil.ExtractDomain(r.Host), nil)
@@ -615,7 +622,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		releaseAttempt := func() {}
 		bounded := false
 		if budgetEnabled {
-			attemptCtx, cancelAttempt, releaseAttempt, bounded = attemptContextForRequest(requestCtx, attempt, retryBudget)
+			attemptCtx, cancelAttempt, releaseAttempt, bounded = attemptContextForRequest(
+				requestCtx, attempt, retryBudget, routed.Route.RequestAttemptTimeout,
+			)
 		}
 		if bounded && attemptCtx == nil {
 			if err := r.Context().Err(); err != nil {

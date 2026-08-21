@@ -50,7 +50,13 @@ type Platform struct {
 	// ProxyRequestTotalTimeoutNs is copied into each route generation. Zero is
 	// deliberate fail-closed: a global cap never enables platform retries.
 	ProxyRequestTotalTimeoutNs int64
-	ResponseRules              ResponseRules
+	// ProxyRequestAttemptTimeoutNs optionally bounds one pre-response attempt.
+	// Zero means that attempt uses the remaining total deadline.
+	ProxyRequestAttemptTimeoutNs int64
+	// ProxyRequestMaxAttempts is an explicit platform limit. Zero means all
+	// candidates captured by the immutable route generation may be tried.
+	ProxyRequestMaxAttempts int
+	ResponseRules           ResponseRules
 
 	// Routable view & its publication lock.
 	// viewMu serializes publishers while allowing concurrent identity reads.

@@ -506,6 +506,8 @@ var platformPatchAllowedFields = map[string]bool{
 	"allocation_policy":                    true,
 	"passive_circuit_breaker_disabled":     true,
 	"proxy_request_total_timeout":          true,
+	"proxy_request_attempt_timeout":        true,
+	"proxy_request_max_attempts":           true,
 	"response_rules":                       true,
 }
 

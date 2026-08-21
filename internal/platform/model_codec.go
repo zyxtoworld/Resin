@@ -24,6 +24,23 @@ func ValidateProxyRequestTotalTimeoutNs(ns int64) error {
 	return nil
 }
 
+func ValidateProxyRequestAttemptTimeoutNs(ns int64) error {
+	if ns < 0 {
+		return fmt.Errorf("proxy_request_attempt_timeout_ns: must be non-negative")
+	}
+	if ns > int64(MaxProxyRequestTotalTimeout) {
+		return fmt.Errorf("proxy_request_attempt_timeout_ns: must not exceed %s", MaxProxyRequestTotalTimeout)
+	}
+	return nil
+}
+
+func ValidateProxyRequestMaxAttempts(attempts int) error {
+	if attempts < 0 {
+		return fmt.Errorf("proxy_request_max_attempts: must be non-negative")
+	}
+	return nil
+}
+
 func isLowerAlpha2(s string) bool {
 	if len(s) != 2 {
 		return false
@@ -117,6 +134,12 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 	if err := ValidateProxyRequestTotalTimeoutNs(mp.ProxyRequestTotalTimeoutNs); err != nil {
 		return nil, fmt.Errorf("decode platform %s: %w", mp.ID, err)
 	}
+	if err := ValidateProxyRequestAttemptTimeoutNs(mp.ProxyRequestAttemptTimeoutNs); err != nil {
+		return nil, fmt.Errorf("decode platform %s: %w", mp.ID, err)
+	}
+	if err := ValidateProxyRequestMaxAttempts(mp.ProxyRequestMaxAttempts); err != nil {
+		return nil, fmt.Errorf("decode platform %s: %w", mp.ID, err)
+	}
 	regexFilters, err := CompileModelRegexFilters(mp.ID, mp.RegexFilters)
 	if err != nil {
 		return nil, err
@@ -166,6 +189,8 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		mp.PassiveCircuitBreakerDisabled,
 	)
 	plat.ProxyRequestTotalTimeoutNs = mp.ProxyRequestTotalTimeoutNs
+	plat.ProxyRequestAttemptTimeoutNs = mp.ProxyRequestAttemptTimeoutNs
+	plat.ProxyRequestMaxAttempts = mp.ProxyRequestMaxAttempts
 	responseRules, err := CompileResponseRules(mp.ID, mp.ResponseRules)
 	if err != nil {
 		return nil, err

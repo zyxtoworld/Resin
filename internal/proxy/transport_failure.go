@@ -12,27 +12,15 @@ import (
 	"github.com/Resinat/Resin/internal/routing"
 )
 
-const (
-	// maxProxyAttempts bounds work per request. A platform view may contain
-	// thousands of candidates, but that is not a reason to create thousands of
-	// tiny deadline slices or to retry until the caller's deadline is exhausted.
-	maxProxyAttempts = 3
-
-	// attemptBudgetReservationSlots reserves time for the current attempt and
-	// one next-node attempt. Further attempts are still possible when earlier
-	// attempts finish early, but candidate cardinality never shrinks the first
-	// attempt to milliseconds.
-	attemptBudgetReservationSlots = 2
-)
-
-func proxyAttemptLimit(candidateBudget int) int {
-	if candidateBudget < 1 {
-		return 1
+func routeAttemptLimit(route routing.RouteResult) int {
+	limit := route.RetryBudget
+	if limit < 1 {
+		limit = 1
 	}
-	if candidateBudget > maxProxyAttempts {
-		return maxProxyAttempts
+	if route.MaxAttempts > 0 && route.MaxAttempts < limit {
+		limit = route.MaxAttempts
 	}
-	return candidateBudget
+	return limit
 }
 
 // classifyTransportFailure returns a stable policy input. It deliberately
@@ -208,11 +196,11 @@ func (c *stoppableDeadlineContext) release() {
 	}
 }
 
-// attemptContextForRequest reserves the remaining request deadline across the
-// attempts still available in this immutable retry snapshot. The caller must
-// pass the context returned by withProxyRequestBudgetController so a configured budget
-// is created once, not reset for every retry.
-func attemptContextForRequest(parent context.Context, attempt, total int) (context.Context, context.CancelFunc, func(), bool) {
+// attemptContextForRequest applies the optional per-attempt deadline to the
+// one immutable total-budget context. It never divides the total deadline by
+// candidate count: fast failures may advance through all eligible candidates,
+// while a slow attempt consumes at most its explicit cap or the total budget.
+func attemptContextForRequest(parent context.Context, attempt, total int, attemptTimeout time.Duration) (context.Context, context.CancelFunc, func(), bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -220,20 +208,20 @@ func attemptContextForRequest(parent context.Context, attempt, total int) (conte
 	if !ok {
 		return parent, nil, func() {}, false
 	}
-	remainingSlots := total - attempt
-	if remainingSlots < 1 {
+	if total > 0 && attempt >= total {
 		return nil, nil, func() {}, true
 	}
-	if remainingSlots > attemptBudgetReservationSlots {
-		remainingSlots = attemptBudgetReservationSlots
-	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
+	if time.Until(deadline) <= 0 {
 		return nil, nil, func() {}, true
 	}
-	perAttempt := remaining / time.Duration(remainingSlots)
-	if perAttempt <= 0 {
-		return nil, nil, func() {}, true
+	if attemptTimeout <= 0 {
+		// Keep a non-nil cancel function so accepted response bodies can own
+		// the request-budget lifetime until Close/EOF.
+		return parent, func() {}, func() {}, true
+	}
+	perAttempt := attemptTimeout
+	if remaining := time.Until(deadline); perAttempt > remaining {
+		perAttempt = remaining
 	}
 	ctx, cancel, release := newStoppableDeadlineContext(parent, perAttempt)
 	return ctx, cancel, release, true

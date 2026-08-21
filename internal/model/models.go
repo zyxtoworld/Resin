@@ -23,7 +23,13 @@ type Platform struct {
 	// ProxyRequestTotalTimeoutNs is the platform-owned pre-response retry
 	// budget. Zero means retry-next is disabled for this platform.
 	ProxyRequestTotalTimeoutNs int64 `json:"proxy_request_total_timeout_ns"`
-	UpdatedAtNs                int64 `json:"updated_at_ns"`
+	// ProxyRequestAttemptTimeoutNs optionally bounds one pre-response attempt.
+	// Zero means an attempt uses the remaining platform deadline.
+	ProxyRequestAttemptTimeoutNs int64 `json:"proxy_request_attempt_timeout_ns"`
+	// ProxyRequestMaxAttempts is an explicit platform limit. Zero means the
+	// immutable candidate snapshot and total deadline are the only limits.
+	ProxyRequestMaxAttempts int   `json:"proxy_request_max_attempts"`
+	UpdatedAtNs             int64 `json:"updated_at_ns"`
 }
 
 // PlatformResponseRule describes one ordered, first-match response policy.

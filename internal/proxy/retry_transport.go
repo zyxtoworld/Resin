@@ -104,7 +104,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		}
 		return resp, nil
 	}
-	budget := proxyAttemptLimit(t.initial.Route.RetryBudget)
+	budget := routeAttemptLimit(t.initial.Route)
 	attemptedEntries := map[*node.NodeEntry]struct{}{t.initial.Entry: {}}
 	attemptedIPs := map[netip.Addr]struct{}{t.initial.Route.EgressIP: {}}
 	current := t.initial
@@ -141,7 +141,9 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		releaseAttempt := func() {}
 		bounded := false
 		if budgetEnabled {
-			attemptCtx, cancelAttempt, releaseAttempt, bounded = attemptContextForRequest(requestCtx, attempt, budget)
+			attemptCtx, cancelAttempt, releaseAttempt, bounded = attemptContextForRequest(
+				requestCtx, attempt, budget, current.Route.RequestAttemptTimeout,
+			)
 		}
 		if bounded && attemptCtx == nil {
 			t.promotable = false

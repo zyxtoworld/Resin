@@ -457,6 +457,12 @@ func TestMigrateStateDB_UpgradesLegacyPlatformsColumns(t *testing.T) {
 	if ok, err := hasTableColumn(db, "platforms", "passive_circuit_breaker_disabled"); err != nil || !ok {
 		t.Fatalf("expected migrated column passive_circuit_breaker_disabled, ok=%v err=%v", ok, err)
 	}
+	if ok, err := hasTableColumn(db, "platforms", "proxy_request_attempt_timeout_ns"); err != nil || !ok {
+		t.Fatalf("expected migrated column proxy_request_attempt_timeout_ns, ok=%v err=%v", ok, err)
+	}
+	if ok, err := hasTableColumn(db, "platforms", "proxy_request_max_attempts"); err != nil || !ok {
+		t.Fatalf("expected migrated column proxy_request_max_attempts, ok=%v err=%v", ok, err)
+	}
 	if ok, err := hasTableColumn(db, "endpoints", "enabled"); err != nil || !ok {
 		t.Fatalf("expected migrated column endpoints.enabled, ok=%v err=%v", ok, err)
 	}
@@ -961,7 +967,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	p := model.Platform{
 		ID: "plat-1", Name: "Default", StickyTTLNs: 1000,
 		RegexFilters: []string{}, RegionFilters: []string{},
-		ProxyRequestTotalTimeoutNs: int64(45 * time.Second),
+		ProxyRequestTotalTimeoutNs:   int64(45 * time.Second),
+		ProxyRequestAttemptTimeoutNs: int64(2 * time.Second),
+		ProxyRequestMaxAttempts:      11,
 		ResponseRules: []model.PlatformResponseRule{{
 			ID: "quota", Enabled: true,
 			Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{429}},
@@ -995,6 +1003,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	if got.ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
 		t.Fatalf("proxy request total timeout did not round-trip: got %d, want %d", got.ProxyRequestTotalTimeoutNs, 45*time.Second)
 	}
+	if got.ProxyRequestAttemptTimeoutNs != int64(2*time.Second) || got.ProxyRequestMaxAttempts != 11 {
+		t.Fatalf("proxy request attempt controls did not round-trip: timeout=%d max=%d", got.ProxyRequestAttemptTimeoutNs, got.ProxyRequestMaxAttempts)
+	}
 	if len(got.ResponseRules) != 1 || got.ResponseRules[0].ID != "quota" || !got.ResponseRules[0].Enabled || got.ResponseRules[0].Action.CooldownScope != "egress_ip" || got.ResponseRules[0].Action.FixedDuration != "24h" {
 		t.Fatalf("response_rules did not round-trip: %+v", got.ResponseRules)
 	}
@@ -1026,6 +1037,9 @@ func TestStateRepo_Platforms_CRUD(t *testing.T) {
 	}
 	if list[0].ProxyRequestTotalTimeoutNs != int64(45*time.Second) {
 		t.Fatalf("proxy request total timeout changed unexpectedly: got %d, want %d", list[0].ProxyRequestTotalTimeoutNs, 45*time.Second)
+	}
+	if list[0].ProxyRequestAttemptTimeoutNs != int64(2*time.Second) || list[0].ProxyRequestMaxAttempts != 11 {
+		t.Fatalf("proxy request attempt controls changed unexpectedly: timeout=%d max=%d", list[0].ProxyRequestAttemptTimeoutNs, list[0].ProxyRequestMaxAttempts)
 	}
 
 	// Delete.

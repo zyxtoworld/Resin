@@ -1,10 +1,12 @@
 package platform
 
 import (
+	"encoding/json"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Resinat/Resin/internal/model"
 )
@@ -57,11 +59,58 @@ func TestBuildFromModel_Success(t *testing.T) {
 	if !plat.PassiveCircuitBreakerDisabled {
 		t.Fatal("passive circuit breaker flag mismatch: got false want true")
 	}
+	if plat.ProxyRequestAttemptTimeoutNs != 0 || plat.ProxyRequestMaxAttempts != 0 {
+		t.Fatalf("default proxy attempt controls changed unexpectedly: timeout=%d max=%d", plat.ProxyRequestAttemptTimeoutNs, plat.ProxyRequestMaxAttempts)
+	}
 	if len(plat.RegexFilters.Any) != 1 || !plat.RegexFilters.Any[0].MatchString("us-node") {
 		t.Fatalf("regex filters not compiled as expected: %+v", plat.RegexFilters)
 	}
 	if len(plat.RegionFilters) != 2 || plat.RegionFilters[0] != "us" || plat.RegionFilters[1] != "jp" {
 		t.Fatalf("region filters mismatch: %+v", plat.RegionFilters)
+	}
+}
+
+func TestBuildFromModel_PreservesExplicitProxyAttemptControls(t *testing.T) {
+	plat, err := BuildFromModel(model.Platform{
+		ID: "p", Name: "p", ReverseProxyMissAction: "TREAT_AS_EMPTY", AllocationPolicy: "BALANCED",
+		ProxyRequestTotalTimeoutNs: int64(8 * time.Second), ProxyRequestAttemptTimeoutNs: int64(1500 * time.Millisecond), ProxyRequestMaxAttempts: 11,
+	})
+	if err != nil {
+		t.Fatalf("BuildFromModel: %v", err)
+	}
+	if plat.ProxyRequestTotalTimeoutNs != int64(8*time.Second) || plat.ProxyRequestAttemptTimeoutNs != int64(1500*time.Millisecond) || plat.ProxyRequestMaxAttempts != 11 {
+		t.Fatalf("proxy attempt controls: total=%d attempt=%d max=%d", plat.ProxyRequestTotalTimeoutNs, plat.ProxyRequestAttemptTimeoutNs, plat.ProxyRequestMaxAttempts)
+	}
+}
+
+func TestBuildFromModelRejectsInvalidProxyAttemptControls(t *testing.T) {
+	for name, input := range map[string]model.Platform{
+		"negative attempt timeout": {ID: "p", Name: "p", ProxyRequestAttemptTimeoutNs: -1},
+		"negative max attempts":    {ID: "p", Name: "p", ProxyRequestMaxAttempts: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildFromModel(input); err == nil {
+				t.Fatal("BuildFromModel unexpectedly accepted invalid attempt control")
+			}
+		})
+	}
+}
+
+func TestPlatformModelJSONRoundTripPreservesProxyAttemptControls(t *testing.T) {
+	original := model.Platform{
+		ID: "p", Name: "p", ProxyRequestTotalTimeoutNs: int64(8 * time.Second),
+		ProxyRequestAttemptTimeoutNs: int64(1500 * time.Millisecond), ProxyRequestMaxAttempts: 11,
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal platform model: %v", err)
+	}
+	var restored model.Platform
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("unmarshal platform model: %v", err)
+	}
+	if restored.ProxyRequestTotalTimeoutNs != original.ProxyRequestTotalTimeoutNs || restored.ProxyRequestAttemptTimeoutNs != original.ProxyRequestAttemptTimeoutNs || restored.ProxyRequestMaxAttempts != original.ProxyRequestMaxAttempts {
+		t.Fatalf("platform model JSON controls: total=%d attempt=%d max=%d", restored.ProxyRequestTotalTimeoutNs, restored.ProxyRequestAttemptTimeoutNs, restored.ProxyRequestMaxAttempts)
 	}
 }
 

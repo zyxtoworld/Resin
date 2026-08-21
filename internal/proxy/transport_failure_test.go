@@ -63,7 +63,7 @@ func TestClassifyTransportFailureRecognizesWrappedTimeout(t *testing.T) {
 func TestAttemptContextForRequestReservesOverallDeadline(t *testing.T) {
 	parent, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 3)
+	ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 3, 0)
 	if !bounded || attemptCancel == nil || ctx == nil {
 		t.Fatal("deadline request did not receive a bounded attempt context")
 	}
@@ -75,7 +75,7 @@ func TestAttemptContextForRequestReservesOverallDeadline(t *testing.T) {
 	attemptCancel()
 	releaseAttempt()
 
-	unbounded, noCancel, _, bounded := attemptContextForRequest(context.Background(), 0, 3)
+	unbounded, noCancel, _, bounded := attemptContextForRequest(context.Background(), 0, 3, 0)
 	if bounded || noCancel != nil || unbounded == nil {
 		t.Fatal("request without an overall deadline must not claim a bounded retry budget")
 	}
@@ -93,7 +93,7 @@ func TestAttemptContextForRequestDoesNotDivideByCandidateCount(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			parent, cancel := context.WithTimeout(context.Background(), tc.total)
 			defer cancel()
-			ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 1444)
+			ctx, attemptCancel, releaseAttempt, bounded := attemptContextForRequest(parent, 0, 1444, 0)
 			if !bounded || ctx == nil || attemptCancel == nil {
 				t.Fatal("large candidate set did not receive a bounded attempt context")
 			}

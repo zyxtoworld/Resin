@@ -20,6 +20,8 @@ const platform: Platform = {
   name: "budget",
   sticky_ttl: "1h0m0s",
   proxy_request_total_timeout: "45s",
+  proxy_request_attempt_timeout: "2s",
+  proxy_request_max_attempts: 11,
   regex_filters: [],
   region_filters: [],
   response_rules: [],
@@ -36,9 +38,15 @@ const values = platformToFormValues(platform);
 assert.equal(values.proxy_request_total_timeout, "45s", "platform budget must be editable");
 assert.equal(toPlatformCreateInput(values).proxy_request_total_timeout, "45s", "create must persist platform budget");
 assert.equal(toPlatformUpdateInput(values).proxy_request_total_timeout, "45s", "update must persist platform budget");
+assert.equal(toPlatformCreateInput(values).proxy_request_attempt_timeout, "2s", "create must persist attempt budget");
+assert.equal(toPlatformCreateInput(values).proxy_request_max_attempts, 11, "create must persist max attempts");
+assert.equal(toPlatformUpdateInput(values).proxy_request_attempt_timeout, "2s", "update must persist attempt budget");
+assert.equal(toPlatformUpdateInput(values).proxy_request_max_attempts, 11, "update must persist max attempts");
 
 const disabled = { ...defaultPlatformFormValues, name: "budget", response_rules_text: "[]" };
 assert.equal(toPlatformUpdateInput(disabled).proxy_request_total_timeout, "", "empty budget must disable platform retry");
+assert.equal(toPlatformUpdateInput(disabled).proxy_request_attempt_timeout, "", "empty attempt budget must use total deadline");
+assert.equal(toPlatformUpdateInput(disabled).proxy_request_max_attempts, 0, "zero max attempts must mean candidate/deadline bound");
 assert.ok(defaultPlatformFormValues.proxy_request_total_timeout === "", "new platforms must default to fail-closed");
 
 console.log("platform form budget contracts passed");
