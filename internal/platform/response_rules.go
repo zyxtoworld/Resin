@@ -101,6 +101,21 @@ type responseExpirySource struct {
 // runtime platform and copied into each route result.
 type ResponseRules []ResponseRule
 
+// HasRetryNext reports whether an enabled rule can advance to another route
+// entry. Callers use it to decide whether request-body replay preparation is
+// worth doing before the first attempt.
+func (m ResponseRules) HasRetryNext() bool {
+	for _, rule := range m {
+		if !rule.Enabled {
+			continue
+		}
+		if rule.Action == ResponseRuleActionRetryNext || rule.Action == ResponseRuleActionCooldownThenRetryNext {
+			return true
+		}
+	}
+	return false
+}
+
 // ResponseRuleMatch describes the first matching rule. Until is zero when the
 // action has no cooldown or no trusted deadline and its fallback is none.
 type ResponseRuleMatch struct {

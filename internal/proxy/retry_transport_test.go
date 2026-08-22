@@ -982,6 +982,194 @@ func TestReverseRetryRoundTripper_TimeoutBeforeBodyReadCoolsAndRetriesReplayable
 	}
 }
 
+func TestReverseRetryRoundTripper_PreparesGetBodyNilBodyBeforeRetryableAttempt(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "generic-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+
+	initial, err := env.router.RouteRequest("plat", "getbody-nil", "https://example.com/getbody-nil")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RetryBudget < 2 {
+		t.Fatalf("initial route retry budget: got %d, want at least 2", initial.RetryBudget)
+	}
+	initialEntry := initial.SelectedEntry()
+	if initialEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	payload := []byte(`{"model":"mimo-v2.5","stream":false,"input":"getbody-nil"}`)
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	var bodies [][]byte
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initialEntry},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				if attempt == 1 {
+					// The node fails before consuming the body. A GetBody-nil request
+					// must already have a bounded replay copy for this retryable route.
+					return nil, responseHeaderTimeoutError{}
+				}
+				body, readErr := io.ReadAll(req.Body)
+				closeErr := req.Body.Close()
+				if readErr != nil || closeErr != nil {
+					t.Fatalf("retry body completion: read=%v close=%v", readErr, closeErr)
+				}
+				bodies = append(bodies, body)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	// io.NopCloser deliberately leaves GetBody nil, matching the real reverse
+	// proxy request shape while keeping this test body small and deterministic.
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/getbody-nil", io.NopCloser(bytes.NewReader(payload)))
+	req.ContentLength = int64(len(payload))
+	req.GetBody = nil
+	resp, err := retry.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("getbody-nil retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("getbody-nil response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempt count: got %d, want 2", got)
+	}
+	if len(attempted) != 2 || attempted[0] == attempted[1] {
+		t.Fatalf("retry did not choose a distinct entry: %v", attempted)
+	}
+	if len(bodies) != 1 || !bytes.Equal(bodies[0], payload) {
+		t.Fatalf("request body: got %q, want one exact payload", bodies)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("timeout cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+}
+
+type routeAttemptBudgetBody struct {
+	reader           *bytes.Reader
+	transportEntered <-chan struct{}
+	premature        atomic.Bool
+}
+
+func (b *routeAttemptBudgetBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.transportEntered:
+	default:
+		b.premature.Store(true)
+	}
+	return b.reader.Read(p)
+}
+
+func (b *routeAttemptBudgetBody) Close() error {
+	return nil
+}
+
+func TestReverseRetryRoundTripper_DoesNotPrebufferWhenOnlyOneAttemptIsPossible(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retryable-timeout", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"timeout"}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(2 * time.Second)
+	initial, err := env.router.RouteRequest("plat", "single-attempt", "https://example.com/single-attempt")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RetryBudget = 1
+	initialEntry := initial.SelectedEntry()
+	if initialEntry == nil {
+		t.Fatal("initial route did not expose selected entry")
+	}
+
+	transportEntered := make(chan struct{})
+	body := &routeAttemptBudgetBody{
+		reader:           bytes.NewReader([]byte(`{"stream":true,"input":"single-attempt"}`)),
+		transportEntered: transportEntered,
+	}
+	var attempts atomic.Int32
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initialEntry},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				close(transportEntered)
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("single-attempt body read: %v", err)
+				}
+				if err := req.Body.Close(); err != nil {
+					t.Fatalf("single-attempt body close: %v", err)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/single-attempt", body)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	req.GetBody = nil
+	resp, err := retry.RoundTrip(req)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("single-attempt response: resp=%#v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempt count: got %d, want 1", got)
+	}
+	if body.premature.Load() {
+		t.Fatal("single-attempt body was prebuffered despite no possible retry")
+	}
+}
+
 func TestReverseRetryRoundTripper_RetriesSmallUnknownLengthBodyAfterUnreadTimeout(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")

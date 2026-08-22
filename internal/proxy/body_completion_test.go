@@ -504,8 +504,8 @@ func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
 					trace.WroteRequest(httptrace.WroteRequestInfo{})
 				}
 				if attempt == 1 {
-					if req.GetBody != nil {
-						t.Fatalf("async first attempt unexpectedly had GetBody")
+					if req.GetBody == nil {
+						t.Fatal("retryable first attempt did not receive bounded replay body")
 					}
 					go func() {
 						<-allowFirstBody

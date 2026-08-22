@@ -15,9 +15,10 @@ import (
 )
 
 // reverseRetryRoundTripper applies the compiled response decision and bounded
-// retry state used by the forward proxy. Reverse requests are retried only
-// after their body is fully captured and before ReverseProxy has committed any
-// downstream response bytes.
+// retry state used by the reverse proxy. When a route can actually advance to
+// another attempt, a bounded replayable body is prepared before attempt one;
+// over-limit bodies remain passthrough. Reverse requests are retried only after
+// their body is replayable and before downstream response bytes are committed.
 type reverseRetryRoundTripper struct {
 	router              *routing.Router
 	pool                outbound.PoolAccessor
@@ -57,14 +58,16 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	var bodyPrepared bool
 	if budgetEnabled && baseReq.Body != nil && baseReq.Body != http.NoBody {
 		baseReq = baseReq.Clone(baseReq.Context())
-		if baseReq.GetBody == nil {
-			// Real reverse-proxy requests normally arrive without GetBody. Keep
-			// their first attempt full-duplex: capture only the bounded bytes
-			// actually consumed by the transport, and decide replayability after
-			// the response rule has finished reading the response.
-			capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
-			baseReq.Body = capture
-		} else {
+		prepareBeforeAttempt := baseReq.GetBody != nil
+		if baseReq.Method != http.MethodConnect &&
+			routeAttemptLimit(t.initial.Route) > 1 &&
+			t.initial.Route.ResponseRules.HasRetryNext() {
+			// A retryable route must use the same bounded preparation path even
+			// when the incoming reverse request has no GetBody. Otherwise a
+			// pre-body transport failure makes the lazy capture unreplayable.
+			prepareBeforeAttempt = true
+		}
+		if prepareBeforeAttempt {
 			var prepared bool
 			var prepareErr error
 			var passthroughBody io.ReadCloser
@@ -83,9 +86,6 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 				}
 			} else if passthroughBody != nil {
 				baseReq.Body = passthroughBody
-			} else {
-				capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
-				baseReq.Body = capture
 			}
 		}
 	}
