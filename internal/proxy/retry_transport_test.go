@@ -688,6 +688,229 @@ func TestReverseRetryRoundTripper_ExplicitAttemptTimeoutAdvances(t *testing.T) {
 	}
 }
 
+func TestReverseRetryRoundTripper_EnforcesAttemptDeadlineBeforeLateResponse(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(350 * time.Millisecond)
+	plat.ProxyRequestAttemptTimeoutNs = int64(40 * time.Millisecond)
+	plat.ProxyRequestMaxAttempts = 2
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequestForProxy("plat", "late-response", "https://example.com/late-response")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	traceOwner := newUpstreamRequestTrace()
+	lateEntered := make(chan struct{})
+	lateRelease := make(chan struct{})
+	lateFinished := make(chan struct{})
+	lateBody := &closeCountingBody{reader: strings.NewReader("late-429"), closed: make(chan struct{})}
+	deadlineSeen := make(chan time.Duration, 1)
+	resultCh := make(chan struct {
+		resp *http.Response
+		err  error
+	}, 1)
+
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			trace := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), trace.clientTrace())), trace
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				if attempt == 1 {
+					trace := httptrace.ContextClientTrace(req.Context())
+					if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil {
+						t.Fatal("late response attempt missing request trace")
+					}
+					trace.GotConn(httptrace.GotConnInfo{})
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+					deadline, hasDeadline := req.Context().Deadline()
+					if !hasDeadline {
+						deadlineSeen <- 0
+					} else {
+						deadlineSeen <- time.Until(deadline)
+					}
+					close(lateEntered)
+					<-lateRelease
+					if trace.GotFirstResponseByte != nil {
+						trace.GotFirstResponseByte()
+					}
+					close(lateFinished)
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     make(http.Header),
+						Body:       lateBody,
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+	}
+
+	started := time.Now()
+	go func() {
+		resp, roundTripErr := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/late-response", nil))
+		resultCh <- struct {
+			resp *http.Response
+			err  error
+		}{resp: resp, err: roundTripErr}
+	}()
+	select {
+	case <-lateEntered:
+	case <-time.After(250 * time.Millisecond):
+		close(lateRelease)
+		t.Fatal("first attempt did not start")
+	}
+	select {
+	case remaining := <-deadlineSeen:
+		if remaining <= 0 || remaining > 200*time.Millisecond {
+			t.Fatalf("first attempt deadline remaining: %s, want a live ~40ms deadline", remaining)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(lateRelease)
+		<-lateFinished
+		t.Fatal("first attempt did not expose its deadline")
+	}
+
+	var result struct {
+		resp *http.Response
+		err  error
+	}
+	select {
+	case result = <-resultCh:
+	case <-time.After(200 * time.Millisecond):
+		close(lateRelease)
+		<-lateFinished
+		t.Fatal("attempt deadline did not return before late response")
+	}
+	close(lateRelease)
+	<-lateFinished
+	select {
+	case <-lateBody.closed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("late response body was not closed")
+	}
+
+	if result.err != nil {
+		t.Fatalf("attempt deadline retry: %v", result.err)
+	}
+	if result.resp == nil || result.resp.StatusCode != http.StatusOK {
+		t.Fatalf("attempt deadline response: %#v, want 200", result.resp)
+	}
+	_ = result.resp.Body.Close()
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Fatalf("attempt deadline retry returned too late: %s", elapsed)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts: got %d, want 2", got)
+	}
+	if len(attempted) != 2 || attempted[0] == attempted[1] {
+		t.Fatalf("retry did not use a distinct node: %v", attempted)
+	}
+	if got := lateBody.closeCalls.Load(); got != 1 {
+		t.Fatalf("late response close calls: got %d, want 1", got)
+	}
+	if initial.RequestTotalTimeout != 350*time.Millisecond || initial.RequestAttemptTimeout != 40*time.Millisecond || initial.MaxAttempts != 2 {
+		t.Fatalf("route retry controls: total=%s attempt=%s max=%d", initial.RequestTotalTimeout, initial.RequestAttemptTimeout, initial.MaxAttempts)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("attempt timeout cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+}
+
+func TestReverseRetryRoundTripper_Immediate429RetriesWithoutWaitingAttemptCap(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	plat.ProxyRequestTotalTimeoutNs = int64(250 * time.Millisecond)
+	plat.ProxyRequestAttemptTimeoutNs = int64(200 * time.Millisecond)
+	plat.ProxyRequestMaxAttempts = 2
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "rate-limit", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{StatusCodes: []int{http.StatusTooManyRequests}},
+		Action: model.PlatformResponseRuleAction{Type: "cooldown_then_retry_next", CooldownScope: "egress_ip", Fallback: "fixed_duration", FixedDuration: "1m"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequestForProxy("plat", "immediate-429", "https://example.com/immediate-429")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	var attempts atomic.Int32
+	var attempted []node.Hash
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := attempts.Add(1)
+				attempted = append(attempted, candidate.Entry.Hash)
+				if attempt == 1 {
+					return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("rate-limited")), Request: req}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+			})
+		},
+	}
+	started := time.Now()
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodGet, "https://example.com/immediate-429", nil))
+	if err != nil {
+		t.Fatalf("429 retry: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("429 retry response: %#v, want 200", resp)
+	}
+	_ = resp.Body.Close()
+	if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+		t.Fatalf("immediate 429 waited for attempt cap: %s", elapsed)
+	}
+	if got := attempts.Load(); got != 2 || len(attempted) != 2 || attempted[0] == attempted[1] {
+		t.Fatalf("429 retry attempts: count=%d entries=%v", got, attempted)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != initial.EgressIP {
+		t.Fatalf("429 cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, initial.EgressIP)
+	}
+}
+
 func TestReverseRetryRoundTripper_ExplicitMaxAttemptsStopsExactly(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
@@ -2761,6 +2984,23 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type closeCountingBody struct {
+	reader     io.Reader
+	closeCalls atomic.Int32
+	closed     chan struct{}
+}
+
+func (b *closeCountingBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *closeCountingBody) Close() error {
+	if b.closeCalls.Add(1) == 1 && b.closed != nil {
+		close(b.closed)
+	}
+	return nil
 }
 
 type cancelOnEOFBody struct {

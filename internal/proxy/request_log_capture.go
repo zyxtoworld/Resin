@@ -316,7 +316,7 @@ func roundTripWithBodyCompletionBudget(
 		owner = newAttemptRequestBody(counter)
 		req.Body = owner
 	}
-	resp, err := transport.RoundTrip(req)
+	resp, err := roundTripWithAttemptContext(ctx, transport, req)
 	if owner != nil {
 		// A successful RoundTrip may return response headers while an HTTP/2 or
 		// full-duplex transport is still finishing the request body. The response
@@ -350,6 +350,87 @@ func roundTripWithBodyCompletionBudget(
 		return resp, err, 0, true
 	}
 	return resp, err, counter.Total(), true
+}
+
+type roundTripResult struct {
+	resp *http.Response
+	err  error
+}
+
+type roundTripCall struct {
+	mu        sync.Mutex
+	done      chan struct{}
+	finished  bool
+	abandoned bool
+	result    roundTripResult
+}
+
+// roundTripWithAttemptContext makes the attempt deadline a call boundary as
+// well as a request context. The standard transport normally returns when the
+// context is canceled, but an outbound adapter can otherwise leave RoundTrip
+// blocked while the proxy has already spent the attempt budget. A late result
+// is never usable by this attempt; the RoundTrip worker closes its body.
+func roundTripWithAttemptContext(
+	ctx context.Context,
+	transport http.RoundTripper,
+	req *http.Request,
+) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctx.Done() == nil {
+		return transport.RoundTrip(req)
+	}
+
+	call := &roundTripCall{done: make(chan struct{})}
+	go func() {
+		resp, err := transport.RoundTrip(req)
+		call.mu.Lock()
+		call.finished = true
+		if call.abandoned {
+			call.mu.Unlock()
+			closeRoundTripResponse(resp)
+			return
+		}
+		call.result = roundTripResult{resp: resp, err: err}
+		close(call.done)
+		call.mu.Unlock()
+	}()
+
+	select {
+	case <-call.done:
+		call.mu.Lock()
+		result := call.result
+		call.mu.Unlock()
+		return result.resp, result.err
+	case <-ctx.Done():
+		call.mu.Lock()
+		if call.finished {
+			result := call.result
+			call.mu.Unlock()
+			closeRoundTripResponse(result.resp)
+			return nil, ctx.Err()
+		}
+		call.abandoned = true
+		call.mu.Unlock()
+		if req != nil {
+			if owner, ok := req.Body.(*attemptRequestBody); ok {
+				owner.abort()
+			} else if aborter, ok := req.Body.(attemptBodyAborter); ok {
+				aborter.abandon()
+			}
+		}
+		return nil, ctx.Err()
+	}
+}
+
+func closeRoundTripResponse(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 }
 
 // attemptBodyCompletion owns request-body accounting after a successful
