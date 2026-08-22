@@ -222,7 +222,8 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 		PlatformID:        platform.DefaultPlatformID,
 		AttemptObserver: func(event netutil.AttemptEvent) {
 			log.Printf(
-				"resource_attempt request_id=%d platform_id=%s attempt=%d kind=%s node_id=%s phase=%s elapsed_ms=%d result=%s",
+				"resource_attempt correlation_id=%s request_id=%d platform_id=%s attempt=%d kind=%s node_id=%s phase=%s elapsed_ms=%d result=%s",
+				event.CorrelationID,
 				event.RequestID,
 				event.PlatformID,
 				event.Attempt,

@@ -43,7 +43,10 @@ type SubscriptionScheduler struct {
 	// onSubReenabledNode is called for each non-evicted node entry when a
 	// subscription transitions from disabled to enabled. The entry token keeps
 	// a delayed resource callback from acting on a same-hash replacement.
-	onSubReenabledNode func(hash node.Hash, expected *node.NodeEntry)
+	onSubReenabledNode     func(hash node.Hash, expected *node.NodeEntry)
+	onRefreshEvent         RefreshObserver
+	fetchTotalTimeout      time.Duration
+	fetchAttemptTimeoutCap time.Duration
 
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
@@ -94,21 +97,32 @@ type SchedulerConfig struct {
 	// OnSubReenabledNode is fired after false->true enabled transition for the
 	// exact entry that was observed while the runtime mutation was committed.
 	OnSubReenabledNode func(hash node.Hash, expected *node.NodeEntry)
+	// OnRefreshEvent receives bounded, secret-free phase events for one refresh.
+	// It is called synchronously from the refresh goroutine and must be safe for
+	// concurrent background refreshes.
+	OnRefreshEvent RefreshObserver
+	// These fields are observation metadata for the configured downloader
+	// budget. They do not alter scheduler behavior.
+	FetchTotalTimeout      time.Duration
+	FetchAttemptTimeoutCap time.Duration
 }
 
 // NewSubscriptionScheduler creates a new scheduler.
 func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 	downloadCtx, cancelDownload := context.WithCancel(context.Background())
 	sched := &SubscriptionScheduler{
-		subManager:         cfg.SubManager,
-		pool:               cfg.Pool,
-		downloader:         cfg.Downloader,
-		downloadCtx:        downloadCtx,
-		cancelDownload:     cancelDownload,
-		onSubUpdated:       cfg.OnSubUpdated,
-		runRefreshMutation: cfg.RunRefreshMutation,
-		onSubReenabledNode: cfg.OnSubReenabledNode,
-		stopCh:             make(chan struct{}),
+		subManager:             cfg.SubManager,
+		pool:                   cfg.Pool,
+		downloader:             cfg.Downloader,
+		downloadCtx:            downloadCtx,
+		cancelDownload:         cancelDownload,
+		onSubUpdated:           cfg.OnSubUpdated,
+		runRefreshMutation:     cfg.RunRefreshMutation,
+		onSubReenabledNode:     cfg.OnSubReenabledNode,
+		onRefreshEvent:         cfg.OnRefreshEvent,
+		fetchTotalTimeout:      cfg.FetchTotalTimeout,
+		fetchAttemptTimeoutCap: cfg.FetchAttemptTimeoutCap,
+		stopCh:                 make(chan struct{}),
 	}
 	if cfg.Fetcher != nil {
 		sched.Fetcher = cfg.Fetcher
@@ -403,14 +417,27 @@ func (s *SubscriptionScheduler) updateSubscription(ctx context.Context, sub *sub
 	_ = s.updateSubscriptionResult(ctx, sub)
 }
 
-func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, sub *subscription.Subscription) error {
+func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, sub *subscription.Subscription) (refreshErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	attemptSeq := sub.NextAttemptSeq()
+	trace := newRefreshTrace(
+		ctx,
+		sub.ID,
+		attemptSeq,
+		s.fetchTotalTimeout,
+		s.fetchAttemptTimeoutCap,
+		s.onRefreshEvent,
+	)
+	trace.emit(RefreshStageStart, "started", 0)
+	defer func() {
+		trace.emit(RefreshStageFinished, refreshResult(ctx, refreshErr), 0)
+	}()
+	ctx = netutil.WithRequestCorrelationID(ctx, trace.correlationID)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	attemptSeq := sub.NextAttemptSeq()
 	if s.beforeRefreshConfigSnapshotHook != nil {
 		s.beforeRefreshConfigSnapshotHook()
 	}
@@ -421,6 +448,7 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	attemptURL := attemptConfig.URL
 	attemptSourceType := attemptConfig.SourceType
 	attemptContent := attemptConfig.Content
+	trace.sourceType = attemptSourceType
 	if s.beforeRefreshConfigVersionHook != nil {
 		s.beforeRefreshConfigVersionHook()
 	}
@@ -434,17 +462,19 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	if s.beforeRefreshUpdateHook != nil {
 		s.beforeRefreshUpdateHook()
 	}
+	trace.emit(RefreshStageFetchStart, "started", 0)
 	if attemptSourceType == subscription.SourceTypeLocal {
 		body = []byte(attemptContent)
 	} else {
 		body, err = s.fetchSubscription(ctx, attemptURL)
 		if err != nil {
+			trace.emit(RefreshStageFetchEnd, refreshResult(ctx, err), 0)
 			// A request cancellation/deadline is not a subscription failure.
 			// Keep counting a timeout produced by the Fetcher itself while the
 			// caller is still alive (for example, the configured resource-fetch
 			// timeout), but never publish a result for a finished caller.
 			if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
-				s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "fetch", err)
+				s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "fetch", err, trace.correlationID)
 				return err
 			}
 			if ctx.Err() != nil {
@@ -453,33 +483,40 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 			return err
 		}
 	}
+	trace.emit(RefreshStageFetchEnd, "ok", 0)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	// 2. Parse (lock-free).
+	trace.emit(RefreshStageParseStart, "started", 0)
 	if s.beforeRefreshParseHook != nil {
 		s.beforeRefreshParseHook()
 	}
 	parsed, err := subscription.ParseGeneralSubscription(body)
 	if err != nil {
-		s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "parse", err)
+		trace.emit(RefreshStageParseEnd, refreshResult(ctx, err), 0)
+		s.handleUpdateFailure(ctx, sub, attemptSeq, attemptConfigVersion, "parse", err, trace.correlationID)
 		return err
 	}
 	if len(parsed) == 0 {
 		// A recognized payload with no supported nodes is not a trustworthy
 		// replacement. Keep the last known-good runtime view instead of treating
 		// an all-invalid/unsupported response as an intentional empty refresh.
+		parseErr := errors.New("subscription: no supported nodes found")
+		trace.emit(RefreshStageParseEnd, refreshResult(ctx, parseErr), 0)
 		s.handleUpdateFailure(
 			ctx,
 			sub,
 			attemptSeq,
 			attemptConfigVersion,
 			"parse",
-			errors.New("subscription: no supported nodes found"),
+			parseErr,
+			trace.correlationID,
 		)
-		return errors.New("subscription: no supported nodes found")
+		return parseErr
 	}
+	trace.emit(RefreshStageParseEnd, "ok", len(parsed))
 
 	// 3. Build refreshed managed nodes map (lock-free, pure computation).
 	refreshedManagedNodes := subscription.NewManagedNodes()
@@ -499,6 +536,7 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	mutationAdmitted := true
 	var runtimeMutationErr error
 	var runtimePreparation []nodeRuntimePreparation
+	trace.emit(RefreshStageApplyStart, "started", 0)
 	if hook := s.beforeRefreshApplyLockHook; hook != nil {
 		hook()
 	}
@@ -627,24 +665,31 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 			applyMutation(nil)
 		}
 	}); err != nil {
+		trace.emit(RefreshStageApplyEnd, refreshResult(ctx, err), 0)
 		return err
 	}
 	if !mutationAdmitted {
+		trace.emit(RefreshStageApplyEnd, "rejected", 0)
 		return ErrRefreshMutationRejected
 	}
 	if runtimeMutationErr != nil {
+		trace.emit(RefreshStageApplyEnd, refreshResult(ctx, runtimeMutationErr), 0)
 		return runtimeMutationErr
 	}
 	if !applied {
+		trace.emit(RefreshStageApplyEnd, "stale", 0)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		log.Printf("[scheduler] stale success ignored for %s", sub.ID)
 		return nil
 	}
+	trace.emit(RefreshStageApplyEnd, "ok", len(runtimePreparation))
+	trace.emit(RefreshStageRuntimePreparationStart, "started", len(runtimePreparation))
 	for _, prep := range runtimePreparation {
 		s.pool.RunNodeAddedRuntime(prep.hash, prep.entry)
 	}
+	trace.emit(RefreshStageRuntimePreparationEnd, "ok", len(runtimePreparation))
 
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
@@ -668,6 +713,7 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 	attemptConfigVersion int64,
 	stage string,
 	err error,
+	correlationID string,
 ) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -702,11 +748,23 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 		return
 	}
 	if !applied {
-		log.Printf("[scheduler] stale %s failure ignored for %s: %v", stage, sub.ID, err)
+		log.Printf(
+			"[scheduler] subscription_refresh_failure_stale correlation_id=%s subscription_id=%s stage=%s result=%s",
+			correlationID,
+			sub.ID,
+			stage,
+			refreshResult(ctx, err),
+		)
 		return
 	}
 
-	log.Printf("[scheduler] %s %s failed: %v", stage, sub.ID, err)
+	log.Printf(
+		"[scheduler] subscription_refresh_failure correlation_id=%s subscription_id=%s stage=%s result=%s",
+		correlationID,
+		sub.ID,
+		stage,
+		refreshResult(ctx, err),
+	)
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
 	}

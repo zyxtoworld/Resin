@@ -334,9 +334,31 @@ func newTopologyRuntime(
 	log.Println("ProbeManager initialized")
 
 	scheduler := topology.NewSubscriptionScheduler(topology.SchedulerConfig{
-		SubManager: subManager,
-		Pool:       pool,
-		Downloader: downloader,
+		SubManager:             subManager,
+		Pool:                   pool,
+		Downloader:             downloader,
+		FetchTotalTimeout:      envCfg.ResourceFetchTimeout,
+		FetchAttemptTimeoutCap: envCfg.ResourceFetchTimeout / 2,
+		OnRefreshEvent: func(event topology.RefreshEvent) {
+			callerDeadline := "none"
+			if event.CallerDeadlineSet {
+				callerDeadline = event.CallerDeadline.UTC().Format(time.RFC3339Nano)
+			}
+			log.Printf(
+				"subscription_refresh correlation_id=%s subscription_id=%s attempt_seq=%d stage=%s source_type=%s elapsed_ms=%d result=%s caller_deadline=%s fetch_total_timeout=%s fetch_attempt_timeout_cap=%s prepared_nodes=%d",
+				event.CorrelationID,
+				event.SubscriptionID,
+				event.AttemptSeq,
+				event.Stage,
+				event.SourceType,
+				event.Elapsed/time.Millisecond,
+				event.Result,
+				callerDeadline,
+				event.FetchTotalTimeout,
+				event.FetchAttemptTimeoutCap,
+				event.PreparedNodeCount,
+			)
+		},
 		RunRefreshMutation: func(fn func(topology.PersistenceAdmission)) bool {
 			return engine.WithDirtyWriteAdmission(func(admission *state.DirtyWriteAdmission) {
 				fn(admission)

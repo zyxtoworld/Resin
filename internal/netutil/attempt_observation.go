@@ -31,14 +31,15 @@ const (
 // AttemptEvent is the bounded, non-secret observation emitted by a resource
 // download. NodeID is a stable node hash, never an address or raw options.
 type AttemptEvent struct {
-	RequestID  uint64
-	PlatformID string
-	Attempt    int
-	Kind       AttemptKind
-	NodeID     string
-	Phase      AttemptPhase
-	Elapsed    time.Duration
-	Result     string
+	RequestID     uint64
+	CorrelationID string
+	PlatformID    string
+	Attempt       int
+	Kind          AttemptKind
+	NodeID        string
+	Phase         AttemptPhase
+	Elapsed       time.Duration
+	Result        string
 }
 
 // AttemptObserver receives one safe event at a time. Observers must not
@@ -46,13 +47,14 @@ type AttemptEvent struct {
 type AttemptObserver func(AttemptEvent)
 
 type attemptState struct {
-	requestID  uint64
-	platformID string
-	attempt    int
-	kind       AttemptKind
-	nodeID     string
-	started    time.Time
-	observe    AttemptObserver
+	requestID     uint64
+	correlationID string
+	platformID    string
+	attempt       int
+	kind          AttemptKind
+	nodeID        string
+	started       time.Time
+	observe       AttemptObserver
 }
 
 type attemptStateContextKey struct{}
@@ -78,14 +80,15 @@ func emitAttemptPhaseForState(state *attemptState, phase AttemptPhase, result st
 		return
 	}
 	state.observe(AttemptEvent{
-		RequestID:  state.requestID,
-		PlatformID: state.platformID,
-		Attempt:    state.attempt,
-		Kind:       state.kind,
-		NodeID:     state.nodeID,
-		Phase:      phase,
-		Elapsed:    time.Since(state.started),
-		Result:     result,
+		RequestID:     state.requestID,
+		CorrelationID: state.correlationID,
+		PlatformID:    state.platformID,
+		Attempt:       state.attempt,
+		Kind:          state.kind,
+		NodeID:        state.nodeID,
+		Phase:         phase,
+		Elapsed:       time.Since(state.started),
+		Result:        result,
 	})
 }
 

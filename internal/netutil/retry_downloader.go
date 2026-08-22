@@ -60,14 +60,16 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 	defer cancelRequest()
 
 	requestID := r.nextRequestID.Add(1)
+	correlationID := RequestCorrelationID(ctx)
 	proxyAttempts := r.maxProxyAttempts()
 	directState := &attemptState{
-		requestID:  requestID,
-		platformID: r.PlatformID,
-		attempt:    1,
-		kind:       AttemptKindDirect,
-		started:    time.Now(),
-		observe:    r.AttemptObserver,
+		requestID:     requestID,
+		correlationID: correlationID,
+		platformID:    r.PlatformID,
+		attempt:       1,
+		kind:          AttemptKindDirect,
+		started:       time.Now(),
+		observe:       r.AttemptObserver,
 	}
 	directSlots := proxyAttempts + 1
 	if r.AttemptTimeoutCap > 0 {
@@ -137,13 +139,14 @@ func (r *RetryDownloader) Download(ctx context.Context, url string) ([]byte, err
 		attempted = append(attempted, selection)
 
 		attemptState := &attemptState{
-			requestID:  requestID,
-			platformID: r.PlatformID,
-			attempt:    proxyAttempt + 2,
-			kind:       AttemptKindProxy,
-			nodeID:     selection.Hash.Hex(),
-			started:    time.Now(),
-			observe:    r.AttemptObserver,
+			requestID:     requestID,
+			correlationID: correlationID,
+			platformID:    r.PlatformID,
+			attempt:       proxyAttempt + 2,
+			kind:          AttemptKindProxy,
+			nodeID:        selection.Hash.Hex(),
+			started:       time.Now(),
+			observe:       r.AttemptObserver,
 		}
 		attemptBudget := r.attemptBudget(requestCtx, proxyAttempts-proxyAttempt)
 		if attemptBudget <= 0 {
