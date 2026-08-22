@@ -297,7 +297,7 @@ func roundTripWithBodyCompletion(
 	transport http.RoundTripper,
 	req *http.Request,
 ) (*http.Response, error, int64, bool) {
-	return roundTripWithBodyCompletionBudget(ctx, transport, req, attemptBodyQuiescenceBudget)
+	return roundTripWithBodyCompletionBudgetAndDeadline(ctx, transport, req, attemptBodyQuiescenceBudget, false)
 }
 
 func roundTripWithBodyCompletionBudget(
@@ -305,6 +305,24 @@ func roundTripWithBodyCompletionBudget(
 	transport http.RoundTripper,
 	req *http.Request,
 	budget time.Duration,
+) (*http.Response, error, int64, bool) {
+	return roundTripWithBodyCompletionBudgetAndDeadline(ctx, transport, req, budget, false)
+}
+
+func roundTripWithAttemptDeadline(
+	ctx context.Context,
+	transport http.RoundTripper,
+	req *http.Request,
+) (*http.Response, error, int64, bool) {
+	return roundTripWithBodyCompletionBudgetAndDeadline(ctx, transport, req, attemptBodyQuiescenceBudget, true)
+}
+
+func roundTripWithBodyCompletionBudgetAndDeadline(
+	ctx context.Context,
+	transport http.RoundTripper,
+	req *http.Request,
+	budget time.Duration,
+	enforceCallDeadline bool,
 ) (*http.Response, error, int64, bool) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -316,7 +334,13 @@ func roundTripWithBodyCompletionBudget(
 		owner = newAttemptRequestBody(counter)
 		req.Body = owner
 	}
-	resp, err := roundTripWithAttemptContext(ctx, transport, req)
+	var resp *http.Response
+	var err error
+	if enforceCallDeadline {
+		resp, err = roundTripWithAttemptContext(ctx, transport, req)
+	} else {
+		resp, err = transport.RoundTrip(req)
+	}
 	if owner != nil {
 		// A successful RoundTrip may return response headers while an HTTP/2 or
 		// full-duplex transport is still finishing the request body. The response

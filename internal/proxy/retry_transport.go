@@ -179,9 +179,19 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			outReq, attemptTrace = t.decorateAttempt(outReq, current)
 		}
 		pendingHeaderBytes := headerWireLen(outReq.Header)
-		resp, err, bodyBytes, bodyComplete := roundTripWithBodyCompletion(
-			attemptCtx, t.transportFor(current), outReq,
-		)
+		var resp *http.Response
+		var err error
+		var bodyBytes int64
+		var bodyComplete bool
+		if bounded && current.Route.RequestAttemptTimeout > 0 {
+			resp, err, bodyBytes, bodyComplete = roundTripWithAttemptDeadline(
+				attemptCtx, t.transportFor(current), outReq,
+			)
+		} else {
+			resp, err, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
+				attemptCtx, t.transportFor(current), outReq,
+			)
+		}
 		deferredBody := responseBodyCompletion(resp)
 		bodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
 		retryCurrent := func() bool {

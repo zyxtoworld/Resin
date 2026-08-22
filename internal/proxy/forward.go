@@ -654,9 +654,15 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		var bodyBytes int64
 		var bodyComplete bool
 		var deferredBody *attemptBodyCompletion
-		resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
-			attemptCtx, transport, outReq,
-		)
+		if bounded && routed.Route.RequestAttemptTimeout > 0 {
+			resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithAttemptDeadline(
+				attemptCtx, transport, outReq,
+			)
+		} else {
+			resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
+				attemptCtx, transport, outReq,
+			)
+		}
 		deferredBody = responseBodyCompletion(resp)
 		if !bodyComplete && deferredBody == nil {
 			resp = nil
