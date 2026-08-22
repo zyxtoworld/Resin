@@ -190,6 +190,7 @@ func TestBootstrapNodes_IsolatesBadOutboundAndKeepsGoodRoute(t *testing.T) {
 		SubManager: subManager,
 		Pool:       pool,
 	})
+	defer scheduler.Stop()
 	if admitted, err := scheduler.UpdateSubscriptionContextResult(context.Background(), refreshed); !admitted || err != nil {
 		t.Fatalf("corrected subscription refresh = admitted %v, err %v", admitted, err)
 	}
@@ -197,6 +198,10 @@ func TestBootstrapNodes_IsolatesBadOutboundAndKeepsGoodRoute(t *testing.T) {
 	fixedRaw := parsedFixed[0].RawOptions
 	fixedHash := node.HashFromRawOptions(fixedRaw)
 	fixedEntry, ok := pool.GetEntry(fixedHash)
+	deadline := time.Now().Add(2 * time.Second)
+	for ok && !fixedEntry.HasOutbound() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !ok || !fixedEntry.HasOutbound() {
 		t.Fatal("corrected subscription did not publish a recovered outbound")
 	}

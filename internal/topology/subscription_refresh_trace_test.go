@@ -28,7 +28,11 @@ func TestSchedulerRefreshTraceCorrelatesConcurrentStages(t *testing.T) {
 		Fetcher: func(_ context.Context, url string) ([]byte, error) {
 			fetchEntered <- url
 			<-releaseFetch
-			return makeSubscriptionJSON(`{"type":"shadowsocks","tag":"` + url + `","server":"1.1.1.1","server_port":443}`), nil
+			server := "1.1.1.1"
+			if url == "https://example.test/second" {
+				server = "1.1.1.2"
+			}
+			return makeSubscriptionJSON(`{"type":"shadowsocks","tag":"` + url + `","server":"` + server + `","server_port":443}`), nil
 		},
 		FetchTotalTimeout:      2 * time.Second,
 		FetchAttemptTimeoutCap: 500 * time.Millisecond,
@@ -60,6 +64,7 @@ func TestSchedulerRefreshTraceCorrelatesConcurrentStages(t *testing.T) {
 			t.Fatal("concurrent refresh did not finish")
 		}
 	}
+	sched.Stop()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -68,24 +73,31 @@ func TestSchedulerRefreshTraceCorrelatesConcurrentStages(t *testing.T) {
 	}
 	bySubscription := make(map[string]string)
 	byCorrelation := make(map[string]string)
+	commitCorrelations := make(map[string]struct{})
+	preparationParents := make(map[string]string)
 	for _, event := range events {
 		if event.CorrelationID == "" {
 			t.Fatalf("refresh event has empty correlation_id: %+v", event)
 		}
-		if previous := bySubscription[event.SubscriptionID]; previous != "" && previous != event.CorrelationID {
-			t.Fatalf("subscription %q crossed correlation IDs: %q and %q", event.SubscriptionID, previous, event.CorrelationID)
+		if event.ParentCorrelationID == "" {
+			commitCorrelations[event.CorrelationID] = struct{}{}
+			if previous := bySubscription[event.SubscriptionID]; previous != "" && previous != event.CorrelationID {
+				t.Fatalf("subscription %q crossed commit correlation IDs: %q and %q", event.SubscriptionID, previous, event.CorrelationID)
+			}
+			bySubscription[event.SubscriptionID] = event.CorrelationID
+		} else {
+			preparationParents[event.CorrelationID] = event.ParentCorrelationID
 		}
-		bySubscription[event.SubscriptionID] = event.CorrelationID
 		if previous := byCorrelation[event.CorrelationID]; previous != "" && previous != event.SubscriptionID {
 			t.Fatalf("correlation ID %q crossed subscriptions: %q and %q", event.CorrelationID, previous, event.SubscriptionID)
 		}
 		byCorrelation[event.CorrelationID] = event.SubscriptionID
 	}
-	if len(bySubscription) != 2 || len(byCorrelation) != 2 {
-		t.Fatalf("trace identity groups = subscriptions:%d correlations:%d, want 2/2", len(bySubscription), len(byCorrelation))
+	if len(bySubscription) != 2 || len(commitCorrelations) != 2 || len(preparationParents) != 2 || len(byCorrelation) != 4 {
+		t.Fatalf("trace identity groups = subscriptions:%d commits:%d preparations:%d correlations:%d, want 2/2/2/4", len(bySubscription), len(commitCorrelations), len(preparationParents), len(byCorrelation))
 	}
 
-	wantStages := []RefreshStage{
+	wantCommit := []RefreshStage{
 		RefreshStageStart,
 		RefreshStageFetchStart,
 		RefreshStageFetchEnd,
@@ -93,9 +105,12 @@ func TestSchedulerRefreshTraceCorrelatesConcurrentStages(t *testing.T) {
 		RefreshStageParseEnd,
 		RefreshStageApplyStart,
 		RefreshStageApplyEnd,
+		RefreshStageFinished,
+	}
+	wantPreparation := []RefreshStage{
+		RefreshStageRuntimePreparationScheduled,
 		RefreshStageRuntimePreparationStart,
 		RefreshStageRuntimePreparationEnd,
-		RefreshStageFinished,
 	}
 	byCorrelationStages := make(map[string][]RefreshStage)
 	for _, event := range events {
@@ -108,13 +123,34 @@ func TestSchedulerRefreshTraceCorrelatesConcurrentStages(t *testing.T) {
 		}
 	}
 	for correlationID, gotStages := range byCorrelationStages {
-		if len(gotStages) != len(wantStages) {
-			t.Fatalf("correlation ID %q has stages %v, want %v", correlationID, gotStages, wantStages)
+		if preparationParents[correlationID] != "" {
+			if !equalRefreshStages(gotStages, wantPreparation) {
+				t.Fatalf("correlation ID %q has invalid preparation stages %v", correlationID, gotStages)
+			}
+			if _, ok := commitCorrelations[preparationParents[correlationID]]; !ok {
+				t.Fatalf("preparation correlation ID %q has unknown parent %q", correlationID, preparationParents[correlationID])
+			}
+			continue
 		}
-		for i, want := range wantStages {
-			if gotStages[i] != want {
-				t.Fatalf("correlation ID %q stage[%d] = %q, want %q; all=%v", correlationID, i, gotStages[i], want, gotStages)
+		if len(gotStages) != len(wantCommit) {
+			t.Fatalf("correlation ID %q has commit stages %v, want %v", correlationID, gotStages, wantCommit)
+		}
+		for i, wantStage := range wantCommit {
+			if gotStages[i] != wantStage {
+				t.Fatalf("correlation ID %q stage[%d] = %q, want %q; all=%v", correlationID, i, gotStages[i], wantStage, gotStages)
 			}
 		}
 	}
+}
+
+func equalRefreshStages(got, want []RefreshStage) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

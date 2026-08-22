@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
@@ -606,6 +607,151 @@ func TestProbeEgressSyncForEntryFetcherUsesCapturedEntry(t *testing.T) {
 	mgr.Stop()
 }
 
+func TestProbeGuardRejectsEpochChangedDuringFetchWithoutHealthWriteback(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	raw := []byte(`{"type":"guarded-probe"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, "sub1")
+	entry, ok := pool.GetEntry(hash)
+	if !ok || entry == nil {
+		t.Fatal("probe entry not found")
+	}
+	storeOutbound(entry)
+
+	fetchEntered := make(chan struct{})
+	releaseFetch := make(chan struct{})
+	gate := runtimeguard.NewGate()
+	guard := gate.Capture()
+	mgr := NewProbeManager(ProbeConfig{
+		Pool: pool,
+		Fetcher: func(context.Context, *node.NodeEntry, string) ([]byte, time.Duration, error) {
+			close(fetchEntered)
+			<-releaseFetch
+			return []byte("fl=123\nip=203.0.113.9\nloc=US"), 42 * time.Millisecond, nil
+		},
+	})
+	var resultRecorded atomic.Int32
+	mgr.afterProbeResultRecordHook = func() { resultRecorded.Add(1) }
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := mgr.performEgressProbeGuarded(context.Background(), hash, entry, guard)
+		done <- err
+	}()
+	select {
+	case <-fetchEntered:
+	case <-time.After(time.Second):
+		t.Fatal("guarded probe did not enter fetch")
+	}
+	gate.Invalidate()
+	close(releaseFetch)
+	select {
+	case err := <-done:
+		if err != errProbeEntryNotLive {
+			t.Fatalf("guarded probe error = %v, want %v", err, errProbeEntryNotLive)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("guarded probe did not finish after fetch release")
+	}
+
+	if got := resultRecorded.Load(); got != 0 {
+		t.Fatalf("epoch-invalidated probe recorded a result: %d", got)
+	}
+	if got := entry.FailureCount.Load(); got != 0 {
+		t.Fatalf("epoch-invalidated probe changed failure count: %d", got)
+	}
+	if got := entry.LastLatencyProbeAttempt.Load(); got != 0 {
+		t.Fatalf("epoch-invalidated probe wrote latency attempt timestamp: %d", got)
+	}
+	if got := entry.LastEgressUpdateAttempt.Load(); got != 0 {
+		t.Fatalf("epoch-invalidated probe wrote egress attempt timestamp: %d", got)
+	}
+	if got := entry.LastEgressUpdate.Load(); got != 0 {
+		t.Fatalf("epoch-invalidated probe wrote egress update timestamp: %d", got)
+	}
+	if ip := entry.GetEgressIP(); ip.IsValid() {
+		t.Fatalf("epoch-invalidated probe published egress IP: %v", ip)
+	}
+	if _, ok := entry.LatencyTable.GetDomainStats("cloudflare.com"); ok {
+		t.Fatal("epoch-invalidated probe published latency stats")
+	}
+}
+
+func TestProbeGuardCommitRejectsInvalidationAfterFetch(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	raw := []byte(`{"type":"guarded-probe-commit"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, "sub1")
+	entry, ok := pool.GetEntry(hash)
+	if !ok || entry == nil {
+		t.Fatal("probe entry not found")
+	}
+	storeOutbound(entry)
+
+	gate := runtimeguard.NewGate()
+	guard := gate.Capture()
+	commitEntered := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	mgr := NewProbeManager(ProbeConfig{
+		Pool: pool,
+		Fetcher: func(context.Context, *node.NodeEntry, string) ([]byte, time.Duration, error) {
+			return []byte("fl=123\nip=203.0.113.9\nloc=US"), 42 * time.Millisecond, nil
+		},
+	})
+	mgr.beforeGuardCommitHook = func() {
+		if !guard.Allowed() {
+			t.Fatal("guard was invalid before the final health-write seam")
+		}
+		close(commitEntered)
+		<-releaseCommit
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := mgr.performEgressProbeGuarded(context.Background(), hash, entry, guard)
+		done <- err
+	}()
+	select {
+	case <-commitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("guarded probe did not reach final commit seam")
+	}
+	invalidated := make(chan struct{})
+	go func() {
+		gate.Invalidate()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		t.Fatal("invalidation waited behind work that had not entered the commit gate")
+	}
+	close(releaseCommit)
+	select {
+	case err := <-done:
+		if err != errProbeEntryNotLive {
+			t.Fatalf("guarded probe error = %v, want %v", err, errProbeEntryNotLive)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("guarded probe did not finish after final seam release")
+	}
+	if got := entry.FailureCount.Load(); got != 0 {
+		t.Fatalf("invalidated guarded probe changed failure count: %d", got)
+	}
+	if got := entry.LastEgressUpdateAttempt.Load(); got != 0 {
+		t.Fatalf("invalidated guarded probe wrote egress attempt timestamp: %d", got)
+	}
+	if ip := entry.GetEgressIP(); ip.IsValid() {
+		t.Fatalf("invalidated guarded probe published egress IP: %v", ip)
+	}
+}
+
 func TestProbeLatencySyncForEntryFetcherUsesCapturedEntry(t *testing.T) {
 	pool := topology.NewGlobalNodePool(topology.PoolConfig{
 		MaxLatencyTableEntries: 16,
@@ -1050,6 +1196,53 @@ func TestTriggerImmediateEgressProbe_WithFetcher(t *testing.T) {
 	}
 }
 
+func TestGuardedProbeSameEpochCoalescesToOneTaskKey(t *testing.T) {
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	raw := []byte(`{"type":"guarded-probe-coalesce"}`)
+	hash := node.HashFromRawOptions(raw)
+	pool.AddNodeFromSub(hash, raw, "sub1")
+	entry, ok := pool.GetEntry(hash)
+	if !ok || entry == nil {
+		t.Fatal("probe entry not found")
+	}
+	storeOutbound(entry)
+	mgr := NewProbeManager(ProbeConfig{Pool: pool})
+	gate := runtimeguard.NewGate()
+	first := gate.Capture()
+	second := gate.Capture()
+	if first == nil || second == nil {
+		t.Fatal("failed to capture runtime guard")
+	}
+	if first.Identity() != second.Identity() {
+		t.Fatal("same gate epoch produced different task identities")
+	}
+	if !mgr.TriggerImmediateEgressProbeForEntryGuarded(hash, entry, first) {
+		t.Fatal("first guarded probe was not queued")
+	}
+	if mgr.TriggerImmediateEgressProbeForEntryGuarded(hash, entry, second) {
+		t.Fatal("same-epoch guarded probe created a duplicate queue token")
+	}
+	if got := mgr.taskStates.Size(); got != 1 {
+		t.Fatalf("guarded probe task state count = %d, want 1", got)
+	}
+	task, ok := mgr.taskQueue.Dequeue()
+	if !ok {
+		t.Fatal("guarded probe queue token was lost")
+	}
+	if task.guard != first {
+		t.Fatal("dequeued guarded probe lost its captured token")
+	}
+	if state, ok := mgr.markTaskRunning(task.key); !ok {
+		t.Fatal("dequeued guarded probe state was not retained")
+	} else {
+		mgr.finishTask(task, state)
+	}
+	mgr.Stop()
+}
+
 func TestTriggerImmediateEgressProbeForEntryRejectsRecreatedHash(t *testing.T) {
 	pool := topology.NewGlobalNodePool(topology.PoolConfig{
 		MaxLatencyTableEntries: 16,
@@ -1093,7 +1286,7 @@ func TestTriggerImmediateEgressProbeForEntryRejectsRecreatedHash(t *testing.T) {
 		t.Fatal("queued exact-generation task state was lost")
 	}
 	mgr.executeTask(task)
-	mgr.finishTask(task.key, state)
+	mgr.finishTask(task, state)
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("stale task probed replacement generation: %d calls", got)
 	}

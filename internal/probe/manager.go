@@ -13,6 +13,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/scanloop"
 	"github.com/Resinat/Resin/internal/topology"
 	"github.com/puzpuzpuz/xsync/v4"
@@ -82,6 +83,9 @@ type ProbeManager struct {
 	// Package-private test seam immediately before a periodic scan enqueues a
 	// due node. Production leaves it nil.
 	beforeScanEnqueueHook func(node.Hash, *node.NodeEntry)
+	// Package-private test seam after guarded external work and immediately
+	// before the short final health-write commit. Production leaves it nil.
+	beforeGuardCommitHook func()
 }
 
 const (
@@ -111,10 +115,12 @@ type probeTaskKey struct {
 	hash     node.Hash
 	kind     probeTaskKind
 	expected *node.NodeEntry
+	guardID  runtimeguard.TokenID
 }
 
 type probeTask struct {
-	key probeTaskKey
+	key   probeTaskKey
+	guard *runtimeguard.Guard
 }
 
 type probeTaskState struct {
@@ -407,6 +413,19 @@ func (m *ProbeManager) TriggerImmediateEgressProbeForEntry(hash node.Hash, expec
 	m.enqueueProbe(hash, probeTaskKindEgress, probePriorityNormal, expected)
 }
 
+// TriggerImmediateEgressProbeForEntryGuarded carries the subscription epoch
+// into both queue admission and the worker's final health-write checks.
+func (m *ProbeManager) TriggerImmediateEgressProbeForEntryGuarded(
+	hash node.Hash,
+	expected *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) bool {
+	if expected == nil || guard == nil || !guard.Allowed() {
+		return false
+	}
+	return m.enqueueProbeGuarded(hash, probeTaskKindEgress, probePriorityNormal, expected, guard)
+}
+
 // TriggerImmediateLatencyProbe enqueues an async latency probe for a node.
 // Caller returns immediately.
 func (m *ProbeManager) TriggerImmediateLatencyProbe(hash node.Hash) {
@@ -697,11 +716,14 @@ func (m *ProbeManager) runProbeWorker() {
 		}
 
 		m.executeTask(task)
-		m.finishTask(task.key, state)
+		m.finishTask(task, state)
 	}
 }
 
 func (m *ProbeManager) executeTask(task probeTask) {
+	if task.guard != nil && !task.guard.Allowed() {
+		return
+	}
 	entry, ok := m.pool.GetEntry(task.key.hash)
 	if !ok || (task.key.expected != nil && entry != task.key.expected) || entry.Outbound.Load() == nil {
 		return
@@ -712,9 +734,9 @@ func (m *ProbeManager) executeTask(task probeTask) {
 
 	switch task.key.kind {
 	case probeTaskKindEgress:
-		m.probeEgress(task.key.hash, entry)
+		m.probeEgressGuarded(task.key.hash, entry, task.guard)
 	case probeTaskKindLatency:
-		m.probeLatency(task.key.hash, entry, m.currentLatencyTestURL())
+		m.probeLatencyGuarded(task.key.hash, entry, m.currentLatencyTestURL(), task.guard)
 	}
 }
 
@@ -723,7 +745,24 @@ func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority
 	if len(expected) != 0 {
 		expectedEntry = expected[0]
 	}
-	key := probeTaskKey{hash: hash, kind: kind, expected: expectedEntry}
+	return m.enqueueProbeGuarded(hash, kind, priority, expectedEntry, nil)
+}
+
+func (m *ProbeManager) enqueueProbeGuarded(
+	hash node.Hash,
+	kind probeTaskKind,
+	priority probePriority,
+	expectedEntry *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) bool {
+	if guard != nil && !guard.Allowed() {
+		return false
+	}
+	var guardID runtimeguard.TokenID
+	if guard != nil {
+		guardID = guard.Identity()
+	}
+	key := probeTaskKey{hash: hash, kind: kind, expected: expectedEntry, guardID: guardID}
 	state, _ := m.taskStates.LoadOrCompute(key, func() (*probeTaskState, bool) {
 		return &probeTaskState{}, false
 	})
@@ -751,7 +790,7 @@ func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority
 				if !state.flags.CompareAndSwap(flags, next) {
 					continue
 				}
-				if m.taskQueue.Enqueue(probeTask{key: key}, probePriorityHigh) {
+				if m.taskQueue.Enqueue(probeTask{key: key, guard: guard}, probePriorityHigh) {
 					return true
 				}
 				for {
@@ -785,7 +824,7 @@ func (m *ProbeManager) enqueueProbe(hash node.Hash, kind probeTaskKind, priority
 			continue
 		}
 
-		if m.taskQueue.Enqueue(probeTask{key: key}, priority) {
+		if m.taskQueue.Enqueue(probeTask{key: key, guard: guard}, priority) {
 			return true
 		}
 
@@ -814,7 +853,22 @@ func (m *ProbeManager) markTaskRunning(key probeTaskKey) (*probeTaskState, bool)
 	}
 }
 
-func (m *ProbeManager) finishTask(key probeTaskKey, state *probeTaskState) {
+func (m *ProbeManager) finishTask(task probeTask, state *probeTaskState) {
+	key := task.key
+	if task.guard != nil && !task.guard.Allowed() {
+		// The worker has already claimed the running bit.  Drop every pending
+		// token, including that bit, so an invalidated task cannot leave a
+		// permanent state entry behind or be mistaken for an in-flight probe.
+		for {
+			flags := state.flags.Load()
+			next := flags &^ (taskFlagRunning | taskFlagQueued | taskFlagQueuedHigh | taskFlagDirty | taskFlagDirtyHigh)
+			if state.flags.CompareAndSwap(flags, next) {
+				break
+			}
+		}
+		m.tryDeleteTaskState(key, state)
+		return
+	}
 	requeue := false
 	requeuePriority := probePriorityNormal
 
@@ -845,7 +899,7 @@ func (m *ProbeManager) finishTask(key probeTaskKey, state *probeTaskState) {
 	}
 
 	if requeue {
-		if !m.taskQueue.Enqueue(probeTask{key: key}, requeuePriority) {
+		if !m.taskQueue.Enqueue(probeTask{key: key, guard: task.guard}, requeuePriority) {
 			m.clearDroppedState(state)
 		}
 	}
@@ -917,7 +971,14 @@ func (m *ProbeManager) isLatencyProbeDue(
 // probeEgress performs a single egress probe against a node via Cloudflare trace.
 // Writes back: RecordResult, RecordLatency (cloudflare.com), UpdateNodeEgressIP.
 func (m *ProbeManager) probeEgress(hash node.Hash, entry *node.NodeEntry) {
+	m.probeEgressGuarded(hash, entry, nil)
+}
+
+func (m *ProbeManager) probeEgressGuarded(hash node.Hash, entry *node.NodeEntry, guard *runtimeguard.Guard) {
 	if m.fetcher == nil {
+		return
+	}
+	if guard != nil && !guard.Allowed() {
 		return
 	}
 
@@ -930,7 +991,7 @@ func (m *ProbeManager) probeEgress(hash node.Hash, entry *node.NodeEntry) {
 		m.onProbeEvent("egress")
 	}
 
-	_, stage, err := m.performEgressProbe(m.probeCtx, hash, entry)
+	_, stage, err := m.performEgressProbeGuarded(m.probeCtx, hash, entry, guard)
 	if err != nil {
 		if stage == egressProbeParseError {
 			log.Printf("[probe] parse egress IP for %s: %v", hash.Hex(), err)
@@ -944,7 +1005,14 @@ func (m *ProbeManager) probeEgress(hash node.Hash, entry *node.NodeEntry) {
 // probeLatency performs a latency probe against a node using the configured test URL.
 // Writes back: RecordResult, RecordLatency.
 func (m *ProbeManager) probeLatency(hash node.Hash, entry *node.NodeEntry, testURL string) {
+	m.probeLatencyGuarded(hash, entry, testURL, nil)
+}
+
+func (m *ProbeManager) probeLatencyGuarded(hash node.Hash, entry *node.NodeEntry, testURL string, guard *runtimeguard.Guard) {
 	if m.fetcher == nil {
+		return
+	}
+	if guard != nil && !guard.Allowed() {
 		return
 	}
 
@@ -957,13 +1025,25 @@ func (m *ProbeManager) probeLatency(hash node.Hash, entry *node.NodeEntry, testU
 		m.onProbeEvent("latency")
 	}
 
-	if err := m.performLatencyProbe(m.probeCtx, hash, entry, testURL); err != nil {
+	if err := m.performLatencyProbeGuarded(m.probeCtx, hash, entry, testURL, guard); err != nil {
 		log.Printf("[probe] latency probe failed for %s: %v", hash.Hex(), err)
 		return
 	}
 }
 
 func (m *ProbeManager) performEgressProbe(ctx context.Context, hash node.Hash, entry *node.NodeEntry) (netip.Addr, egressProbeErrorStage, error) {
+	return m.performEgressProbeGuarded(ctx, hash, entry, nil)
+}
+
+func (m *ProbeManager) performEgressProbeGuarded(
+	ctx context.Context,
+	hash node.Hash,
+	entry *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) (netip.Addr, egressProbeErrorStage, error) {
+	if guard != nil && !guard.Allowed() {
+		return netip.Addr{}, egressProbeFetchError, errProbeEntryNotLive
+	}
 	body, latency, err := m.fetcher(ctx, entry, egressTraceURL)
 	if err != nil {
 		if ctx != nil {
@@ -971,8 +1051,17 @@ func (m *ProbeManager) performEgressProbe(ctx context.Context, hash node.Hash, e
 				return netip.Addr{}, egressProbeFetchError, ctxErr
 			}
 		}
-		m.pool.RecordResultForEntry(hash, entry, false)
-		m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+		if guard == nil {
+			m.pool.RecordResultForEntry(hash, entry, false)
+			m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+			return netip.Addr{}, egressProbeFetchError, err
+		}
+		if commitErr := m.commitGuardedProbeHealth(ctx, guard, func() {
+			m.pool.RecordResultForEntry(hash, entry, false)
+			m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+		}); commitErr != nil {
+			return netip.Addr{}, egressProbeFetchError, commitErr
+		}
 		return netip.Addr{}, egressProbeFetchError, err
 	}
 	if ctx != nil {
@@ -981,26 +1070,51 @@ func (m *ProbeManager) performEgressProbe(ctx context.Context, hash node.Hash, e
 		}
 	}
 
-	if !m.pool.RecordResultForEntry(hash, entry, true) {
-		return netip.Addr{}, egressProbeFetchError, errProbeEntryNotLive
-	}
-	if hook := m.afterProbeResultRecordHook; hook != nil {
-		hook()
-	}
-
 	ip, loc, err := ParseCloudflareTrace(body)
-	postErr := m.withProbePostProcessing(ctx, func() {
-		if latency > 0 {
-			m.pool.RecordLatencyForEntry(hash, entry, egressTraceDomain, &latency)
+	if guard == nil {
+		if !m.pool.RecordResultForEntry(hash, entry, true) {
+			return netip.Addr{}, egressProbeFetchError, errProbeEntryNotLive
 		}
-		if err != nil {
-			m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
-			return
+		if hook := m.afterProbeResultRecordHook; hook != nil {
+			hook()
 		}
-		m.pool.UpdateNodeEgressIPForEntry(hash, entry, &ip, loc)
-	})
-	if postErr != nil {
-		return netip.Addr{}, egressProbeFetchError, postErr
+		postErr := m.withProbePostProcessing(ctx, nil, func() {
+			if latency > 0 {
+				m.pool.RecordLatencyForEntry(hash, entry, egressTraceDomain, &latency)
+			}
+			if err != nil {
+				m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+				return
+			}
+			m.pool.UpdateNodeEgressIPForEntry(hash, entry, &ip, loc)
+		})
+		if postErr != nil {
+			return netip.Addr{}, egressProbeFetchError, postErr
+		}
+	} else {
+		healthRecorded := false
+		if commitErr := m.commitGuardedProbeHealth(ctx, guard, func() {
+			healthRecorded = m.pool.RecordResultForEntry(hash, entry, true)
+			if !healthRecorded {
+				return
+			}
+			if hook := m.afterProbeResultRecordHook; hook != nil {
+				hook()
+			}
+			if latency > 0 {
+				m.pool.RecordLatencyForEntry(hash, entry, egressTraceDomain, &latency)
+			}
+			if err != nil {
+				m.pool.UpdateNodeEgressIPForEntry(hash, entry, nil, nil)
+				return
+			}
+			m.pool.UpdateNodeEgressIPForEntry(hash, entry, &ip, loc)
+		}); commitErr != nil {
+			return netip.Addr{}, egressProbeFetchError, commitErr
+		}
+		if !healthRecorded {
+			return netip.Addr{}, egressProbeFetchError, errProbeEntryNotLive
+		}
 	}
 	if err != nil {
 		return netip.Addr{}, egressProbeParseError, err
@@ -1009,6 +1123,19 @@ func (m *ProbeManager) performEgressProbe(ctx context.Context, hash node.Hash, e
 }
 
 func (m *ProbeManager) performLatencyProbe(ctx context.Context, hash node.Hash, entry *node.NodeEntry, testURL string) error {
+	return m.performLatencyProbeGuarded(ctx, hash, entry, testURL, nil)
+}
+
+func (m *ProbeManager) performLatencyProbeGuarded(
+	ctx context.Context,
+	hash node.Hash,
+	entry *node.NodeEntry,
+	testURL string,
+	guard *runtimeguard.Guard,
+) error {
+	if guard != nil && !guard.Allowed() {
+		return errProbeEntryNotLive
+	}
 	domain := netutil.ExtractDomain(testURL)
 	_, latency, err := m.fetcher(ctx, entry, testURL)
 	if err != nil {
@@ -1017,8 +1144,17 @@ func (m *ProbeManager) performLatencyProbe(ctx context.Context, hash node.Hash, 
 				return ctxErr
 			}
 		}
-		m.pool.RecordResultForEntry(hash, entry, false)
-		m.pool.RecordLatencyForEntry(hash, entry, domain, nil)
+		if guard == nil {
+			m.pool.RecordResultForEntry(hash, entry, false)
+			m.pool.RecordLatencyForEntry(hash, entry, domain, nil)
+			return err
+		}
+		if commitErr := m.commitGuardedProbeHealth(ctx, guard, func() {
+			m.pool.RecordResultForEntry(hash, entry, false)
+			m.pool.RecordLatencyForEntry(hash, entry, domain, nil)
+		}); commitErr != nil {
+			return commitErr
+		}
 		return err
 	}
 	if ctx != nil {
@@ -1027,24 +1163,82 @@ func (m *ProbeManager) performLatencyProbe(ctx context.Context, hash node.Hash, 
 		}
 	}
 
-	if !m.pool.RecordResultForEntry(hash, entry, true) {
+	if guard == nil {
+		if !m.pool.RecordResultForEntry(hash, entry, true) {
+			return errProbeEntryNotLive
+		}
+		if hook := m.afterProbeResultRecordHook; hook != nil {
+			hook()
+		}
+		if err := m.withProbePostProcessing(ctx, nil, func() {
+			m.pool.RecordLatencyForEntry(hash, entry, domain, &latency)
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+	healthRecorded := false
+	if commitErr := m.commitGuardedProbeHealth(ctx, guard, func() {
+		healthRecorded = m.pool.RecordResultForEntry(hash, entry, true)
+		if !healthRecorded {
+			return
+		}
+		if hook := m.afterProbeResultRecordHook; hook != nil {
+			hook()
+		}
+		m.pool.RecordLatencyForEntry(hash, entry, domain, &latency)
+	}); commitErr != nil {
+		return commitErr
+	}
+	if !healthRecorded {
 		return errProbeEntryNotLive
 	}
-	if hook := m.afterProbeResultRecordHook; hook != nil {
+	return nil
+}
+
+// commitGuardedProbeHealth is the only final write path for scheduler-owned
+// probes. The hook is outside the gate so invalidation can complete while a
+// test or future admission seam is paused; the actual health writes are then
+// linearized by Guard.Commit.
+func (m *ProbeManager) commitGuardedProbeHealth(
+	ctx context.Context,
+	guard *runtimeguard.Guard,
+	fn func(),
+) error {
+	if guard == nil {
+		return errors.New("missing runtime guard")
+	}
+	if hook := m.beforeGuardCommitHook; hook != nil {
 		hook()
 	}
-	if err := m.withProbePostProcessing(ctx, func() {
-		m.pool.RecordLatencyForEntry(hash, entry, domain, &latency)
-	}); err != nil {
-		return err
+	var commitErr error
+	committed := guard.Commit(func() {
+		m.lifecycleMu.Lock()
+		defer m.lifecycleMu.Unlock()
+		if m.stopped {
+			commitErr = context.Canceled
+			return
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				commitErr = err
+				return
+			}
+		}
+		if fn != nil {
+			fn()
+		}
+	})
+	if !committed {
+		return errProbeEntryNotLive
 	}
-	return nil
+	return commitErr
 }
 
 // withProbePostProcessing owns the final health metadata write after the
 // result record. Stop uses the same lifecycle lock to close this admission, so
 // cancellation cannot land between the context check and the writeback.
-func (m *ProbeManager) withProbePostProcessing(ctx context.Context, fn func()) error {
+func (m *ProbeManager) withProbePostProcessing(ctx context.Context, guard *runtimeguard.Guard, fn func()) error {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
 	if m.stopped {
@@ -1054,6 +1248,9 @@ func (m *ProbeManager) withProbePostProcessing(ctx context.Context, fn func()) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+	if guard != nil && !guard.Allowed() {
+		return context.Canceled
 	}
 	if fn != nil {
 		fn()

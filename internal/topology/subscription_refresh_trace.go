@@ -12,23 +12,28 @@ import (
 type RefreshStage string
 
 const (
-	RefreshStageStart                   RefreshStage = "start"
-	RefreshStageFetchStart              RefreshStage = "fetch_start"
-	RefreshStageFetchEnd                RefreshStage = "fetch_end"
-	RefreshStageParseStart              RefreshStage = "parse_start"
-	RefreshStageParseEnd                RefreshStage = "parse_end"
-	RefreshStageApplyStart              RefreshStage = "apply_start"
-	RefreshStageApplyEnd                RefreshStage = "apply_end"
-	RefreshStageRuntimePreparationStart RefreshStage = "runtime_preparation_start"
-	RefreshStageRuntimePreparationEnd   RefreshStage = "runtime_preparation_end"
-	RefreshStageFinished                RefreshStage = "finished"
+	RefreshStageStart                       RefreshStage = "start"
+	RefreshStageFetchStart                  RefreshStage = "fetch_start"
+	RefreshStageFetchEnd                    RefreshStage = "fetch_end"
+	RefreshStageParseStart                  RefreshStage = "parse_start"
+	RefreshStageParseEnd                    RefreshStage = "parse_end"
+	RefreshStageApplyStart                  RefreshStage = "apply_start"
+	RefreshStageApplyEnd                    RefreshStage = "apply_end"
+	RefreshStageRuntimePreparationScheduled RefreshStage = "runtime_preparation_scheduled"
+	RefreshStageRuntimePreparationStart     RefreshStage = "runtime_preparation_start"
+	RefreshStageRuntimePreparationEnd       RefreshStage = "runtime_preparation_end"
+	RefreshStageFinished                    RefreshStage = "finished"
 )
 
 // RefreshEvent is a bounded observation for one subscription refresh. It
 // deliberately contains no source URL, response body, node options, or raw
 // error text.
 type RefreshEvent struct {
-	CorrelationID          string
+	CorrelationID string
+	// ParentCorrelationID links an asynchronous runtime-preparation lifecycle
+	// back to the committed refresh without making preparation events trailing
+	// stages of that refresh's commit trace.
+	ParentCorrelationID    string
 	SubscriptionID         string
 	AttemptSeq             int64
 	Stage                  RefreshStage
@@ -48,6 +53,7 @@ type RefreshObserver func(RefreshEvent)
 
 type refreshTrace struct {
 	correlationID          string
+	parentCorrelationID    string
 	subscriptionID         string
 	attemptSeq             int64
 	started                time.Time
@@ -84,12 +90,30 @@ func newRefreshTrace(
 	}
 }
 
+func newRuntimePreparationTrace(parent *refreshTrace) *refreshTrace {
+	if parent == nil {
+		return newRefreshTrace(context.Background(), "", 0, 0, 0, nil)
+	}
+	trace := newRefreshTrace(
+		context.Background(),
+		parent.subscriptionID,
+		parent.attemptSeq,
+		parent.fetchTotalTimeout,
+		parent.fetchAttemptTimeoutCap,
+		parent.observe,
+	)
+	trace.parentCorrelationID = parent.correlationID
+	trace.sourceType = parent.sourceType
+	return trace
+}
+
 func (t *refreshTrace) emit(stage RefreshStage, result string, preparedNodeCount int) {
 	if t == nil || t.observe == nil {
 		return
 	}
 	t.observe(RefreshEvent{
 		CorrelationID:          t.correlationID,
+		ParentCorrelationID:    t.parentCorrelationID,
 		SubscriptionID:         t.subscriptionID,
 		AttemptSeq:             t.attemptSeq,
 		Stage:                  stage,

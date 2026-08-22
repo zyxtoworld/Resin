@@ -11,6 +11,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/sagernet/sing-box/adapter"
 )
 
@@ -92,6 +93,9 @@ type OutboundManager struct {
 	// beforeRetirementLifecycleHook is a package-test seam immediately before
 	// shutdown enters the pool mutation boundary.
 	beforeRetirementLifecycleHook func()
+	// beforeGuardCommitHook is a package-test seam after external build work and
+	// before the guarded final commit. Production leaves it nil.
+	beforeGuardCommitHook func()
 }
 
 func NewOutboundManager(pool PoolAccessor, builder OutboundBuilder) *OutboundManager {
@@ -114,18 +118,37 @@ func (m *OutboundManager) isLiveEntry(hash node.Hash, entry *node.NodeEntry) boo
 // The NodeEntry owner serializes publication with retirement; losing builds
 // are discarded and closed.
 func (m *OutboundManager) EnsureNodeOutbound(hash node.Hash) {
-	m.ensureNodeOutbound(hash, nil)
+	m.ensureNodeOutbound(hash, nil, nil)
 }
 
 // EnsureNodeOutboundForEntry prepares an outbound only for the exact node
 // generation captured by the caller. A same-hash replacement is a different
 // owner and must be prepared by its own creation callback.
 func (m *OutboundManager) EnsureNodeOutboundForEntry(hash node.Hash, expected *node.NodeEntry) {
-	m.ensureNodeOutbound(hash, expected)
+	m.ensureNodeOutbound(hash, expected, nil)
 }
 
-func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.NodeEntry) {
+// EnsureNodeOutboundForEntryGuarded performs the same build, but refuses to
+// publish a result after the owning subscription generation is invalidated.
+// The guard is checked again while holding the short publication lock; no
+// lock spans the external builder.
+func (m *OutboundManager) EnsureNodeOutboundForEntryGuarded(
+	hash node.Hash,
+	expected *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) {
+	m.ensureNodeOutbound(hash, expected, guard)
+}
+
+func (m *OutboundManager) ensureNodeOutbound(
+	hash node.Hash,
+	expected *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) {
 	if m == nil || m.pool == nil {
+		return
+	}
+	if guard != nil && !guard.Allowed() {
 		return
 	}
 	m.lifecycleMu.Lock()
@@ -138,7 +161,7 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 	defer m.finishBuild()
 
 	entry, ok := m.pool.GetEntry(hash)
-	if !ok || (expected != nil && entry != expected) {
+	if !ok || (expected != nil && entry != expected) || (guard != nil && !guard.Allowed()) {
 		return
 	}
 	// Fast path: already has outbound.
@@ -157,33 +180,55 @@ func (m *OutboundManager) ensureNodeOutbound(hash node.Hash, expected *node.Node
 		// build may already have installed a usable outbound; that result owns
 		// the recovery state and a late failed attempt must not make the live
 		// entry look broken again.
-		m.lifecycleMu.Lock()
-		if entry.Outbound.Load() == nil {
-			entry.SetLastError("outbound build: " + err.Error())
+		commit := func() {
+			m.lifecycleMu.Lock()
+			defer m.lifecycleMu.Unlock()
+			if !m.closed && m.isLiveEntry(hash, entry) &&
+				(expected == nil || entry == expected) && entry.Outbound.Load() == nil {
+				entry.SetLastError("outbound build: " + err.Error())
+			}
 		}
-		m.lifecycleMu.Unlock()
+		if guard == nil {
+			commit()
+		} else {
+			guard.Commit(commit)
+		}
 		return
 	}
 
+	if guard != nil {
+		if hook := m.beforeGuardCommitHook; hook != nil {
+			hook()
+		}
+	}
 	// Serialize the final live-entry check and publication with Shutdown. A
 	// build may run for an arbitrary duration, so the lifecycle lock covers only
 	// this short commit point; a result built after admission closes is closed
-	// instead of escaping the shutdown retirement snapshot.
-	m.lifecycleMu.Lock()
-	if m.closed || !m.isLiveEntry(hash, entry) || (expected != nil && entry != expected) {
-		m.lifecycleMu.Unlock()
-		closeOutbound(ob)
-		return
+	// instead of escaping the shutdown retirement snapshot. A guarded commit
+	// also shares the subscription gate with invalidation, so invalidation
+	// cannot return between the token check and this publication.
+	installed := false
+	commit := func() {
+		m.lifecycleMu.Lock()
+		defer m.lifecycleMu.Unlock()
+		if m.closed || !m.isLiveEntry(hash, entry) || (expected != nil && entry != expected) {
+			return
+		}
+		installed = entry.InstallOutboundIfAbsent(ob)
+		if installed {
+			// Keep the recovery state update in the same lifecycle commit as the
+			// outbound publication, so a concurrent failed build cannot overwrite
+			// it after this clear.
+			entry.SetLastError("")
+		}
 	}
-	installed := entry.InstallOutboundIfAbsent(ob)
-	if installed {
-		// Keep the recovery state update in the same lifecycle commit as the
-		// outbound publication, so a concurrent failed build cannot overwrite
-		// it after this clear.
-		entry.SetLastError("")
+	committed := true
+	if guard == nil {
+		commit()
+	} else {
+		committed = guard.Commit(commit)
 	}
-	m.lifecycleMu.Unlock()
-	if !installed {
+	if !committed || !installed {
 		// Another goroutine won the race. Close the losing build result.
 		closeOutbound(ob)
 		return

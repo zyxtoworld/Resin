@@ -11,6 +11,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/scanloop"
 	"github.com/Resinat/Resin/internal/subscription"
 )
@@ -20,6 +21,132 @@ const schedulerLookahead = 15 * time.Second
 type nodeRuntimePreparation struct {
 	hash  node.Hash
 	entry *node.NodeEntry
+}
+
+type runtimePreparationRequest struct {
+	sub           *subscription.Subscription
+	configVersion int64
+	generation    int64
+	guard         *runtimeguard.Guard
+	candidates    map[node.Hash]*node.NodeEntry
+	batch         *runtimePreparationBatch
+}
+
+// runtimePreparationBatch owns lifecycle observation for one committed
+// refresh. The queue retains one candidate map per subscription at most; it
+// never retains one queued task per node or one waiting goroutine per refresh.
+type runtimePreparationBatch struct {
+	trace     *refreshTrace
+	mu        sync.Mutex
+	remaining int
+	total     int
+	started   bool
+	ended     bool
+	result    string
+}
+
+func newRuntimePreparationBatch(parent *refreshTrace) *runtimePreparationBatch {
+	return &runtimePreparationBatch{trace: newRuntimePreparationTrace(parent)}
+}
+
+func (b *runtimePreparationBatch) record(result string) {
+	if b == nil || result == "" {
+		return
+	}
+	b.mu.Lock()
+	b.result = mergeRuntimePreparationResult(b.result, result)
+	b.mu.Unlock()
+}
+
+func (b *runtimePreparationBatch) start() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.started || b.ended {
+		b.mu.Unlock()
+		return
+	}
+	b.started = true
+	total := b.total
+	b.mu.Unlock()
+	b.trace.emit(RefreshStageRuntimePreparationStart, "started", total)
+}
+
+func (b *runtimePreparationBatch) complete(result string) {
+	if b == nil {
+		return
+	}
+	var (
+		endResult string
+		endCount  int
+		shouldEnd bool
+	)
+	b.mu.Lock()
+	b.result = mergeRuntimePreparationResult(b.result, result)
+	if b.remaining > 0 {
+		b.remaining--
+	}
+	if b.remaining == 0 && !b.ended {
+		b.ended = true
+		endResult = b.result
+		if endResult == "" {
+			endResult = "dropped"
+		}
+		endCount = b.total
+		shouldEnd = true
+	}
+	b.mu.Unlock()
+	if shouldEnd {
+		b.trace.emit(RefreshStageRuntimePreparationEnd, endResult, endCount)
+	}
+}
+
+func (b *runtimePreparationBatch) finishEmpty(result string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.result = mergeRuntimePreparationResult(b.result, result)
+	if b.ended {
+		b.mu.Unlock()
+		return
+	}
+	b.remaining = 0
+	b.ended = true
+	endResult := b.result
+	if endResult == "" {
+		endResult = "dropped"
+	}
+	b.mu.Unlock()
+	b.trace.emit(RefreshStageRuntimePreparationEnd, endResult, 0)
+}
+
+func mergeRuntimePreparationResult(current, next string) string {
+	if next == "" {
+		return current
+	}
+	if current == "" || runtimePreparationResultRank(next) > runtimePreparationResultRank(current) {
+		return next
+	}
+	return current
+}
+
+func runtimePreparationResultRank(result string) int {
+	switch result {
+	case "error":
+		return 6
+	case "dropped":
+		return 5
+	case "stale":
+		return 4
+	case "completed":
+		return 3
+	case "coalesced":
+		return 2
+	default:
+		return 0
+	}
 }
 
 // SubscriptionScheduler manages periodic subscription updates.
@@ -54,6 +181,17 @@ type SubscriptionScheduler struct {
 	started     bool
 	stopped     bool
 	stopDone    chan struct{}
+
+	// Runtime preparation is scheduler-owned.  There is exactly one worker and
+	// at most one latest request per registered subscription.  A request keeps
+	// a bounded current-generation candidate map, never a per-node queue.
+	runtimePrepMu            sync.Mutex
+	runtimePrepWake          chan struct{}
+	runtimePrepPending       map[*subscription.Subscription]*runtimePreparationRequest
+	runtimePrepOrder         []*subscription.Subscription
+	runtimePrepHead          int
+	runtimePrepWorkerStarted bool
+	runtimePrepWorkerRuns    int // package-private evidence for bounded-worker tests
 
 	// Package-private test seam for the deterministic boundary after the
 	// worker's stop check and immediately before refresh source admission.
@@ -123,6 +261,8 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 		fetchTotalTimeout:      cfg.FetchTotalTimeout,
 		fetchAttemptTimeoutCap: cfg.FetchAttemptTimeoutCap,
 		stopCh:                 make(chan struct{}),
+		runtimePrepWake:        make(chan struct{}, 1),
+		runtimePrepPending:     make(map[*subscription.Subscription]*runtimePreparationRequest),
 	}
 	if cfg.Fetcher != nil {
 		sched.Fetcher = cfg.Fetcher
@@ -293,6 +433,221 @@ func (s *SubscriptionScheduler) startTracked(fn func()) bool {
 	return true
 }
 
+func (s *SubscriptionScheduler) schedulerStopped() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// enqueueRuntimePreparation publishes one latest-generation request for a
+// subscription.  The pending set is bounded by the registered subscription
+// identities, not by an arbitrary node-count constant.  A newer request
+// atomically replaces an older pending request for the same subscription; the
+// worker later walks that request's current-generation hash/entry candidates.
+func (s *SubscriptionScheduler) enqueueRuntimePreparation(
+	sub *subscription.Subscription,
+	configVersion int64,
+	generation int64,
+	candidates map[node.Hash]*node.NodeEntry,
+	parent *refreshTrace,
+) (accepted bool) {
+	if len(candidates) == 0 {
+		return false
+	}
+	batch := newRuntimePreparationBatch(parent)
+	if s.schedulerStopped() {
+		batch.record("dropped")
+		batch.finishEmpty("dropped")
+		return false
+	}
+	request := &runtimePreparationRequest{
+		sub:           sub,
+		configVersion: configVersion,
+		generation:    generation,
+		guard:         sub.RuntimePreparationGuard(),
+		candidates:    cloneRuntimePreparationCandidates(candidates),
+		batch:         batch,
+	}
+	batch.total = len(request.candidates)
+	batch.remaining = batch.total
+	// Publish the scheduled lifecycle event before making the request visible
+	// to the worker. Otherwise an already-running worker can emit start/end
+	// before this goroutine gets to the observer callback.
+	batch.trace.emit(RefreshStageRuntimePreparationScheduled, "scheduled", batch.total)
+	var replaced *runtimePreparationRequest
+	needStart := false
+
+	s.runtimePrepMu.Lock()
+	if s.schedulerStopped() {
+		s.runtimePrepMu.Unlock()
+		batch.record("dropped")
+		batch.finishEmpty("dropped")
+		return false
+	}
+	if old, ok := s.runtimePrepPending[sub]; ok {
+		replaced = old
+		s.runtimePrepPending[sub] = request
+	} else {
+		s.runtimePrepPending[sub] = request
+		s.runtimePrepOrder = append(s.runtimePrepOrder, sub)
+	}
+	if !s.runtimePrepWorkerStarted {
+		s.runtimePrepWorkerStarted = true
+		needStart = true
+	}
+	s.runtimePrepMu.Unlock()
+
+	// Scheduling is a separate lifecycle. It has its own correlation ID so the
+	// commit trace cannot acquire trailing preparation stages.
+	if replaced != nil {
+		replaced.batch.finishEmpty("coalesced")
+	}
+
+	if needStart && !s.startTracked(s.runRuntimePreparationWorker) {
+		// Stop won the worker-admission race.  The worker never existed, so
+		// remove the pending requests and complete their batches synchronously.
+		var toDrop []*runtimePreparationRequest
+		s.runtimePrepMu.Lock()
+		if s.runtimePrepWorkerStarted {
+			s.runtimePrepWorkerStarted = false
+			for subID, request := range s.runtimePrepPending {
+				delete(s.runtimePrepPending, subID)
+				toDrop = append(toDrop, request)
+			}
+			s.runtimePrepOrder = nil
+			s.runtimePrepHead = 0
+		}
+		s.runtimePrepMu.Unlock()
+		for _, request := range toDrop {
+			request.batch.finishEmpty("dropped")
+		}
+		return false
+	}
+	nonBlockingSignal(s.runtimePrepWake)
+	return true
+}
+
+func cloneRuntimePreparationCandidates(
+	candidates map[node.Hash]*node.NodeEntry,
+) map[node.Hash]*node.NodeEntry {
+	copyOf := make(map[node.Hash]*node.NodeEntry, len(candidates))
+	for hash, entry := range candidates {
+		if entry != nil {
+			copyOf[hash] = entry
+		}
+	}
+	return copyOf
+}
+
+func nonBlockingSignal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (s *SubscriptionScheduler) dequeueRuntimePreparation() *runtimePreparationRequest {
+	s.runtimePrepMu.Lock()
+	defer s.runtimePrepMu.Unlock()
+	for s.runtimePrepHead < len(s.runtimePrepOrder) {
+		sub := s.runtimePrepOrder[s.runtimePrepHead]
+		s.runtimePrepHead++
+		request, ok := s.runtimePrepPending[sub]
+		if !ok {
+			continue
+		}
+		delete(s.runtimePrepPending, sub)
+		if s.runtimePrepHead > 1024 && s.runtimePrepHead*2 >= len(s.runtimePrepOrder) {
+			s.runtimePrepOrder = append([]*subscription.Subscription(nil), s.runtimePrepOrder[s.runtimePrepHead:]...)
+			s.runtimePrepHead = 0
+		}
+		return request
+	}
+	if s.runtimePrepHead == len(s.runtimePrepOrder) {
+		s.runtimePrepOrder = nil
+		s.runtimePrepHead = 0
+	}
+	return nil
+}
+
+func (s *SubscriptionScheduler) runRuntimePreparationWorker() {
+	defer func() {
+		s.runtimePrepMu.Lock()
+		s.runtimePrepWorkerStarted = false
+		s.runtimePrepMu.Unlock()
+	}()
+	s.runtimePrepMu.Lock()
+	s.runtimePrepWorkerRuns++
+	s.runtimePrepMu.Unlock()
+	for {
+		if request := s.dequeueRuntimePreparation(); request != nil {
+			s.executeRuntimePreparation(request)
+			continue
+		}
+		if s.schedulerStopped() {
+			return
+		}
+		select {
+		case <-s.runtimePrepWake:
+		case <-s.stopCh:
+		}
+	}
+}
+
+func (s *SubscriptionScheduler) runtimePreparationStillCurrent(
+	request *runtimePreparationRequest,
+	hash node.Hash,
+	expected *node.NodeEntry,
+) bool {
+	if request == nil || request.sub == nil || expected == nil {
+		return false
+	}
+	if s.pool == nil {
+		return false
+	}
+	sub := request.sub
+	if s.subManager != nil && s.subManager.Lookup(sub.ID) != sub {
+		return false
+	}
+	if request.guard == nil || !request.guard.Allowed() || !sub.Enabled() || sub.ConfigVersion() != request.configVersion || sub.LastAppliedSeq() != request.generation {
+		return false
+	}
+	managed, ok := sub.ManagedNodes().LoadNode(hash)
+	if !ok || managed.Evicted {
+		return false
+	}
+	current, ok := s.pool.GetEntry(hash)
+	return ok && current == expected
+}
+
+func (s *SubscriptionScheduler) executeRuntimePreparation(request *runtimePreparationRequest) {
+	if request == nil || request.batch == nil {
+		return
+	}
+	request.batch.start()
+	for hash, expected := range request.candidates {
+		result := "completed"
+		if !s.runtimePreparationStillCurrent(request, hash, expected) {
+			request.batch.complete("stale")
+			continue
+		}
+		// The epoch guard is checked by the pool immediately before invoking
+		// the guarded callback. The callback must re-check it at outbound final
+		// publication and probe queue admission; no scheduler lock spans that
+		// external work.
+		s.pool.RunNodeAddedRuntimeIf(hash, expected, request.guard)
+		if !s.runtimePreparationStillCurrent(request, hash, expected) {
+			result = "stale"
+		} else if expected.GetLastError() != "" {
+			result = "error"
+		}
+		request.batch.complete(result)
+	}
+}
+
 func (s *SubscriptionScheduler) tick() {
 	select {
 	case <-s.stopCh:
@@ -431,8 +786,11 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 		s.onRefreshEvent,
 	)
 	trace.emit(RefreshStageStart, "started", 0)
+	commitFinished := false
 	defer func() {
-		trace.emit(RefreshStageFinished, refreshResult(ctx, refreshErr), 0)
+		if !commitFinished {
+			trace.emit(RefreshStageFinished, refreshResult(ctx, refreshErr), 0)
+		}
 	}()
 	ctx = netutil.WithRequestCorrelationID(ctx, trace.correlationID)
 	if err := ctx.Err(); err != nil {
@@ -535,7 +893,7 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 	applied := false
 	mutationAdmitted := true
 	var runtimeMutationErr error
-	var runtimePreparation []nodeRuntimePreparation
+	var runtimePreparationCandidates map[node.Hash]*node.NodeEntry
 	trace.emit(RefreshStageApplyStart, "started", 0)
 	if hook := s.beforeRefreshApplyLockHook; hook != nil {
 		hook()
@@ -616,7 +974,10 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 					continue
 				}
 				if entry := s.pool.AddNodeFromSubWithPersistenceForRuntimeBatch(h, raw, sub.ID, admission); entry != nil {
-					runtimePreparation = append(runtimePreparation, nodeRuntimePreparation{hash: h, entry: entry})
+					if runtimePreparationCandidates == nil {
+						runtimePreparationCandidates = make(map[node.Hash]*node.NodeEntry)
+					}
+					runtimePreparationCandidates[h] = entry
 				}
 			}
 			for _, h := range kept {
@@ -634,7 +995,10 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 					continue
 				}
 				if entry := s.pool.AddNodeFromSubWithPersistenceForRuntimeBatch(h, raw, sub.ID, admission); entry != nil {
-					runtimePreparation = append(runtimePreparation, nodeRuntimePreparation{hash: h, entry: entry})
+					if runtimePreparationCandidates == nil {
+						runtimePreparationCandidates = make(map[node.Hash]*node.NodeEntry)
+					}
+					runtimePreparationCandidates[h] = entry
 				}
 			}
 			for _, h := range removed {
@@ -684,15 +1048,24 @@ func (s *SubscriptionScheduler) updateSubscriptionResult(ctx context.Context, su
 		log.Printf("[scheduler] stale success ignored for %s", sub.ID)
 		return nil
 	}
-	trace.emit(RefreshStageApplyEnd, "ok", len(runtimePreparation))
-	trace.emit(RefreshStageRuntimePreparationStart, "started", len(runtimePreparation))
-	for _, prep := range runtimePreparation {
-		s.pool.RunNodeAddedRuntime(prep.hash, prep.entry)
-	}
-	trace.emit(RefreshStageRuntimePreparationEnd, "ok", len(runtimePreparation))
+	trace.emit(RefreshStageApplyEnd, "ok", 0)
 
 	if s.onSubUpdated != nil {
 		s.onSubUpdated(sub)
+	}
+	// The persistence callback is the subscription commit gate.  The commit
+	// event is deliberately emitted before the independent preparation trace;
+	// no runtime-preparation event is appended to this refresh trace.
+	trace.emit(RefreshStageFinished, "committed", 0)
+	commitFinished = true
+	if len(runtimePreparationCandidates) != 0 {
+		s.enqueueRuntimePreparation(
+			sub,
+			attemptConfigVersion,
+			attemptSeq,
+			runtimePreparationCandidates,
+			trace,
+		)
 	}
 	return nil
 }

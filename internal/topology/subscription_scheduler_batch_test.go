@@ -67,6 +67,7 @@ func TestSchedulerRefreshDoesNotExposeMixedRuntimeGeneration(t *testing.T) {
 			return makeSubscriptionJSON(newRaw), nil
 		},
 	})
+	t.Cleanup(scheduler.Stop)
 	refreshDone := make(chan bool, 1)
 	go func() { refreshDone <- scheduler.UpdateSubscription(sub) }()
 	select {
@@ -101,7 +102,7 @@ func TestSchedulerRefreshDoesNotExposeMixedRuntimeGeneration(t *testing.T) {
 	}
 }
 
-func TestSchedulerRefreshDoesNotHoldRuntimeReadLockDuringNodePreparation(t *testing.T) {
+func TestSchedulerRefreshCommitsBeforeRuntimePreparationFinishes(t *testing.T) {
 	pool, sub := newPoolPickerTestPool(t, nil)
 	newRaw := `{"type":"vmess","tag":"prepared-outside-batch","server":"2.2.2.2","server_port":443}`
 	newHash := node.HashFromRawOptions([]byte(newRaw))
@@ -134,6 +135,7 @@ func TestSchedulerRefreshDoesNotHoldRuntimeReadLockDuringNodePreparation(t *test
 			return makeSubscriptionJSON(newRaw), nil
 		},
 	})
+	t.Cleanup(scheduler.Stop)
 	refreshDone := make(chan bool, 1)
 	go func() { refreshDone <- scheduler.UpdateSubscription(sub) }()
 	select {
@@ -153,15 +155,16 @@ func TestSchedulerRefreshDoesNotHoldRuntimeReadLockDuringNodePreparation(t *test
 		t.Fatal("runtime read remained blocked by external node preparation")
 	}
 
-	close(allowPrep)
 	select {
 	case ok := <-refreshDone:
 		if !ok {
 			t.Fatal("refresh was not admitted")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("refresh did not finish after node preparation")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("refresh did not return while background runtime preparation was blocked")
 	}
+
+	close(allowPrep)
 }
 
 func TestSchedulerRefreshDoesNotHoldRuntimeReadLockDuringPlatformNotify(t *testing.T) {
@@ -208,6 +211,7 @@ func TestSchedulerRefreshDoesNotHoldRuntimeReadLockDuringPlatformNotify(t *testi
 			return makeSubscriptionJSON(newRaw), nil
 		},
 	})
+	t.Cleanup(scheduler.Stop)
 	refreshDone := make(chan bool, 1)
 	go func() { refreshDone <- scheduler.UpdateSubscription(sub) }()
 	select {
@@ -283,6 +287,7 @@ func TestSchedulerRuntimePreparationDoesNotCrossEntryGeneration(t *testing.T) {
 			return makeSubscriptionJSON(raw), nil
 		},
 	})
+	t.Cleanup(scheduler.Stop)
 	refreshDone := make(chan bool, 1)
 	go func() { refreshDone <- scheduler.UpdateSubscription(sub) }()
 	select {
@@ -319,8 +324,8 @@ func TestSchedulerRuntimePreparationDoesNotCrossEntryGeneration(t *testing.T) {
 		if !ok {
 			t.Fatal("refresh was not admitted")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("refresh did not finish after stale preparation was released")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("refresh did not commit before background preparation was released")
 	}
 	select {
 	case got := <-callbacks:

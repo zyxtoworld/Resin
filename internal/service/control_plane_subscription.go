@@ -726,7 +726,7 @@ func (s *ControlPlaneService) DeleteSubscriptionContext(ctx context.Context, id 
 				for _, h := range managedHashes {
 					s.Pool.RemoveNodeFromSub(h, id)
 				}
-				s.SubMgr.Unregister(id)
+				s.SubMgr.UnregisterExact(id, sub)
 			})
 			return deleteErr
 		})

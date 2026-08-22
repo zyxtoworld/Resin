@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/Resinat/Resin/internal/topology"
 	"github.com/sagernet/sing-box/adapter"
@@ -332,6 +333,58 @@ func TestEnsureNodeOutboundForEntryRejectsStaleGeneration(t *testing.T) {
 	}
 	if !entryB.HasOutbound() {
 		t.Fatal("current generation did not receive its outbound")
+	}
+}
+
+func TestEnsureNodeOutboundGuardRejectsEpochChangedDuringBuild(t *testing.T) {
+	entry := newTestEntry(`{"type":"guarded-build"}`)
+	pool := &mockPool{}
+	pool.addEntry(entry)
+	builder := newBlockingClosableBuilder()
+	mgr := NewOutboundManager(pool, builder)
+	gate := runtimeguard.NewGate()
+	guard := gate.Capture()
+	commitEntered := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	mgr.beforeGuardCommitHook = func() {
+		if !guard.Allowed() {
+			t.Fatal("guard was invalid before the final publication seam")
+		}
+		close(commitEntered)
+		<-releaseCommit
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mgr.EnsureNodeOutboundForEntryGuarded(entry.Hash, entry, guard)
+	}()
+	<-builder.started
+	close(builder.release)
+	select {
+	case <-commitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("guarded build did not reach final commit seam")
+	}
+	invalidated := make(chan struct{})
+	go func() {
+		gate.Invalidate()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		t.Fatal("invalidation waited behind work that had not entered the commit gate")
+	}
+	close(releaseCommit)
+	<-done
+	if entry.HasOutbound() {
+		t.Fatal("epoch-invalidated build published an outbound")
+	}
+	if got := entry.GetLastError(); got != "" {
+		t.Fatalf("epoch-invalidated build wrote LastError: %q", got)
+	}
+	if !builder.firstBuilt(t).closed.Load() {
+		t.Fatal("epoch-invalidated outbound was not closed")
 	}
 }
 

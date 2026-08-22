@@ -18,6 +18,7 @@ import (
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/platform"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/subscription"
 	"github.com/puzpuzpuz/xsync/v4"
 )
@@ -89,6 +90,10 @@ type GlobalNodePool struct {
 	// Package-private test seam immediately before an out-of-band node runtime
 	// preparation callback. Production leaves it nil.
 	beforeNodeAddedRuntimeHook func(node.Hash, *node.NodeEntry)
+	// Package-private test seam after the scheduler guard and immediately
+	// before the external callback. Production leaves it nil. The scheduler's
+	// subscription ownership gate remains held across this boundary.
+	beforeNodeAddedRuntimeCallbackHook func(node.Hash, *node.NodeEntry)
 	// Package-private test seam immediately before a context-aware platform
 	// rebuild attempts the platform read lock. Production leaves it nil.
 	beforePlatformReadLockHook func()
@@ -103,7 +108,8 @@ type GlobalNodePool struct {
 	onNodeAdded                       func(hash node.Hash) // called after a new node is created
 	onNodeAddedWithPersistence        func(hash node.Hash, admission PersistenceAdmission)
 	onNodeAddedRuntime                func(hash node.Hash, expected *node.NodeEntry) // runtime preparation; runs outside nodeLifecycleMu
-	onNodeRemoved                     func(hash node.Hash, entry *node.NodeEntry)    // called after a node is deleted from pool
+	onNodeAddedRuntimeGuarded         func(hash node.Hash, expected *node.NodeEntry, guard *runtimeguard.Guard)
+	onNodeRemoved                     func(hash node.Hash, entry *node.NodeEntry) // called after a node is deleted from pool
 	onSubNodeChanged                  func(subID string, hash node.Hash, added bool)
 	onSubNodeChangedWithPersistence   func(subID string, hash node.Hash, added bool, admission PersistenceAdmission)
 	onFinalNodeRemoved                func(subID string, hash node.Hash, entry *node.NodeEntry) // called for the last subscription reference removal; replaces the ordinary remove callback
@@ -160,7 +166,11 @@ type PoolConfig struct {
 	// OnNodeAddedRuntime prepares external runtime resources for a newly
 	// created node. It runs after the pool lifecycle mutation is unlocked, so
 	// arbitrary builder/runtime work cannot block unrelated node mutations.
-	OnNodeAddedRuntime              func(hash node.Hash, expected *node.NodeEntry)
+	OnNodeAddedRuntime func(hash node.Hash, expected *node.NodeEntry)
+	// OnNodeAddedRuntimeGuarded is used by deferred subscription preparation.
+	// The callback must pass the guard to every expensive producer's final
+	// publication/admission point.
+	OnNodeAddedRuntimeGuarded       func(hash node.Hash, expected *node.NodeEntry, guard *runtimeguard.Guard)
 	OnNodeRemoved                   func(hash node.Hash, entry *node.NodeEntry)
 	OnSubNodeChanged                func(subID string, hash node.Hash, added bool)
 	OnSubNodeChangedWithPersistence func(subID string, hash node.Hash, added bool, admission PersistenceAdmission)
@@ -214,6 +224,7 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		onNodeAdded:                       cfg.OnNodeAdded,
 		onNodeAddedWithPersistence:        cfg.OnNodeAddedWithPersistence,
 		onNodeAddedRuntime:                cfg.OnNodeAddedRuntime,
+		onNodeAddedRuntimeGuarded:         cfg.OnNodeAddedRuntimeGuarded,
 		onNodeRemoved:                     cfg.OnNodeRemoved,
 		onSubNodeChanged:                  cfg.OnSubNodeChanged,
 		onSubNodeChangedWithPersistence:   cfg.OnSubNodeChangedWithPersistence,
@@ -302,7 +313,7 @@ func (p *GlobalNodePool) addNodeFromSub(
 	p.nodeGeneration.Add(1)
 	p.nodeLifecycleMu.Unlock()
 	if isNew && runRuntime {
-		p.runNodeAddedRuntime(hash, runtimeEntry)
+		p.runNodeAddedRuntime(hash, runtimeEntry, nil)
 	}
 
 	p.notifyAllPlatformsDirty(hash)
@@ -1229,16 +1240,41 @@ func (p *GlobalNodePool) SetOnNodeAddedRuntime(fn func(hash node.Hash, expected 
 	p.onNodeAddedRuntime = fn
 }
 
+// SetOnNodeAddedRuntimeGuarded configures the deferred-preparation callback.
+// Direct pool additions continue to use the legacy callback; scheduler-owned
+// work with a generation guard is dispatched here.
+func (p *GlobalNodePool) SetOnNodeAddedRuntimeGuarded(
+	fn func(hash node.Hash, expected *node.NodeEntry, guard *runtimeguard.Guard),
+) {
+	p.onNodeAddedRuntimeGuarded = fn
+}
+
 // RunNodeAddedRuntime runs the configured external preparation callback for a
 // node after the caller has completed its runtime publication critical
 // section. It is intentionally separate from AddNodeFromSub's membership
 // mutation so expensive builders and probes do not run under runtimeBatchMu.
 func (p *GlobalNodePool) RunNodeAddedRuntime(hash node.Hash, expected *node.NodeEntry) {
-	p.runNodeAddedRuntime(hash, expected)
+	p.runNodeAddedRuntime(hash, expected, nil)
 }
 
-func (p *GlobalNodePool) runNodeAddedRuntime(hash node.Hash, expected *node.NodeEntry) {
-	if p == nil || expected == nil || p.onNodeAddedRuntime == nil {
+// RunNodeAddedRuntimeIf is the guarded form used by scheduler-owned deferred
+// preparation. The entry identity and guard are rechecked at this admission
+// boundary. This is deliberately not a lifecycle lock; the guarded callback
+// must recheck its token at every final publication/admission point.
+func (p *GlobalNodePool) RunNodeAddedRuntimeIf(
+	hash node.Hash,
+	expected *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) {
+	p.runNodeAddedRuntime(hash, expected, guard)
+}
+
+func (p *GlobalNodePool) runNodeAddedRuntime(
+	hash node.Hash,
+	expected *node.NodeEntry,
+	guard *runtimeguard.Guard,
+) {
+	if p == nil || expected == nil || (p.onNodeAddedRuntime == nil && p.onNodeAddedRuntimeGuarded == nil) {
 		return
 	}
 	current, ok := p.nodes.Load(hash)
@@ -1253,6 +1289,19 @@ func (p *GlobalNodePool) runNodeAddedRuntime(hash node.Hash, expected *node.Node
 	// immediately before any external builder/probe is allowed to run.
 	current, ok = p.nodes.Load(hash)
 	if !ok || current != expected {
+		return
+	}
+	if guard != nil && !guard.Allowed() {
+		return
+	}
+	if hook := p.beforeNodeAddedRuntimeCallbackHook; hook != nil {
+		hook(hash, expected)
+	}
+	if guard != nil && !guard.Allowed() {
+		return
+	}
+	if p.onNodeAddedRuntimeGuarded != nil && guard != nil {
+		p.onNodeAddedRuntimeGuarded(hash, expected, guard)
 		return
 	}
 	p.onNodeAddedRuntime(hash, expected)

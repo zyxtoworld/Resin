@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/puzpuzpuz/xsync/v4"
 )
 
@@ -190,6 +191,9 @@ type Subscription struct {
 	// configVersion is incremented whenever refresh-input-related config changes
 	// (URL/source/content/update-interval). Scheduler uses it for stale-guard.
 	configVersion atomic.Int64
+	// runtimeGate linearizes short deferred-runtime publication with lifecycle
+	// invalidation. External builders/probes never hold this gate.
+	runtimeGate *runtimeguard.Gate
 }
 
 // ConfigSnapshot is an immutable copy of the persisted subscription
@@ -230,6 +234,7 @@ func NewSubscription(id, name, url string, enabled, ephemeral bool) *Subscriptio
 	emptyErr := ""
 	s.LastError.Store(&emptyErr)
 	s.configVersion.Store(1)
+	s.runtimeGate = runtimeguard.NewGate()
 	return s
 }
 
@@ -245,8 +250,18 @@ func (s *Subscription) NextAttemptSeq() int64 { return s.attemptSeq.Add(1) }
 // LastAppliedSeq returns the latest committed refresh result sequence.
 func (s *Subscription) LastAppliedSeq() int64 { return s.lastAppliedSeq.Load() }
 
-// MarkAppliedAttempt records the latest committed refresh result sequence.
-func (s *Subscription) MarkAppliedAttempt(seq int64) { s.lastAppliedSeq.Store(seq) }
+// MarkAppliedAttempt records the latest committed refresh result sequence and
+// invalidates deferred runtime work captured for an older result.
+func (s *Subscription) MarkAppliedAttempt(seq int64) {
+	if s == nil {
+		return
+	}
+	if s.runtimeGate == nil {
+		s.lastAppliedSeq.Store(seq)
+		return
+	}
+	s.runtimeGate.Mutate(func() { s.lastAppliedSeq.Store(seq) })
+}
 
 // WithOpLock runs fn under the subscription operation lock.
 func (s *Subscription) WithOpLock(fn func()) {
@@ -354,35 +369,55 @@ func (s *Subscription) UpdateIntervalNs() int64 {
 
 // SetFetchConfig updates URL and update interval together atomically under lock.
 func (s *Subscription) SetFetchConfig(url string, updateIntervalNs int64) {
-	s.mu.Lock()
-	changed := s.url != url || s.updateIntervalNs != updateIntervalNs
-	s.url = url
-	s.updateIntervalNs = updateIntervalNs
-	if changed {
-		s.configVersion.Add(1)
+	mutate := func() {
+		s.mu.Lock()
+		if s.url != url || s.updateIntervalNs != updateIntervalNs {
+			s.url = url
+			s.updateIntervalNs = updateIntervalNs
+			s.configVersion.Add(1)
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
+	if s.runtimeGate == nil {
+		mutate()
+		return
+	}
+	s.runtimeGate.Mutate(mutate)
 }
 
 // SetSourceType updates subscription source type (thread-safe).
 func (s *Subscription) SetSourceType(sourceType string) {
 	sourceType = normalizeSourceType(sourceType)
-	s.mu.Lock()
-	if s.sourceType != sourceType {
-		s.sourceType = sourceType
-		s.configVersion.Add(1)
+	mutate := func() {
+		s.mu.Lock()
+		if s.sourceType != sourceType {
+			s.sourceType = sourceType
+			s.configVersion.Add(1)
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
+	if s.runtimeGate == nil {
+		mutate()
+		return
+	}
+	s.runtimeGate.Mutate(mutate)
 }
 
 // SetContent updates local subscription content (thread-safe).
 func (s *Subscription) SetContent(content string) {
-	s.mu.Lock()
-	if s.content != content {
-		s.content = content
-		s.configVersion.Add(1)
+	mutate := func() {
+		s.mu.Lock()
+		if s.content != content {
+			s.content = content
+			s.configVersion.Add(1)
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
+	if s.runtimeGate == nil {
+		mutate()
+		return
+	}
+	s.runtimeGate.Mutate(mutate)
 }
 
 // Name returns the subscription name (thread-safe).
@@ -408,9 +443,20 @@ func (s *Subscription) Enabled() bool {
 
 // SetEnabled updates the enabled flag (thread-safe).
 func (s *Subscription) SetEnabled(v bool) {
-	s.mu.Lock()
-	s.enabled = v
-	s.mu.Unlock()
+	if s == nil {
+		return
+	}
+	if s.runtimeGate == nil {
+		s.mu.Lock()
+		s.enabled = v
+		s.mu.Unlock()
+		return
+	}
+	s.runtimeGate.Mutate(func() {
+		s.mu.Lock()
+		s.enabled = v
+		s.mu.Unlock()
+	})
 }
 
 // Ephemeral returns whether the subscription is ephemeral (thread-safe).
@@ -462,7 +508,36 @@ func (s *Subscription) ManagedNodes() *ManagedNodes {
 
 // SwapManagedNodes atomically replaces the managed nodes view.
 func (s *Subscription) SwapManagedNodes(m *ManagedNodes) {
-	s.managedNodes.Store(m)
+	if s == nil {
+		return
+	}
+	if s.runtimeGate == nil {
+		s.managedNodes.Store(m)
+		return
+	}
+	s.runtimeGate.Mutate(func() { s.managedNodes.Store(m) })
+}
+
+// InvalidateRuntimePreparation invalidates deferred runtime work. It never
+// waits for an external builder.
+func (s *Subscription) InvalidateRuntimePreparation() {
+	if s == nil {
+		return
+	}
+	if s.runtimeGate != nil {
+		s.runtimeGate.Invalidate()
+	}
+}
+
+// RuntimePreparationGuard captures the current lifecycle generation.
+func (s *Subscription) RuntimePreparationGuard() *runtimeguard.Guard {
+	if s == nil {
+		return nil
+	}
+	if s.runtimeGate == nil {
+		return nil
+	}
+	return s.runtimeGate.Capture()
 }
 
 // DiffHashes computes the hash diff between old and new managed-nodes maps.

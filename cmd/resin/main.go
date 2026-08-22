@@ -27,6 +27,7 @@ import (
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/routing"
+	"github.com/Resinat/Resin/internal/runtimeguard"
 	"github.com/Resinat/Resin/internal/service"
 	"github.com/Resinat/Resin/internal/state"
 	"github.com/Resinat/Resin/internal/subscription"
@@ -322,6 +323,10 @@ func newTopologyRuntime(
 		// No NotifyNodeDirty here — AddNodeFromSub already notifies all platforms.
 		probeMgr.TriggerImmediateEgressProbeForEntry(hash, expected)
 	})
+	pool.SetOnNodeAddedRuntimeGuarded(func(hash node.Hash, expected *node.NodeEntry, guard *runtimeguard.Guard) {
+		outboundMgr.EnsureNodeOutboundForEntryGuarded(hash, expected, guard)
+		probeMgr.TriggerImmediateEgressProbeForEntryGuarded(hash, expected, guard)
+	})
 	pool.SetOnNodeRemoved(func(hash node.Hash, entry *node.NodeEntry) {
 		outboundMgr.RemoveNodeOutbound(entry)
 		if entry != nil && entry.LatencyTable != nil {
@@ -345,8 +350,9 @@ func newTopologyRuntime(
 				callerDeadline = event.CallerDeadline.UTC().Format(time.RFC3339Nano)
 			}
 			log.Printf(
-				"subscription_refresh correlation_id=%s subscription_id=%s attempt_seq=%d stage=%s source_type=%s elapsed_ms=%d result=%s caller_deadline=%s fetch_total_timeout=%s fetch_attempt_timeout_cap=%s prepared_nodes=%d",
+				"subscription_refresh correlation_id=%s parent_correlation_id=%s subscription_id=%s attempt_seq=%d stage=%s source_type=%s elapsed_ms=%d result=%s caller_deadline=%s fetch_total_timeout=%s fetch_attempt_timeout_cap=%s prepared_nodes=%d",
 				event.CorrelationID,
+				event.ParentCorrelationID,
 				event.SubscriptionID,
 				event.AttemptSeq,
 				event.Stage,
