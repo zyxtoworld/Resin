@@ -34,6 +34,9 @@ type GetEntryFunc func(node.Hash) (*node.NodeEntry, bool)
 type Platform struct {
 	ID   string
 	Name string
+	// RevisionNs is the persisted platform update timestamp copied into this
+	// immutable runtime generation. It is diagnostic identity only.
+	RevisionNs int64
 
 	// Filter configuration.
 	RegexFilters  node.TagFilter

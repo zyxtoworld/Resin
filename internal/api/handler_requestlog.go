@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/observability"
+	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 )
 
@@ -190,7 +191,7 @@ func HandleGetRequestLog(repo *requestlog.Repo, projector *observability.Project
 			return
 		}
 
-		WriteJSON(w, http.StatusOK, toLogListItem(projector, *row))
+		WriteJSON(w, http.StatusOK, toLogDetailItem(projector, *row))
 	})
 }
 
@@ -280,78 +281,102 @@ func parseStrictBoolQuery(w http.ResponseWriter, r *http.Request, key string) (*
 // --- Response types ---
 
 type logListItem struct {
-	ID                   string `json:"id"`
-	Ts                   string `json:"ts"`
-	ProxyType            int    `json:"proxy_type"`
-	ClientIP             string `json:"client_ip"`
-	PlatformID           string `json:"platform_id"`
-	PlatformName         string `json:"platform_name"`
-	Account              string `json:"account"`
-	AccountRedacted      bool   `json:"account_redacted"`
-	TargetHost           string `json:"target_host"`
-	TargetURL            string `json:"target_url"`
-	NodeHash             string `json:"node_hash"`
-	NodeTag              string `json:"node_tag"`
-	EgressIP             string `json:"egress_ip"`
-	DurationMs           int64  `json:"duration_ms"`
-	FirstByteDurationMs  int64  `json:"first_byte_duration_ms"`
-	NetOK                bool   `json:"net_ok"`
-	HTTPMethod           string `json:"http_method"`
-	HTTPStatus           int    `json:"http_status"`
-	ResinError           string `json:"resin_error"`
-	UpstreamStage        string `json:"upstream_stage"`
-	UpstreamErrKind      string `json:"upstream_err_kind"`
-	UpstreamErrno        string `json:"upstream_errno"`
-	UpstreamErrMsg       string `json:"upstream_err_msg"`
-	IngressBytes         int64  `json:"ingress_bytes"`
-	EgressBytes          int64  `json:"egress_bytes"`
-	PayloadPresent       bool   `json:"payload_present"`
-	ReqHeadersLen        int    `json:"req_headers_len"`
-	ReqBodyLen           int    `json:"req_body_len"`
-	RespHeadersLen       int    `json:"resp_headers_len"`
-	RespBodyLen          int    `json:"resp_body_len"`
-	ReqHeadersTruncated  bool   `json:"req_headers_truncated"`
-	ReqBodyTruncated     bool   `json:"req_body_truncated"`
-	RespHeadersTruncated bool   `json:"resp_headers_truncated"`
-	RespBodyTruncated    bool   `json:"resp_body_truncated"`
+	ID                          string `json:"id"`
+	Ts                          string `json:"ts"`
+	ProxyType                   int    `json:"proxy_type"`
+	ClientIP                    string `json:"client_ip"`
+	PlatformID                  string `json:"platform_id"`
+	PlatformName                string `json:"platform_name"`
+	Account                     string `json:"account"`
+	AccountRedacted             bool   `json:"account_redacted"`
+	TargetHost                  string `json:"target_host"`
+	TargetURL                   string `json:"target_url"`
+	NodeHash                    string `json:"node_hash"`
+	NodeTag                     string `json:"node_tag"`
+	EgressIP                    string `json:"egress_ip"`
+	DurationMs                  int64  `json:"duration_ms"`
+	FirstByteDurationMs         int64  `json:"first_byte_duration_ms"`
+	NetOK                       bool   `json:"net_ok"`
+	HTTPMethod                  string `json:"http_method"`
+	HTTPStatus                  int    `json:"http_status"`
+	ResinError                  string `json:"resin_error"`
+	UpstreamStage               string `json:"upstream_stage"`
+	UpstreamErrKind             string `json:"upstream_err_kind"`
+	UpstreamErrno               string `json:"upstream_errno"`
+	UpstreamErrMsg              string `json:"upstream_err_msg"`
+	IngressBytes                int64  `json:"ingress_bytes"`
+	EgressBytes                 int64  `json:"egress_bytes"`
+	PayloadPresent              bool   `json:"payload_present"`
+	ReqHeadersLen               int    `json:"req_headers_len"`
+	ReqBodyLen                  int    `json:"req_body_len"`
+	RespHeadersLen              int    `json:"resp_headers_len"`
+	RespBodyLen                 int    `json:"resp_body_len"`
+	ReqHeadersTruncated         bool   `json:"req_headers_truncated"`
+	ReqBodyTruncated            bool   `json:"req_body_truncated"`
+	RespHeadersTruncated        bool   `json:"resp_headers_truncated"`
+	RespBodyTruncated           bool   `json:"resp_body_truncated"`
+	AttemptCount                int    `json:"attempt_count"`
+	AttemptFirstMs              int64  `json:"attempt_first_ms"`
+	AttemptLastMs               int64  `json:"attempt_last_ms"`
+	AttemptFinalStage           string `json:"attempt_final_stage"`
+	AttemptFinalKind            string `json:"attempt_final_kind"`
+	AttemptDiagnosticsTruncated bool   `json:"attempt_diagnostics_truncated"`
 }
 
 func toLogListItem(projector *observability.Projector, s requestlog.LogSummary) logListItem {
 	return logListItem{
-		ID:                   s.ID,
-		Ts:                   time.Unix(0, s.TsNs).UTC().Format(time.RFC3339Nano),
-		ProxyType:            s.ProxyType,
-		ClientIP:             s.ClientIP,
-		PlatformID:           s.PlatformID,
-		PlatformName:         s.PlatformName,
-		Account:              projector.RedactAccount(s.PlatformID, s.Account),
-		AccountRedacted:      s.Account != "",
-		TargetHost:           s.TargetHost,
-		TargetURL:            s.TargetURL,
-		NodeHash:             s.NodeHash,
-		NodeTag:              s.NodeTag,
-		EgressIP:             s.EgressIP,
-		DurationMs:           s.DurationNs / 1e6,
-		FirstByteDurationMs:  s.FirstByteDurationNs / 1e6,
-		NetOK:                s.NetOK,
-		HTTPMethod:           s.HTTPMethod,
-		HTTPStatus:           s.HTTPStatus,
-		ResinError:           s.ResinError,
-		UpstreamStage:        s.UpstreamStage,
-		UpstreamErrKind:      s.UpstreamErrKind,
-		UpstreamErrno:        s.UpstreamErrno,
-		UpstreamErrMsg:       s.UpstreamErrMsg,
-		IngressBytes:         s.IngressBytes,
-		EgressBytes:          s.EgressBytes,
-		PayloadPresent:       s.PayloadPresent,
-		ReqHeadersLen:        s.ReqHeadersLen,
-		ReqBodyLen:           s.ReqBodyLen,
-		RespHeadersLen:       s.RespHeadersLen,
-		RespBodyLen:          s.RespBodyLen,
-		ReqHeadersTruncated:  s.ReqHeadersTruncated,
-		ReqBodyTruncated:     s.ReqBodyTruncated,
-		RespHeadersTruncated: s.RespHeadersTruncated,
-		RespBodyTruncated:    s.RespBodyTruncated,
+		ID:                          s.ID,
+		Ts:                          time.Unix(0, s.TsNs).UTC().Format(time.RFC3339Nano),
+		ProxyType:                   s.ProxyType,
+		ClientIP:                    s.ClientIP,
+		PlatformID:                  s.PlatformID,
+		PlatformName:                s.PlatformName,
+		Account:                     projector.RedactAccount(s.PlatformID, s.Account),
+		AccountRedacted:             s.Account != "",
+		TargetHost:                  s.TargetHost,
+		TargetURL:                   s.TargetURL,
+		NodeHash:                    s.NodeHash,
+		NodeTag:                     s.NodeTag,
+		EgressIP:                    s.EgressIP,
+		DurationMs:                  s.DurationNs / 1e6,
+		FirstByteDurationMs:         s.FirstByteDurationNs / 1e6,
+		NetOK:                       s.NetOK,
+		HTTPMethod:                  s.HTTPMethod,
+		HTTPStatus:                  s.HTTPStatus,
+		ResinError:                  s.ResinError,
+		UpstreamStage:               s.UpstreamStage,
+		UpstreamErrKind:             s.UpstreamErrKind,
+		UpstreamErrno:               s.UpstreamErrno,
+		UpstreamErrMsg:              s.UpstreamErrMsg,
+		IngressBytes:                s.IngressBytes,
+		EgressBytes:                 s.EgressBytes,
+		PayloadPresent:              s.PayloadPresent,
+		ReqHeadersLen:               s.ReqHeadersLen,
+		ReqBodyLen:                  s.ReqBodyLen,
+		RespHeadersLen:              s.RespHeadersLen,
+		RespBodyLen:                 s.RespBodyLen,
+		ReqHeadersTruncated:         s.ReqHeadersTruncated,
+		ReqBodyTruncated:            s.ReqBodyTruncated,
+		RespHeadersTruncated:        s.RespHeadersTruncated,
+		RespBodyTruncated:           s.RespBodyTruncated,
+		AttemptCount:                s.AttemptCount,
+		AttemptFirstMs:              s.AttemptFirstMs,
+		AttemptLastMs:               s.AttemptLastMs,
+		AttemptFinalStage:           s.AttemptFinalStage,
+		AttemptFinalKind:            s.AttemptFinalKind,
+		AttemptDiagnosticsTruncated: s.AttemptDiagnosticsTruncated,
+	}
+}
+
+type logDetailItem struct {
+	logListItem
+	AttemptDiagnostics []proxy.RequestAttemptDiagnostic `json:"attempt_diagnostics"`
+}
+
+func toLogDetailItem(projector *observability.Projector, s requestlog.LogSummary) logDetailItem {
+	return logDetailItem{
+		logListItem:        toLogListItem(projector, s),
+		AttemptDiagnostics: s.AttemptDiagnostics,
 	}
 }
 

@@ -688,7 +688,10 @@ func TestReverseRetryRoundTripper_ExplicitAttemptTimeoutAdvances(t *testing.T) {
 	}
 }
 
-func TestReverseRetryRoundTripper_EnforcesAttemptDeadlineBeforeLateResponse(t *testing.T) {
+// This is a defensive contract for an intentionally non-compliant RoundTripper.
+// The production path is covered by TestForwardProxy_ExplicitAttemptTimeoutCancelsRealDelayedHeader,
+// which uses the real net/http transport and a real delayed-header server.
+func TestReverseRetryRoundTripper_BoundsNonCompliantTransportBeforeLateResponse(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
 	if !ok {

@@ -395,6 +395,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				lifecycle.addEgressBytes(headerBytes)
 				lifecycle.addEgressBytes(bodyBytes)
 			},
+			diagnosticStart: lifecycle.startedAt,
+			onAttemptDiagnostic: func(diagnostic *attemptDiagnostic) {
+				lifecycle.registerAttemptDiagnostic(diagnostic)
+			},
 			transportFor: func(candidate routedOutbound) http.RoundTripper {
 				return p.outboundHTTPTransport(candidate)
 			},

@@ -188,6 +188,7 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		mp.AllocationPolicy,
 		mp.PassiveCircuitBreakerDisabled,
 	)
+	plat.RevisionNs = mp.UpdatedAtNs
 	plat.ProxyRequestTotalTimeoutNs = mp.ProxyRequestTotalTimeoutNs
 	plat.ProxyRequestAttemptTimeoutNs = mp.ProxyRequestAttemptTimeoutNs
 	plat.ProxyRequestMaxAttempts = mp.ProxyRequestMaxAttempts

@@ -668,6 +668,134 @@ func TestRoundTripWithBodyCompletionAcceptsResponseBeforeRequestBodyClose(t *tes
 	waitForChannel(t, responseBody.closed, "response body close")
 }
 
+func TestRoundTripWithAttemptDeadlineBoundsAbandonedCalls(t *testing.T) {
+	limiter := newNonCompliantAttemptCallLimiter(2)
+	releaseTransport := make(chan struct{})
+	workerDone := make(chan struct{}, 2)
+	startedSignal := make(chan struct{}, 2)
+	var started atomic.Int32
+	transport := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		started.Add(1)
+		startedSignal <- struct{}{}
+		<-releaseTransport
+		workerDone <- struct{}{}
+		return nil, errors.New("released test transport")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		go func() {
+			_, err := roundTripWithAttemptContextUsingLimiter(ctx, transport, nil, limiter)
+			results <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-startedSignal:
+		case <-time.After(time.Second):
+			t.Fatal("bounded call workers did not start")
+		}
+	}
+	cancel()
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-results:
+			if err == nil {
+				t.Fatal("abandoned call unexpectedly succeeded")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("bounded call did not return")
+		}
+	}
+	if got := started.Load(); got != 2 {
+		t.Fatalf("abandoned call workers: got %d, want limiter capacity 2", got)
+	}
+	close(releaseTransport)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-workerDone:
+		case <-time.After(time.Second):
+			t.Fatal("abandoned worker did not finish after transport release")
+		}
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	replacementTransport := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("released")
+	})
+	var replacementErr error
+	for replacementErr == nil || errors.Is(replacementErr, errNonCompliantAttemptCallLimit) {
+		if _, replacementErr = roundTripWithAttemptContextUsingLimiter(ctx2, replacementTransport, nil, limiter); replacementErr != nil && !errors.Is(replacementErr, errNonCompliantAttemptCallLimit) {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx2.Done():
+			t.Fatalf("limiter did not release completed slots: %v", ctx2.Err())
+		}
+	}
+	if replacementErr == nil || errors.Is(replacementErr, errNonCompliantAttemptCallLimit) {
+		t.Fatalf("replacement call did not reach transport: %v", replacementErr)
+	}
+}
+
+func TestRoundTripWithAttemptDeadlineAllows65ConcurrentHTTPTransportCalls(t *testing.T) {
+	const concurrent = 65
+	entered := make(chan struct{}, concurrent)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		upstream.Close()
+	}()
+
+	transport := &http.Transport{MaxConnsPerHost: concurrent, MaxIdleConnsPerHost: concurrent}
+	defer transport.CloseIdleConnections()
+	results := make(chan error, concurrent)
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+			if err != nil {
+				results <- err
+				return
+			}
+			resp, err := roundTripWithAttemptContext(ctx, transport, req)
+			if err == nil && resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			results <- err
+		}()
+	}
+	for i := 0; i < concurrent; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("context-aware HTTP transport admitted fewer than %d concurrent calls", concurrent)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	for i := 0; i < concurrent; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("context-aware HTTP transport call: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("context-aware HTTP transport call did not finish")
+		}
+	}
+}
+
 func TestRoundTripWithBodyCompletionReturnsStartedResponseBeforeRequestBodyClose(t *testing.T) {
 	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{

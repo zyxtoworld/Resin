@@ -3537,6 +3537,339 @@ func TestForwardProxy_ExplicitAttemptTimeoutAdvances(t *testing.T) {
 	}
 }
 
+func TestForwardProxy_ExplicitAttemptTimeoutCancelsRealDelayedHeader(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "response-header-timeout", Enabled: true,
+		Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(350 * time.Millisecond)
+	plat.ProxyRequestAttemptTimeoutNs = int64(40 * time.Millisecond)
+	plat.ProxyRequestMaxAttempts = 2
+
+	var upstreamRequests atomic.Int32
+	firstHeaderWritten := make(chan struct{})
+	firstRequestCanceled := make(chan struct{})
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		attempt := upstreamRequests.Add(1)
+		if attempt == 1 {
+			// This is a real HTTP server and a real net/http.Transport path. Delay
+			// the response header beyond the platform attempt cap; do not turn the
+			// server into a fake RoundTripper that returns a selected error.
+			time.Sleep(250 * time.Millisecond)
+			if req.Context().Err() != nil {
+				select {
+				case <-firstRequestCanceled:
+				default:
+					close(firstRequestCanceled)
+				}
+			}
+			close(firstHeaderWritten)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	upstream.Start()
+	defer upstream.Close()
+
+	upstreamAddr := upstream.Listener.Addr().String()
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstreamAddr)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstreamAddr)
+	initial, err := env.router.RouteRequestForProxy("plat", "real-delayed-header", "https://example.com/real-delayed-header")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	if initial.RequestTotalTimeout != 350*time.Millisecond || initial.RequestAttemptTimeout != 40*time.Millisecond || initial.MaxAttempts != 2 {
+		t.Fatalf("route retry controls: total=%s attempt=%s max=%d", initial.RequestTotalTimeout, initial.RequestAttemptTimeout, initial.MaxAttempts)
+	}
+	if !env.router.CommitRouteForAccount(initial, "real-delayed-header") {
+		t.Fatal("failed to pin initial route")
+	}
+
+	var routes []netip.Addr
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok", Router: env.router, Pool: env.pool,
+		onRoute: func(route routing.RouteResult, _ *node.NodeEntry) {
+			routes = append(routes, route.EgressIP)
+		},
+	})
+	request := httptest.NewRequest(http.MethodGet, "http://example.com/real-delayed-header", nil)
+	request.Header.Set("Proxy-Authorization", basicAuth("plat.real-delayed-header", "tok"))
+	response := httptest.NewRecorder()
+	started := time.Now()
+	fp.ServeHTTP(response, request)
+	elapsed := time.Since(started)
+
+	if response.Code != http.StatusOK || response.Body.String() != "ok" {
+		t.Fatalf("real delayed-header proxy response: status=%d body=%q", response.Code, response.Body.String())
+	}
+	if got := upstreamRequests.Load(); got != 2 {
+		t.Fatalf("real delayed-header upstream requests: got %d, want 2", got)
+	}
+	if len(routes) != 2 || routes[0] != initial.EgressIP || routes[0] == routes[1] {
+		t.Fatalf("real delayed-header routes: %v, want initial=%s and a distinct retry", routes, initial.EgressIP)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("real delayed-header retry exceeded attempt boundary: %s", elapsed)
+	}
+	select {
+	case <-firstHeaderWritten:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("delayed upstream did not reach its header write")
+	}
+	select {
+	case <-firstRequestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("real transport did not close the canceled first connection")
+	}
+}
+
+func TestReverseProxy_RecordsAttemptTimelineForRealTransport(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		total       time.Duration
+		attempt     time.Duration
+		maxAttempts int
+		delay       time.Duration
+	}{
+		{name: "scaled", total: 350 * time.Millisecond, attempt: 40 * time.Millisecond, maxAttempts: 2, delay: 250 * time.Millisecond},
+		{name: "production-controls", total: 5 * time.Second, attempt: 850 * time.Millisecond, maxAttempts: 3, delay: 1100 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newProxyE2EEnv(t)
+			plat, ok := env.pool.GetPlatform("plat-id")
+			if !ok {
+				t.Fatal("platform not found")
+			}
+			rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+				ID: "response-header-timeout", Enabled: true,
+				Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"response_header_timeout"}},
+				Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+			}})
+			if err != nil {
+				t.Fatalf("CompileResponseRules: %v", err)
+			}
+			plat.ResponseRules = rules
+			plat.ProxyRequestTotalTimeoutNs = int64(tc.total)
+			plat.ProxyRequestAttemptTimeoutNs = int64(tc.attempt)
+			plat.ProxyRequestMaxAttempts = tc.maxAttempts
+
+			const requestBody = "timeline-body"
+			firstBody := make(chan []byte, 1)
+			secondBody := make(chan []byte, 1)
+			firstCanceled := make(chan struct{})
+			var firstCanceledOnce sync.Once
+			first := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				body, readErr := io.ReadAll(req.Body)
+				if readErr != nil {
+					t.Errorf("first upstream body: %v", readErr)
+				}
+				firstBody <- body
+				timer := time.NewTimer(tc.delay)
+				defer timer.Stop()
+				select {
+				case <-req.Context().Done():
+					firstCanceledOnce.Do(func() { close(firstCanceled) })
+					return
+				case <-timer.C:
+					// A correct attempt deadline must cancel before this response
+					// header is available to the proxy.
+					w.WriteHeader(http.StatusBadGateway)
+				}
+			}))
+			first.Start()
+			defer first.Close()
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				body, readErr := io.ReadAll(req.Body)
+				if readErr != nil {
+					t.Errorf("second upstream body: %v", readErr)
+				}
+				secondBody <- body
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "timeline-ok")
+			}))
+			defer second.Close()
+
+			baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+			baseEntry, ok := env.pool.GetEntry(baseHash)
+			if !ok {
+				t.Fatal("base node not found")
+			}
+			setProxyE2EEntryDialTarget(t, baseEntry, first.Listener.Addr().String())
+			initial, err := env.router.RouteRequest("plat", "timeline", "https://example.com/diag")
+			if err != nil {
+				t.Fatalf("initial route: %v", err)
+			}
+			if initial.NodeHash != baseHash || !env.router.CommitRouteForAccount(initial, "timeline") {
+				t.Fatalf("failed to pin base initial route: hash=%s want=%s", initial.NodeHash.Hex(), baseHash.Hex())
+			}
+			secondEntry := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", second.Listener.Addr().String())
+
+			emitter := newMockEventEmitter()
+			proxyHandler := NewReverseProxy(ReverseProxyConfig{
+				ProxyToken: "tok", Router: env.router, Pool: env.pool, PlatformLookup: env.pool, Events: emitter,
+			})
+			targetHost := strings.TrimPrefix(first.URL, "http://")
+			request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/tok/plat:timeline/http/%s/diag", targetHost), io.NopCloser(strings.NewReader(requestBody)))
+			request.ContentLength = int64(len(requestBody))
+			request.GetBody = nil
+			response := httptest.NewRecorder()
+			started := time.Now()
+			proxyHandler.ServeHTTP(response, request)
+			elapsed := time.Since(started)
+			if response.Code != http.StatusOK || response.Body.String() != "timeline-ok" {
+				t.Fatalf("reverse timeline response: status=%d body=%q", response.Code, response.Body.String())
+			}
+			if elapsed >= tc.delay {
+				t.Fatalf("first delayed header was not cut off by attempt deadline: elapsed=%s delay=%s", elapsed, tc.delay)
+			}
+			select {
+			case <-firstCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("first upstream request was not canceled before its delayed header")
+			}
+			if string(<-firstBody) != requestBody || string(<-secondBody) != requestBody {
+				t.Fatal("retry request bodies were not byte-for-byte identical")
+			}
+
+			var logEntry RequestLogEntry
+			select {
+			case logEntry = <-emitter.logCh:
+			case <-time.After(time.Second):
+				t.Fatal("reverse timeline request log not emitted")
+			}
+			if len(logEntry.AttemptDiagnostics) != 2 {
+				t.Fatalf("attempt diagnostics: got %d: %#v", len(logEntry.AttemptDiagnostics), logEntry.AttemptDiagnostics)
+			}
+			firstDiagnostic, secondDiagnostic := logEntry.AttemptDiagnostics[0], logEntry.AttemptDiagnostics[1]
+			if firstDiagnostic.Attempt != 1 || secondDiagnostic.Attempt != 2 || firstDiagnostic.RouteGeneration == 0 || firstDiagnostic.RouteGeneration != secondDiagnostic.RouteGeneration {
+				t.Fatalf("attempt identity: first=%#v second=%#v", firstDiagnostic, secondDiagnostic)
+			}
+			if firstDiagnostic.NodeHash != baseHash.Hex() || secondDiagnostic.NodeHash != secondEntry.Hash.Hex() || firstDiagnostic.NodeHash == secondDiagnostic.NodeHash {
+				t.Fatalf("attempt node identity: first=%q second=%q base=%q retry=%q", firstDiagnostic.NodeHash, secondDiagnostic.NodeHash, baseHash.Hex(), secondEntry.Hash.Hex())
+			}
+			if firstDiagnostic.EgressIP == secondDiagnostic.EgressIP || firstDiagnostic.EgressIP != "203.0.113.10" || secondDiagnostic.EgressIP != "203.0.113.11" {
+				t.Fatalf("attempt egress identity: first=%q second=%q", firstDiagnostic.EgressIP, secondDiagnostic.EgressIP)
+			}
+			if firstDiagnostic.Transport != "*http.Transport" || secondDiagnostic.Transport != "*http.Transport" {
+				t.Fatalf("transport types: first=%q second=%q", firstDiagnostic.Transport, secondDiagnostic.Transport)
+			}
+			if firstDiagnostic.RequestTotalTimeoutMs != tc.total.Milliseconds() || firstDiagnostic.RequestAttemptTimeoutMs != tc.attempt.Milliseconds() || firstDiagnostic.MaxAttempts != tc.maxAttempts {
+				t.Fatalf("first route controls: %#v", firstDiagnostic)
+			}
+			if firstDiagnostic.ErrorKind != "response_header_timeout" || firstDiagnostic.ResponseStarted || firstDiagnostic.ResponseHeaderMs != 0 || firstDiagnostic.ResponseStatus != 0 ||
+				(firstDiagnostic.RequestBodyComplete && firstDiagnostic.RequestBodyBytes != int64(len(requestBody))) ||
+				(!firstDiagnostic.RequestBodyComplete && firstDiagnostic.RequestBodyBytes != 0) {
+				t.Fatalf("first attempt timeline: %#v", firstDiagnostic)
+			}
+			if secondDiagnostic.ResponseStatus != http.StatusOK || !secondDiagnostic.ResponseStarted || secondDiagnostic.ErrorKind != "" || secondDiagnostic.RoundTripEndMs <= 0 || secondDiagnostic.BodyFinishMs <= 0 || secondDiagnostic.RequestBodyBytes != int64(len(requestBody)) || !secondDiagnostic.RequestBodyComplete {
+				t.Fatalf("second attempt timeline: %#v", secondDiagnostic)
+			}
+		})
+	}
+}
+
+func TestReverseProxy_StartedResponseBodyErrorDoesNotRetryRealTransport(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{
+		{
+			ID: "started-response-body-retry", Enabled: true,
+			Match: model.PlatformResponseRuleMatch{
+				StatusCodes: []int{http.StatusOK},
+				Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "retry-me"},
+			},
+			Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+		},
+		{
+			ID: "started-response-transport-retry", Enabled: true,
+			Match:  model.PlatformResponseRuleMatch{FailureKinds: []string{"transport_error"}},
+			Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(500 * time.Millisecond)
+	plat.ProxyRequestAttemptTimeoutNs = int64(100 * time.Millisecond)
+	plat.ProxyRequestMaxAttempts = 2
+
+	const responsePrefix = "started-response"
+	var requests atomic.Int32
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) != 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", "128")
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsePrefix)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, hijackErr := hijacker.Hijack()
+		if hijackErr == nil {
+			_ = conn.Close()
+		}
+	}))
+	upstream.Start()
+	defer upstream.Close()
+
+	baseHash := node.HashFromRawOptions(json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`))
+	baseEntry, ok := env.pool.GetEntry(baseHash)
+	if !ok {
+		t.Fatal("base node not found")
+	}
+	setProxyE2EEntryDialTarget(t, baseEntry, upstream.Listener.Addr().String())
+	initial, err := env.router.RouteRequest("plat", "started-body", "https://example.com/started")
+	if err != nil || initial.NodeHash != baseHash || !env.router.CommitRouteForAccount(initial, "started-body") {
+		t.Fatalf("pin initial route: route=%#v err=%v", initial, err)
+	}
+	second := setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", upstream.Listener.Addr().String())
+	if second.Hash == baseHash {
+		t.Fatal("retry candidate did not have a distinct node hash")
+	}
+
+	proxyHandler := NewReverseProxy(ReverseProxyConfig{
+		ProxyToken: "tok", Router: env.router, Pool: env.pool, PlatformLookup: env.pool,
+	})
+	targetHost := strings.TrimPrefix(upstream.URL, "http://")
+	request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/tok/plat:started-body/http/%s/started", targetHost), nil)
+	response := httptest.NewRecorder()
+	proxyHandler.ServeHTTP(response, request)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("started response body error retried: calls=%d, want 1", got)
+	}
+	if response.Code != http.StatusOK || response.Body.String() != responsePrefix {
+		t.Fatalf("started response body: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
 func TestForwardProxy_ExplicitMaxAttemptsStopsExactly(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")

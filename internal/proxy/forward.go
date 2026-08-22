@@ -617,6 +617,10 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			transport = p.outboundHTTPTransport(routed)
 		}
+		diagnostic := newAttemptDiagnostic(lifecycle.startedAt, attempt, route, transport)
+		diagnostic.markStarted()
+		lifecycle.registerAttemptDiagnostic(diagnostic)
+		upstreamAttemptTrace.setDiagnostic(diagnostic)
 		attemptCtx := requestCtx
 		var cancelAttempt context.CancelFunc
 		releaseAttempt := func() {}
@@ -664,15 +668,25 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		deferredBody = responseBodyCompletion(resp)
+		diagnostic.markRoundTripEnd()
+		if resp != nil {
+			diagnostic.markResponseHeader()
+			diagnostic.setResponse(resp)
+			wrapAttemptDiagnosticResponseBody(resp, diagnostic)
+		}
 		if !bodyComplete && deferredBody == nil {
+			diagnostic.setRequestBody(false, 0)
 			resp = nil
 			if cancelAttempt != nil {
 				cancelAttempt()
 			}
 		}
 		if bodyComplete && upstreamAttemptTrace.commitEgress(resp != nil && roundTripErr == nil, roundTripErr) {
+			diagnostic.setRequestBody(true, bodyBytes)
 			lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 			lifecycle.addEgressBytes(bodyBytes)
+		} else if bodyComplete {
+			diagnostic.setRequestBody(true, bodyBytes)
 		}
 		if bodyComplete && resp != nil && roundTripErr == nil {
 			// The pre-response timer has served its purpose. Do not let the
@@ -680,6 +694,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			releaseAttempt()
 		} else if deferredBody != nil && resp != nil && roundTripErr == nil {
 			deferredBody.handoff(releaseAttempt, func(bodyBytes int64, complete bool) {
+				diagnostic.setRequestBody(complete, bodyBytes)
 				if !complete || !upstreamAttemptTrace.commitEgress(true, nil) {
 					return
 				}
@@ -689,9 +704,11 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if roundTripErr != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(p.router, route, upstreamAttemptTrace, roundTripErr)
+			diagnostic.setErrorKind(classifyTransportFailure(roundTripErr, upstreamAttemptTrace))
 			canRetry := hasRoute && budgetEnabled && failureMatched && failureMatch.RetryNext() && !upstreamAttemptTrace.responseStarted() && resp == nil && bounded &&
 				requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget && requestCtx.Err() == nil
 			if canRetry {
+				diagnostic.setCancelReason("transport_failure_retry")
 				if cancelAttempt != nil {
 					cancelAttempt()
 				}
@@ -746,6 +763,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		finalResponseAccepted = !matchedRule || responseMatch.Action == platform.ResponseRuleActionPassthrough
 		if matchedRule && budgetEnabled && responseMatch.RetryNext() && requestCanBeReplayed(r, bodyCapture) && attempt+1 < retryBudget {
+			diagnostic.setReleaseReason("response_rule_retry")
 			if requestCtx.Err() != nil {
 				_ = resp.Body.Close()
 				if cancelAttempt != nil {

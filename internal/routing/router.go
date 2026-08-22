@@ -73,6 +73,7 @@ type Router struct {
 	pool                        PoolAccessor
 	states                      *xsync.Map[string, *PlatformRoutingState]
 	nextPlatformStateGeneration uint64
+	nextRouteGeneration         atomic.Uint64
 	// lifecycleMu is the platform-routing lifetime owner. Routes, lease writes,
 	// reads, and cleaner sweeps hold the read side. Platform removal first
 	// unregisters the platform from the pool, then takes the write side to drain
@@ -252,8 +253,12 @@ func (r *Router) deleteLeaseWithEvent(
 type RouteResult struct {
 	PlatformID   string
 	PlatformName string
-	NodeHash     node.Hash
-	EgressIP     netip.Addr
+	// RouteGeneration identifies the immutable candidate snapshot used by one
+	// request and all of its retry-next attempts.
+	RouteGeneration    uint64
+	PlatformRevisionNs int64
+	NodeHash           node.Hash
+	EgressIP           netip.Addr
 	// RetryBudget is the upper bound of routable candidates captured from the
 	// platform view for this route generation. Callers may retry only within
 	// this fixed budget; later platform changes must not enlarge one request's
@@ -301,6 +306,7 @@ type routeRetryCandidate struct {
 type RouteRetrySnapshot struct {
 	platformID            string
 	platform              *platform.Platform
+	routeGeneration       uint64
 	candidates            []routeRetryCandidate
 	budget                int
 	requestTotalTimeout   time.Duration
@@ -420,7 +426,8 @@ func (r *Router) RouteRequestNext(previous RouteResult, exclusions RouteRetryExc
 		}
 		result := RouteResult{
 			PlatformID: snapshot.platform.ID, PlatformName: snapshot.platform.Name,
-			NodeHash: candidate.hash, EgressIP: candidate.ip,
+			RouteGeneration: snapshot.routeGeneration,
+			NodeHash:        candidate.hash, EgressIP: candidate.ip,
 			RetryBudget: snapshot.budget, ResponseRules: snapshot.platform.ResponseRules,
 			RequestTotalTimeout:   snapshot.requestTotalTimeout,
 			RequestAttemptTimeout: snapshot.requestAttemptTimeout,
@@ -613,6 +620,7 @@ func (r *Router) routeRequestLocked(
 		return RouteResult{}, err
 	}
 	result.RetryBudget = retryBudget
+	result.RouteGeneration = snapshot.routeGeneration
 	result.platform = plat
 	result.retrySnapshot = snapshot
 	result = withPlatformContext(plat, result)
@@ -623,7 +631,10 @@ func (r *Router) routeRequestLocked(
 }
 
 func (r *Router) captureRetrySnapshot(plat *platform.Platform, cooldowns *ResponseCooldowns, now time.Time) *RouteRetrySnapshot {
-	snapshot := &RouteRetrySnapshot{platform: plat}
+	snapshot := &RouteRetrySnapshot{
+		platform:        plat,
+		routeGeneration: r.nextRouteGeneration.Add(1),
+	}
 	if plat == nil || r.pool == nil {
 		snapshot.budget = 1
 		return snapshot
@@ -653,6 +664,7 @@ func (r *Router) captureRetrySnapshot(plat *platform.Platform, cooldowns *Respon
 func withPlatformContext(plat *platform.Platform, res RouteResult) RouteResult {
 	res.PlatformID = plat.ID
 	res.PlatformName = plat.Name
+	res.PlatformRevisionNs = plat.RevisionNs
 	res.PassiveCircuitBreakerDisabled = plat.PassiveCircuitBreakerDisabled
 	res.ResponseRules = plat.ResponseRules
 	res.RequestTotalTimeout = time.Duration(plat.ProxyRequestTotalTimeoutNs)

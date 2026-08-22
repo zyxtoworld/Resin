@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -243,5 +244,32 @@ func TestConfigAwareEventEmitter_DoesNotMixRuntimeConfigGenerations(t *testing.T
 		if got[i] != got[0] {
 			t.Fatalf("mixed runtime config generations: captured lengths = %v", got)
 		}
+	}
+}
+
+func TestConfigAwareEventEmitter_BoundsAttemptDiagnosticsBeforePublish(t *testing.T) {
+	base := &recordingEmitter{}
+	emitter := ConfigAwareEventEmitter{
+		Base: base,
+		RequestLogConfigProvider: func() RequestLogRuntimeConfig {
+			return RequestLogRuntimeConfig{Enabled: true}
+		},
+	}
+	diagnostics := make([]RequestAttemptDiagnostic, MaxRequestAttemptDiagnostics+3)
+	for i := range diagnostics {
+		diagnostics[i] = RequestAttemptDiagnostic{
+			Attempt:  i + 1,
+			NodeHash: strings.Repeat("n", MaxRequestAttemptDiagnosticStringBytes+1),
+		}
+	}
+	emitter.EmitRequestLog(RequestLogEntry{AttemptDiagnostics: diagnostics})
+	if len(base.lastLog.AttemptDiagnostics) != MaxRequestAttemptDiagnostics {
+		t.Fatalf("published diagnostics len=%d, want %d", len(base.lastLog.AttemptDiagnostics), MaxRequestAttemptDiagnostics)
+	}
+	if base.lastLog.AttemptCount != len(diagnostics) || !base.lastLog.AttemptDiagnosticsTruncated {
+		t.Fatalf("published diagnostics summary count=%d truncated=%v", base.lastLog.AttemptCount, base.lastLog.AttemptDiagnosticsTruncated)
+	}
+	if len(base.lastLog.AttemptDiagnostics[0].NodeHash) > MaxRequestAttemptDiagnosticStringBytes {
+		t.Fatalf("published diagnostic string len=%d exceeds bound", len(base.lastLog.AttemptDiagnostics[0].NodeHash))
 	}
 }

@@ -267,6 +267,42 @@ var errAttemptBodyQuiescence = errors.New("upstream request body did not quiesce
 
 const attemptBodyQuiescenceBudget = time.Second
 
+var errNonCompliantAttemptCallLimit = errors.New("upstream non-compliant attempt call limit reached")
+
+// maxNonCompliantAttemptCalls bounds calls routed through the defensive
+// adapter path below. Production outbound requests use *http.Transport and
+// stay on net/http's context-aware synchronous path; this quota is only for a
+// RoundTripper implementation that can outlive its canceled caller.
+const maxNonCompliantAttemptCalls = 64
+
+type nonCompliantAttemptCallLimiter struct {
+	slots chan struct{}
+}
+
+func newNonCompliantAttemptCallLimiter(capacity int) *nonCompliantAttemptCallLimiter {
+	if capacity <= 0 {
+		capacity = 1
+	}
+	return &nonCompliantAttemptCallLimiter{slots: make(chan struct{}, capacity)}
+}
+
+func (l *nonCompliantAttemptCallLimiter) tryAcquire() (func(), bool) {
+	if l == nil || l.slots == nil {
+		return func() {}, true
+	}
+	select {
+	case l.slots <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-l.slots })
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+var defaultNonCompliantAttemptCallLimiter = newNonCompliantAttemptCallLimiter(maxNonCompliantAttemptCalls)
+
 func (b *attemptRequestBody) await(ctx context.Context, budget time.Duration) error {
 	if b == nil {
 		return nil
@@ -341,6 +377,12 @@ func roundTripWithBodyCompletionBudgetAndDeadline(
 	} else {
 		resp, err = transport.RoundTrip(req)
 	}
+	if errors.Is(err, errNonCompliantAttemptCallLimit) {
+		if owner != nil {
+			owner.abort()
+		}
+		return nil, err, 0, false
+	}
 	if owner != nil {
 		// A successful RoundTrip may return response headers while an HTTP/2 or
 		// full-duplex transport is still finishing the request body. The response
@@ -399,8 +441,27 @@ func roundTripWithAttemptContext(
 	transport http.RoundTripper,
 	req *http.Request,
 ) (*http.Response, error) {
+	// Every production routed transport is an *http.Transport. Let net/http
+	// enforce cancellation directly; it owns the connection lifecycle and does
+	// not need an abandoned-call goroutine. Unknown adapter implementations use
+	// the bounded defensive path below.
+	if _, ok := transport.(*http.Transport); ok {
+		return transport.RoundTrip(req)
+	}
+	return roundTripWithAttemptContextUsingLimiter(ctx, transport, req, defaultNonCompliantAttemptCallLimiter)
+}
+
+func roundTripWithAttemptContextUsingLimiter(
+	ctx context.Context,
+	transport http.RoundTripper,
+	req *http.Request,
+	limiter *nonCompliantAttemptCallLimiter,
+) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if limiter == nil {
+		limiter = defaultNonCompliantAttemptCallLimiter
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -408,9 +469,19 @@ func roundTripWithAttemptContext(
 	if ctx.Done() == nil {
 		return transport.RoundTrip(req)
 	}
+	releaseSlot, acquired := limiter.tryAcquire()
+	if !acquired {
+		if req != nil {
+			if owner, ok := req.Body.(*attemptRequestBody); ok {
+				owner.abort()
+			}
+		}
+		return nil, errNonCompliantAttemptCallLimit
+	}
 
 	call := &roundTripCall{done: make(chan struct{})}
 	go func() {
+		defer releaseSlot()
 		resp, err := transport.RoundTrip(req)
 		call.mu.Lock()
 		call.finished = true
@@ -446,6 +517,9 @@ func roundTripWithAttemptContext(
 			} else if aborter, ok := req.Body.(attemptBodyAborter); ok {
 				aborter.abandon()
 			}
+		}
+		if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
 		}
 		return nil, ctx.Err()
 	}

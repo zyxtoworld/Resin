@@ -81,6 +81,49 @@ type RequestLogEntry struct {
 	RespBody             []byte
 	RespBodyLen          int
 	RespBodyTruncated    bool
+	// AttemptDiagnostics is a bounded, sanitized timeline for each upstream
+	// route attempt. It contains no URL, header, body, credential, or account
+	// data; timings are relative to the request start.
+	AttemptDiagnostics []RequestAttemptDiagnostic
+	// AttemptCount is the total number of attempts observed. The detail slice
+	// may be capped and marked by AttemptDiagnosticsTruncated.
+	AttemptCount                int
+	AttemptDiagnosticsTruncated bool
+}
+
+// RequestAttemptDiagnostic is the production-safe per-attempt timeline used
+// to distinguish route-budget expiry from an accepted response/body failure.
+// Zero timing values mean that the milestone was not observed.
+type RequestAttemptDiagnostic struct {
+	Attempt                 int    `json:"attempt"`
+	RouteGeneration         uint64 `json:"route_generation"`
+	PlatformRevisionNs      int64  `json:"platform_revision_ns"`
+	NodeHash                string `json:"node_hash"`
+	EgressIP                string `json:"egress_ip"`
+	Transport               string `json:"transport"`
+	RetryBudget             int    `json:"retry_budget"`
+	RequestTotalTimeoutMs   int64  `json:"request_total_timeout_ms"`
+	RequestAttemptTimeoutMs int64  `json:"request_attempt_timeout_ms"`
+	MaxAttempts             int    `json:"max_attempts"`
+	AttemptDeadlineMs       int64  `json:"attempt_deadline_ms"`
+	StartedMs               int64  `json:"started_ms"`
+	GotConnMs               int64  `json:"got_conn_ms"`
+	WroteRequestMs          int64  `json:"wrote_request_ms"`
+	ResponseHeaderMs        int64  `json:"response_header_ms"`
+	FirstResponseByteMs     int64  `json:"first_response_byte_ms"`
+	BodyStartMs             int64  `json:"body_start_ms"`
+	RoundTripEndMs          int64  `json:"round_trip_end_ms"`
+	BodyFinishMs            int64  `json:"body_finish_ms"`
+	RequestBodyFinishMs     int64  `json:"request_body_finish_ms"`
+	ResponseStatus          int    `json:"response_status"`
+	ResponseStarted         bool   `json:"response_started"`
+	RequestBodyComplete     bool   `json:"request_body_complete"`
+	RequestBodyBytes        int64  `json:"request_body_bytes"`
+	ResponseBodyBytes       int64  `json:"response_body_bytes"`
+	ResponseBodyComplete    bool   `json:"response_body_complete"`
+	ErrorKind               string `json:"error_kind"`
+	CancelReason            string `json:"cancel_reason"`
+	ReleaseReason           string `json:"release_reason"`
 }
 
 // EventEmitter defines the interface for proxy-layer event emission.
@@ -195,6 +238,13 @@ func (e ConfigAwareEventEmitter) EmitRequestLog(ev RequestLogEntry) {
 	if !cfg.Enabled {
 		return
 	}
+	originalAttemptCount := len(ev.AttemptDiagnostics)
+	var diagnosticsTruncated bool
+	ev.AttemptDiagnostics, diagnosticsTruncated = NormalizeRequestAttemptDiagnostics(ev.AttemptDiagnostics)
+	if ev.AttemptCount < originalAttemptCount {
+		ev.AttemptCount = originalAttemptCount
+	}
+	ev.AttemptDiagnosticsTruncated = ev.AttemptDiagnosticsTruncated || diagnosticsTruncated
 
 	// Reverse proxy detail payload is controlled by runtime config.
 	if ev.ProxyType == ProxyTypeReverse {

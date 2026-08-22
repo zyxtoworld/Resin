@@ -18,6 +18,7 @@ type upstreamRequestAttemptTrace struct {
 	firstResponseByteSeen atomic.Bool
 	egressCommitted       atomic.Bool
 	gotFirstResponseByte  func()
+	diagnostic            *attemptDiagnostic
 }
 
 func newUpstreamRequestTrace(gotFirstResponseByte ...func()) *upstreamRequestTrace {
@@ -42,19 +43,34 @@ func (t *upstreamRequestAttemptTrace) clientTrace() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) {
 			t.gotConn.Store(true)
+			if t.diagnostic != nil {
+				t.diagnostic.markGotConn()
+			}
 		},
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
 			// WroteRequest can also fire with Err!=nil for failed write attempts.
 			if info.Err == nil {
 				t.wroteRequest.Store(true)
+				if t.diagnostic != nil {
+					t.diagnostic.markWroteRequest()
+				}
 			}
 		},
 		GotFirstResponseByte: func() {
 			t.firstResponseByteSeen.Store(true)
+			if t.diagnostic != nil {
+				t.diagnostic.markFirstResponseByte()
+			}
 			if t.gotFirstResponseByte != nil {
 				t.gotFirstResponseByte()
 			}
 		},
+	}
+}
+
+func (t *upstreamRequestAttemptTrace) setDiagnostic(diagnostic *attemptDiagnostic) {
+	if t != nil {
+		t.diagnostic = diagnostic
 	}
 }
 

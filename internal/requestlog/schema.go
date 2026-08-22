@@ -41,7 +41,14 @@ CREATE TABLE IF NOT EXISTS request_logs (
 	req_headers_truncated  INTEGER NOT NULL DEFAULT 0,
 	req_body_truncated     INTEGER NOT NULL DEFAULT 0,
 	resp_headers_truncated INTEGER NOT NULL DEFAULT 0,
-	resp_body_truncated    INTEGER NOT NULL DEFAULT 0
+	resp_body_truncated    INTEGER NOT NULL DEFAULT 0,
+	attempt_count          INTEGER NOT NULL DEFAULT 0,
+	attempt_first_ms       INTEGER NOT NULL DEFAULT 0,
+	attempt_last_ms        INTEGER NOT NULL DEFAULT 0,
+	attempt_final_stage    TEXT NOT NULL DEFAULT '',
+	attempt_final_kind     TEXT NOT NULL DEFAULT '',
+	attempt_diagnostics_truncated INTEGER NOT NULL DEFAULT 0,
+	attempt_diagnostics    TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS request_log_payloads (
@@ -78,6 +85,24 @@ const CreateDDL = requestLogTablesDDL + requestLogIndexesDDL
 func ensureRequestLogSchema(db *sql.DB) error {
 	if err := ensureRequestLogColumn(db, "request_logs", "first_byte_duration_ns", "first_byte_duration_ns INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	if err := ensureRequestLogColumn(db, "request_logs", "attempt_diagnostics", "attempt_diagnostics TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "attempt_count", ddl: "attempt_count INTEGER NOT NULL DEFAULT 0"},
+		{name: "attempt_first_ms", ddl: "attempt_first_ms INTEGER NOT NULL DEFAULT 0"},
+		{name: "attempt_last_ms", ddl: "attempt_last_ms INTEGER NOT NULL DEFAULT 0"},
+		{name: "attempt_final_stage", ddl: "attempt_final_stage TEXT NOT NULL DEFAULT ''"},
+		{name: "attempt_final_kind", ddl: "attempt_final_kind TEXT NOT NULL DEFAULT ''"},
+		{name: "attempt_diagnostics_truncated", ddl: "attempt_diagnostics_truncated INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureRequestLogColumn(db, "request_logs", column.name, column.ddl); err != nil {
+			return err
+		}
 	}
 
 	tx, err := db.Begin()

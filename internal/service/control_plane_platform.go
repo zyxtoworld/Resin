@@ -386,6 +386,9 @@ func (s *ControlPlaneService) compileAndPersistPlatform(
 		return model.Platform{}, nil, invalidArg(err.Error())
 	}
 	mp := cfg.toModel(id, time.Now().UnixNano())
+	// The runtime object and persisted row carry the same immutable revision so
+	// request diagnostics can prove which configuration routed a request.
+	plat.RevisionNs = mp.UpdatedAtNs
 	if err := persist(ctx, mp); err != nil {
 		if errors.Is(err, state.ErrConflict) {
 			return model.Platform{}, nil, conflict("platform name already exists")

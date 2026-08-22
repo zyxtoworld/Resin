@@ -29,6 +29,8 @@ type reverseRetryRoundTripper struct {
 	onRoute             func(routing.RouteResult, *node.NodeEntry)
 	decorateAttempt     func(*http.Request, routedOutbound) (*http.Request, *upstreamRequestAttemptTrace)
 	onAttemptEgress     func(headerBytes, bodyBytes int64)
+	diagnosticStart     time.Time
+	onAttemptDiagnostic func(*attemptDiagnostic)
 
 	promotable bool
 }
@@ -145,6 +147,16 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	}
 
 	for attempt := 0; attempt < budget; attempt++ {
+		attemptTransport := t.transportFor(current)
+		diagnosticStart := t.diagnosticStart
+		if diagnosticStart.IsZero() {
+			diagnosticStart = time.Now()
+		}
+		diagnostic := newAttemptDiagnostic(diagnosticStart, attempt, current.Route, attemptTransport)
+		diagnostic.markStarted()
+		if t.onAttemptDiagnostic != nil {
+			t.onAttemptDiagnostic(diagnostic)
+		}
 		attemptCtx := requestCtx
 		var cancelAttempt context.CancelFunc
 		releaseAttempt := func() {}
@@ -164,6 +176,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		if attemptCtx == nil {
 			attemptCtx = req.Context()
 		}
+		diagnostic.setAttemptDeadline(attemptCtx)
 		if t.onRoute != nil {
 			t.onRoute(current.Route, current.Entry)
 		}
@@ -178,6 +191,9 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		if t.decorateAttempt != nil {
 			outReq, attemptTrace = t.decorateAttempt(outReq, current)
 		}
+		if attemptTrace != nil {
+			attemptTrace.setDiagnostic(diagnostic)
+		}
 		pendingHeaderBytes := headerWireLen(outReq.Header)
 		var resp *http.Response
 		var err error
@@ -185,14 +201,20 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		var bodyComplete bool
 		if bounded && current.Route.RequestAttemptTimeout > 0 {
 			resp, err, bodyBytes, bodyComplete = roundTripWithAttemptDeadline(
-				attemptCtx, t.transportFor(current), outReq,
+				attemptCtx, attemptTransport, outReq,
 			)
 		} else {
 			resp, err, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
-				attemptCtx, t.transportFor(current), outReq,
+				attemptCtx, attemptTransport, outReq,
 			)
 		}
 		deferredBody := responseBodyCompletion(resp)
+		diagnostic.markRoundTripEnd()
+		if resp != nil {
+			diagnostic.markResponseHeader()
+			diagnostic.setResponse(resp)
+			wrapAttemptDiagnosticResponseBody(resp, diagnostic)
+		}
 		bodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
 		retryCurrent := func() bool {
 			if cancelAttempt != nil {
@@ -206,11 +228,14 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			return true
 		}
 		if !bodyComplete && deferredBody == nil {
+			diagnostic.setRequestBody(false, 0)
 			if err != nil {
 				failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
+				diagnostic.setErrorKind(classifyTransportFailure(err, attemptTrace))
 				canRetry := budgetEnabled && failureMatched && failureMatch.RetryNext() && (attemptTrace == nil || !attemptTrace.responseStarted()) && resp == nil && bounded &&
 					bodyReplayable && attempt+1 < budget && requestCtx.Err() == nil
 				if canRetry && retryCurrent() {
+					diagnostic.setCancelReason("attempt_failure_retry")
 					continue
 				}
 			}
@@ -221,12 +246,16 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			return nil, err
 		}
 		if bodyComplete && attemptTrace != nil && attemptTrace.commitEgress(resp != nil && err == nil, err) && t.onAttemptEgress != nil {
+			diagnostic.setRequestBody(true, bodyBytes)
 			t.onAttemptEgress(pendingHeaderBytes, bodyBytes)
+		} else if bodyComplete {
+			diagnostic.setRequestBody(true, bodyBytes)
 		}
 		if bodyComplete && resp != nil && err == nil {
 			releaseAttempt()
 		} else if deferredBody != nil && resp != nil && err == nil {
 			deferredBody.handoff(releaseAttempt, func(bodyBytes int64, complete bool) {
+				diagnostic.setRequestBody(complete, bodyBytes)
 				if !complete || attemptTrace == nil || !attemptTrace.commitEgress(true, nil) || t.onAttemptEgress == nil {
 					return
 				}
@@ -235,9 +264,11 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		}
 		if err != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
+			diagnostic.setErrorKind(classifyTransportFailure(err, attemptTrace))
 			canRetry := budgetEnabled && failureMatched && failureMatch.RetryNext() && (attemptTrace == nil || !attemptTrace.responseStarted()) && resp == nil && bounded &&
 				bodyReplayable && attempt+1 < budget && requestCtx.Err() == nil
 			if canRetry && retryCurrent() {
+				diagnostic.setCancelReason("transport_failure_retry")
 				continue
 			}
 			if resp != nil && resp.Body != nil {
@@ -253,6 +284,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		finalAccepted := !matched || decision.Action == platform.ResponseRuleActionPassthrough
 		responseBodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
 		if !matched || !budgetEnabled || !decision.RetryNext() || !responseBodyReplayable || attempt+1 >= budget {
+			diagnostic.setReleaseReason("accepted_response")
 			return finishResponse(resp, finalAccepted, cancelAttempt)
 		}
 		if requestCtx.Err() != nil {
@@ -265,8 +297,10 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 
 		next, ok := advance()
 		if !ok {
+			diagnostic.setReleaseReason("response_rule_no_next")
 			return finishResponse(resp, false, cancelAttempt)
 		}
+		diagnostic.setReleaseReason("response_rule_retry")
 		_ = resp.Body.Close()
 		if cancelAttempt != nil {
 			cancelAttempt()

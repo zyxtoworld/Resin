@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -20,7 +21,8 @@ import (
 	"github.com/Resinat/Resin/internal/state"
 )
 
-const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, platform_name, account, target_host, target_url, node_hash, node_tag, egress_ip, duration_ns, first_byte_duration_ns, net_ok, http_method, http_status, resin_error, upstream_stage, upstream_err_kind, upstream_errno, upstream_err_msg, ingress_bytes, egress_bytes, payload_present, req_headers_len, req_body_len, resp_headers_len, resp_body_len, req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated"
+const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, platform_name, account, target_host, target_url, node_hash, node_tag, egress_ip, duration_ns, first_byte_duration_ns, net_ok, http_method, http_status, resin_error, upstream_stage, upstream_err_kind, upstream_errno, upstream_err_msg, ingress_bytes, egress_bytes, payload_present, req_headers_len, req_body_len, resp_headers_len, resp_body_len, req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated, attempt_count, attempt_first_ms, attempt_last_ms, attempt_final_stage, attempt_final_kind, attempt_diagnostics_truncated"
+const logDetailSelectColumns = logSummarySelectColumns + ", attempt_diagnostics"
 
 // shardGate protects the lifetime of the active database and retained shard
 // files. Readers may run concurrently, but a writer gets priority so a
@@ -425,8 +427,11 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 		ingress_bytes, egress_bytes,
 		payload_present,
 		req_headers_len, req_body_len, resp_headers_len, resp_body_len,
-		req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated,
+		attempt_count, attempt_first_ms, attempt_last_ms,
+		attempt_final_stage, attempt_final_kind, attempt_diagnostics_truncated,
+		attempt_diagnostics
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return 0, fmt.Errorf("requestlog repo prepare log: %w", err)
 	}
@@ -463,6 +468,14 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 		if e.ReqHeaders != nil || e.ReqBody != nil || e.RespHeaders != nil || e.RespBody != nil {
 			hasPayload = 1
 		}
+		attemptSummary, attemptDiagnostics, marshalErr := encodeAttemptDiagnostics(e)
+		if marshalErr != nil {
+			if interruptible {
+				return 0, fmt.Errorf("requestlog repo encode attempt diagnostics id=%q: %w", id, marshalErr)
+			}
+			log.Printf("[requestlog] warning: skip log id=%q attempt diagnostics encode failed: %v", id, marshalErr)
+			continue
+		}
 
 		_, err := insertLog.ExecContext(ctx,
 			id, e.StartedAtNs, int(e.ProxyType), e.ClientIP,
@@ -475,6 +488,10 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 			e.ReqHeadersLen, e.ReqBodyLen, e.RespHeadersLen, e.RespBodyLen,
 			boolToInt(e.ReqHeadersTruncated), boolToInt(e.ReqBodyTruncated),
 			boolToInt(e.RespHeadersTruncated), boolToInt(e.RespBodyTruncated),
+			attemptSummary.Count, attemptSummary.FirstMs, attemptSummary.LastMs,
+			attemptSummary.FinalStage, attemptSummary.FinalKind,
+			boolToInt(attemptSummary.Truncated),
+			attemptDiagnostics,
 		)
 		if err != nil {
 			if interruptible {
@@ -510,6 +527,88 @@ func (r *Repo) insertBatch(ctx context.Context, entries []proxy.RequestLogEntry,
 	}
 	committed = true
 	return inserted, nil
+}
+
+type attemptDiagnosticsSummary struct {
+	Count      int
+	FirstMs    int64
+	LastMs     int64
+	FinalStage string
+	FinalKind  string
+	Truncated  bool
+}
+
+func encodeAttemptDiagnostics(entry *proxy.RequestLogEntry) (attemptDiagnosticsSummary, string, error) {
+	if entry == nil {
+		return attemptDiagnosticsSummary{}, "[]", nil
+	}
+	normalized, truncated := proxy.NormalizeRequestAttemptDiagnostics(entry.AttemptDiagnostics)
+	summary := attemptDiagnosticsSummary{
+		Count:      entry.AttemptCount,
+		FinalStage: proxy.SanitizeRequestAttemptDiagnosticText(entry.UpstreamStage),
+		FinalKind:  proxy.SanitizeRequestAttemptDiagnosticText(entry.UpstreamErrKind),
+		Truncated:  entry.AttemptDiagnosticsTruncated || truncated,
+	}
+	if summary.Count < len(entry.AttemptDiagnostics) {
+		summary.Count = len(entry.AttemptDiagnostics)
+	}
+	if summary.Count > len(normalized) {
+		summary.Truncated = true
+	}
+	if summary.Count == 0 && len(normalized) > 0 {
+		summary.Count = len(normalized)
+	}
+	for _, diagnostic := range normalized {
+		first, last := attemptDiagnosticBounds(diagnostic)
+		if first > 0 && (summary.FirstMs == 0 || first < summary.FirstMs) {
+			summary.FirstMs = first
+		}
+		if last > summary.LastMs {
+			summary.LastMs = last
+		}
+		if summary.FinalKind == "" && diagnostic.ErrorKind != "" {
+			summary.FinalKind = diagnostic.ErrorKind
+		}
+	}
+	if len(normalized) > 0 {
+		lastDiagnostic := normalized[len(normalized)-1]
+		if summary.FinalKind == "" && lastDiagnostic.ErrorKind != "" {
+			summary.FinalKind = lastDiagnostic.ErrorKind
+		}
+	}
+	encoded := []byte("[]")
+	if len(normalized) > 0 {
+		var err error
+		encoded, err = json.Marshal(normalized)
+		if err != nil {
+			return attemptDiagnosticsSummary{}, "", err
+		}
+	}
+	if len(encoded) > proxy.MaxRequestAttemptDiagnosticsJSONBytes {
+		return attemptDiagnosticsSummary{}, "", fmt.Errorf("attempt diagnostics JSON exceeds %d bytes", proxy.MaxRequestAttemptDiagnosticsJSONBytes)
+	}
+	return summary, string(encoded), nil
+}
+
+func attemptDiagnosticBounds(d proxy.RequestAttemptDiagnostic) (int64, int64) {
+	values := [...]int64{
+		d.StartedMs, d.GotConnMs, d.WroteRequestMs, d.ResponseHeaderMs,
+		d.FirstResponseByteMs, d.BodyStartMs, d.RoundTripEndMs,
+		d.BodyFinishMs, d.RequestBodyFinishMs,
+	}
+	var first, last int64
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if first == 0 || value < first {
+			first = value
+		}
+		if value > last {
+			last = value
+		}
+	}
+	return first, last
 }
 
 func resetSQLiteBusyTimeout(conn *sql.Conn) (ok bool) {
@@ -582,15 +681,22 @@ type LogSummary struct {
 	IngressBytes        int64  `json:"ingress_bytes"`
 	EgressBytes         int64  `json:"egress_bytes"`
 
-	PayloadPresent       bool `json:"payload_present"`
-	ReqHeadersLen        int  `json:"req_headers_len"`
-	ReqBodyLen           int  `json:"req_body_len"`
-	RespHeadersLen       int  `json:"resp_headers_len"`
-	RespBodyLen          int  `json:"resp_body_len"`
-	ReqHeadersTruncated  bool `json:"req_headers_truncated"`
-	ReqBodyTruncated     bool `json:"req_body_truncated"`
-	RespHeadersTruncated bool `json:"resp_headers_truncated"`
-	RespBodyTruncated    bool `json:"resp_body_truncated"`
+	PayloadPresent              bool                             `json:"payload_present"`
+	ReqHeadersLen               int                              `json:"req_headers_len"`
+	ReqBodyLen                  int                              `json:"req_body_len"`
+	RespHeadersLen              int                              `json:"resp_headers_len"`
+	RespBodyLen                 int                              `json:"resp_body_len"`
+	ReqHeadersTruncated         bool                             `json:"req_headers_truncated"`
+	ReqBodyTruncated            bool                             `json:"req_body_truncated"`
+	RespHeadersTruncated        bool                             `json:"resp_headers_truncated"`
+	RespBodyTruncated           bool                             `json:"resp_body_truncated"`
+	AttemptCount                int                              `json:"attempt_count"`
+	AttemptFirstMs              int64                            `json:"attempt_first_ms"`
+	AttemptLastMs               int64                            `json:"attempt_last_ms"`
+	AttemptFinalStage           string                           `json:"attempt_final_stage"`
+	AttemptFinalKind            string                           `json:"attempt_final_kind"`
+	AttemptDiagnosticsTruncated bool                             `json:"attempt_diagnostics_truncated"`
+	AttemptDiagnostics          []proxy.RequestAttemptDiagnostic `json:"attempt_diagnostics"`
 }
 
 // PayloadRow holds the payload data for a single log entry.
@@ -832,6 +938,7 @@ func (r *Repo) queryAcrossRetainedDBsContext(
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("[requestlog] warning: %s query failed path=%q %s=%q: %v", op, path, keyName, keyValue, err)
+			return err
 		}
 		if err != nil && ctx.Err() != nil {
 			return ctx.Err()
@@ -1265,8 +1372,8 @@ func (r *Repo) queryLogByID(db *sql.DB, id string) (*LogSummary, error) {
 }
 
 func (r *Repo) queryLogByIDContext(ctx context.Context, db *sql.DB, id string) (*LogSummary, error) {
-	row := db.QueryRowContext(ctx, "SELECT "+logSummarySelectColumns+" FROM request_logs WHERE id = ?", id)
-	s, err := scanLogSummary(row)
+	row := db.QueryRowContext(ctx, "SELECT "+logDetailSelectColumns+" FROM request_logs WHERE id = ?", id)
+	s, err := scanLogDetail(row)
 	if err != nil {
 		return nil, err
 	}
@@ -1305,29 +1412,68 @@ type rowScanner interface {
 }
 
 func scanLogSummary(s rowScanner) (LogSummary, error) {
-	var row LogSummary
-	var netOK, payloadPresent, rht, rbt, rsht, rsbt int
-	err := s.Scan(
-		&row.ID, &row.TsNs, &row.ProxyType, &row.ClientIP,
-		&row.PlatformID, &row.PlatformName, &row.Account,
-		&row.TargetHost, &row.TargetURL, &row.NodeHash, &row.NodeTag, &row.EgressIP,
-		&row.DurationNs, &row.FirstByteDurationNs, &netOK, &row.HTTPMethod, &row.HTTPStatus,
-		&row.ResinError, &row.UpstreamStage, &row.UpstreamErrKind, &row.UpstreamErrno, &row.UpstreamErrMsg,
-		&row.IngressBytes, &row.EgressBytes,
-		&payloadPresent,
-		&row.ReqHeadersLen, &row.ReqBodyLen, &row.RespHeadersLen, &row.RespBodyLen,
-		&rht, &rbt, &rsht, &rsbt,
-	)
-	if err != nil {
+	scan := newLogSummaryScan()
+	if err := s.Scan(scan.destinations()...); err != nil {
 		return LogSummary{}, err
 	}
-	row.NetOK = netOK != 0
-	row.PayloadPresent = payloadPresent != 0
-	row.ReqHeadersTruncated = rht != 0
-	row.ReqBodyTruncated = rbt != 0
-	row.RespHeadersTruncated = rsht != 0
-	row.RespBodyTruncated = rsbt != 0
+	return scan.result(), nil
+}
+
+func scanLogDetail(s rowScanner) (LogSummary, error) {
+	scan := newLogSummaryScan()
+	var attemptDiagnosticsJSON string
+	destinations := scan.destinations()
+	destinations = append(destinations, &attemptDiagnosticsJSON)
+	if err := s.Scan(destinations...); err != nil {
+		return LogSummary{}, err
+	}
+	row := scan.result()
+	if attemptDiagnosticsJSON == "" {
+		return row, nil
+	}
+	if err := json.Unmarshal([]byte(attemptDiagnosticsJSON), &row.AttemptDiagnostics); err != nil {
+		return LogSummary{}, fmt.Errorf("decode attempt diagnostics: %w", err)
+	}
 	return row, nil
+}
+
+type logSummaryScan struct {
+	row                  LogSummary
+	netOK                int
+	payload              int
+	rht, rbt, rsht, rsbt int
+	attemptTruncated     int
+}
+
+func newLogSummaryScan() *logSummaryScan {
+	return &logSummaryScan{}
+}
+
+func (s *logSummaryScan) destinations() []any {
+	return []any{
+		&s.row.ID, &s.row.TsNs, &s.row.ProxyType, &s.row.ClientIP,
+		&s.row.PlatformID, &s.row.PlatformName, &s.row.Account,
+		&s.row.TargetHost, &s.row.TargetURL, &s.row.NodeHash, &s.row.NodeTag, &s.row.EgressIP,
+		&s.row.DurationNs, &s.row.FirstByteDurationNs, &s.netOK, &s.row.HTTPMethod, &s.row.HTTPStatus,
+		&s.row.ResinError, &s.row.UpstreamStage, &s.row.UpstreamErrKind, &s.row.UpstreamErrno, &s.row.UpstreamErrMsg,
+		&s.row.IngressBytes, &s.row.EgressBytes,
+		&s.payload,
+		&s.row.ReqHeadersLen, &s.row.ReqBodyLen, &s.row.RespHeadersLen, &s.row.RespBodyLen,
+		&s.rht, &s.rbt, &s.rsht, &s.rsbt,
+		&s.row.AttemptCount, &s.row.AttemptFirstMs, &s.row.AttemptLastMs,
+		&s.row.AttemptFinalStage, &s.row.AttemptFinalKind, &s.attemptTruncated,
+	}
+}
+
+func (s *logSummaryScan) result() LogSummary {
+	s.row.NetOK = s.netOK != 0
+	s.row.PayloadPresent = s.payload != 0
+	s.row.ReqHeadersTruncated = s.rht != 0
+	s.row.ReqBodyTruncated = s.rbt != 0
+	s.row.RespHeadersTruncated = s.rsht != 0
+	s.row.RespBodyTruncated = s.rsbt != 0
+	s.row.AttemptDiagnosticsTruncated = s.attemptTruncated != 0
+	return s.row
 }
 
 func boolToInt(b bool) int {

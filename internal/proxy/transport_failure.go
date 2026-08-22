@@ -62,6 +62,9 @@ func applyTransportFailureRule(
 	err error,
 ) (platform.ResponseRuleMatch, bool, string) {
 	kind := classifyTransportFailure(err, trace)
+	if errors.Is(err, errNonCompliantAttemptCallLimit) {
+		return platform.ResponseRuleMatch{}, false, "attempt_call_limit"
+	}
 	if kind == "" || kind == "canceled" || len(route.ResponseRules) == 0 {
 		return platform.ResponseRuleMatch{}, false, kind
 	}
