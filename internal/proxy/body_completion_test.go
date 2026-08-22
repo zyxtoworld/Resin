@@ -93,8 +93,62 @@ func waitForChannel[T any](t *testing.T, ch <-chan T, what string) T {
 	}
 }
 
+type gatedResponseBody struct {
+	allow  <-chan struct{}
+	reader *strings.Reader
+}
+
+func (b *gatedResponseBody) Read(p []byte) (int, error) {
+	<-b.allow
+	return b.reader.Read(p)
+}
+
+func (b *gatedResponseBody) Close() error { return nil }
+
+type releaseAndWaitResponseBody struct {
+	release   chan<- struct{}
+	completed <-chan struct{}
+	reader    *strings.Reader
+	once      sync.Once
+}
+
+func (b *releaseAndWaitResponseBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.release) })
+	<-b.completed
+	return b.reader.Read(p)
+}
+
+func (b *releaseAndWaitResponseBody) Close() error { return nil }
+
+type closeSignalReadCloser struct {
+	io.ReadCloser
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (b *closeSignalReadCloser) Close() error {
+	err := b.ReadCloser.Close()
+	b.closeOnce.Do(func() { close(b.closed) })
+	return err
+}
+
+type closeCountingResponseBody struct {
+	reader *strings.Reader
+	closes atomic.Int32
+}
+
+func (b *closeCountingResponseBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *closeCountingResponseBody) Close() error {
+	b.closes.Add(1)
+	return nil
+}
+
 func TestForwardProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 	allowBody := make(chan struct{})
+	allowResponse := make(chan struct{})
 	rt := &asyncBodyRoundTripper{
 		allowBody:   allowBody,
 		returned:    make(chan struct{}),
@@ -103,7 +157,7 @@ func TestForwardProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 		response: &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("forward-ok")),
+			Body:       &gatedResponseBody{allow: allowResponse, reader: strings.NewReader("forward-ok")},
 		},
 	}
 	emitter := newMockEventEmitter()
@@ -127,13 +181,14 @@ func TestForwardProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 	waitForChannel(t, rt.returned, "forward RoundTrip return")
 	select {
 	case <-done:
-		t.Fatal("forward returned before the asynchronous body completed")
+		t.Fatal("forward returned before the response body was released")
 	default:
 	}
 	close(allowBody)
 	if got := string(waitForChannel(t, rt.readDone, "forward body read")); got != "forward-body" {
 		t.Fatalf("forward body: got %q, want %q", got, "forward-body")
 	}
+	close(allowResponse)
 	waitForChannel(t, done, "forward handler")
 	if response.Code != http.StatusOK || response.Body.String() != "forward-ok" {
 		t.Fatalf("forward response: status=%d body=%q", response.Code, response.Body.String())
@@ -152,6 +207,7 @@ func TestForwardProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 
 func TestReverseProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 	allowBody := make(chan struct{})
+	allowResponse := make(chan struct{})
 	rt := &asyncBodyRoundTripper{
 		allowBody:   allowBody,
 		returned:    make(chan struct{}),
@@ -160,7 +216,7 @@ func TestReverseProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 		response: &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("reverse-ok")),
+			Body:       &gatedResponseBody{allow: allowResponse, reader: strings.NewReader("reverse-ok")},
 		},
 	}
 	emitter := newMockEventEmitter()
@@ -187,13 +243,14 @@ func TestReverseProxyDirectBodyCompletionUsesSharedOwner(t *testing.T) {
 	waitForChannel(t, rt.returned, "reverse RoundTrip return")
 	select {
 	case <-done:
-		t.Fatal("reverse returned before the asynchronous body completed")
+		t.Fatal("reverse returned before the response body was released")
 	default:
 	}
 	close(allowBody)
 	if got := string(waitForChannel(t, rt.readDone, "reverse body read")); got != "reverse-body" {
 		t.Fatalf("reverse body: got %q, want %q", got, "reverse-body")
 	}
+	close(allowResponse)
 	waitForChannel(t, done, "reverse handler")
 	if response.Code != http.StatusOK || response.Body.String() != "reverse-ok" {
 		t.Fatalf("reverse response: status=%d body=%q", response.Code, response.Body.String())
@@ -299,7 +356,7 @@ func TestDirectProxyBodyCompletionWaitsForAsyncError(t *testing.T) {
 	}
 }
 
-func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
+func TestReverseRetryResponseRuleReplayableBodyUsesDistinctNext(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	plat, ok := env.pool.GetPlatform("plat-id")
 	if !ok {
@@ -308,8 +365,8 @@ func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
 	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
 		ID: "retryable", Enabled: true,
 		Match: model.PlatformResponseRuleMatch{
-			StatusCodes: []int{http.StatusBadGateway},
-			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "retryable"},
+			StatusCodes: []int{http.StatusTooManyRequests},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "rate-limited"},
 		},
 		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
 	}})
@@ -325,15 +382,9 @@ func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
 	initial.RetryBudget = 2
 
 	const payload = `{"stream":true}`
-	allowBody := []chan struct{}{make(chan struct{}), make(chan struct{})}
-	returned := []chan struct{}{make(chan struct{}), make(chan struct{})}
-	type bodyReadResult struct {
-		attempt int
-		body    string
-	}
-	bodyRead := make(chan bodyReadResult, 2)
-	commits := make(chan int64, 2)
 	var calls atomic.Int32
+	attemptedIPs := make([]string, 0, 2)
+	commits := make(chan int64, 2)
 	traceOwner := newUpstreamRequestTrace()
 	retry := &reverseRetryRoundTripper{
 		router:  env.router,
@@ -343,91 +394,185 @@ func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
 			attempt := traceOwner.newAttempt()
 			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
 		},
-		transportFor: func(_ routedOutbound) http.RoundTripper {
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
 			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				trace := httptrace.ContextClientTrace(req.Context())
-				attempt := int(calls.Add(1)) - 1
-				if attempt >= len(allowBody) {
-					t.Fatalf("unexpected retry attempt %d", attempt+1)
+				attempt := int(calls.Add(1))
+				attemptedIPs = append(attemptedIPs, candidate.Route.EgressIP.String())
+				body, readErr := io.ReadAll(req.Body)
+				closeErr := req.Body.Close()
+				if readErr != nil || closeErr != nil || string(body) != payload {
+					t.Fatalf("attempt %d body completion: body=%q read=%v close=%v", attempt, body, readErr, closeErr)
 				}
-				go func() {
-					close(returned[attempt])
-					<-allowBody[attempt]
-					body, readErr := io.ReadAll(req.Body)
-					closeErr := req.Body.Close()
-					if readErr != nil || closeErr != nil {
-						t.Errorf("attempt %d body completion: read=%v close=%v", attempt+1, readErr, closeErr)
-					}
-					if trace != nil {
-						trace.GotConn(httptrace.GotConnInfo{})
-						trace.WroteRequest(httptrace.WroteRequestInfo{})
-					}
-					bodyRead <- bodyReadResult{attempt: attempt, body: string(body)}
-				}()
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace != nil {
+					trace.GotConn(httptrace.GotConnInfo{})
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+				}
 				status := http.StatusOK
 				responseBody := "ok"
-				if attempt == 0 {
-					status = http.StatusBadGateway
-					responseBody = "retryable"
+				if attempt == 1 {
+					status = http.StatusTooManyRequests
+					responseBody = "rate-limited"
 				}
 				return &http.Response{
 					StatusCode: status,
 					Header:     make(http.Header),
 					Body:       io.NopCloser(strings.NewReader(responseBody)),
+					Request:    req,
 				}, nil
 			})
 		},
-		onAttemptEgress: func(_, bodyBytes int64) {
-			commits <- bodyBytes
-		},
+		onAttemptEgress: func(_, bodyBytes int64) { commits <- bodyBytes },
 	}
 
-	result := make(chan struct {
-		resp *http.Response
-		err  error
-	}, 1)
-	go func() {
-		request := httptest.NewRequest(http.MethodPost, "https://example.com/retry", strings.NewReader(payload))
-		resp, roundTripErr := retry.RoundTrip(request)
-		result <- struct {
-			resp *http.Response
-			err  error
-		}{resp: resp, err: roundTripErr}
-	}()
-
-	waitForChannel(t, returned[0], "first retry RoundTrip return")
-	select {
-	case <-commits:
-		t.Fatal("first retry committed before body completion")
-	default:
+	resp, err := retry.RoundTrip(httptest.NewRequest(http.MethodPost, "https://example.com/retry", strings.NewReader(payload)))
+	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("replayable 429 retry: resp=%#v err=%v", resp, err)
 	}
-	close(allowBody[0])
-	firstBody := waitForChannel(t, bodyRead, "first retry body")
-	firstCommit := waitForChannel(t, commits, "first retry commit")
-	if firstBody.attempt != 0 || firstBody.body != payload || firstCommit != int64(len(payload)) {
-		t.Fatalf("first retry accounting: body=%+v commit=%d", firstBody, firstCommit)
-	}
-
-	waitForChannel(t, returned[1], "second retry RoundTrip return")
-	select {
-	case <-result:
-		t.Fatal("retry completed before second body completion")
-	default:
-	}
-	close(allowBody[1])
-	secondBody := waitForChannel(t, bodyRead, "second retry body")
-	secondCommit := waitForChannel(t, commits, "second retry commit")
-	if secondBody.attempt != 1 || secondBody.body != payload || secondCommit != int64(len(payload)) {
-		t.Fatalf("second retry accounting: body=%+v commit=%d", secondBody, secondCommit)
-	}
-
-	outcome := waitForChannel(t, result, "final retry response")
-	if outcome.err != nil || outcome.resp == nil || outcome.resp.StatusCode != http.StatusOK {
-		t.Fatalf("final retry outcome: resp=%#v err=%v", outcome.resp, outcome.err)
-	}
-	_ = outcome.resp.Body.Close()
+	_ = resp.Body.Close()
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("retry attempts: got %d, want 2", got)
+	}
+	if len(attemptedIPs) != 2 || attemptedIPs[0] == attemptedIPs[1] {
+		t.Fatalf("retry did not use distinct egress IPs: %v", attemptedIPs)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if got := waitForChannel(t, commits, "replayable 429 egress commit"); got != int64(len(payload)) {
+			t.Fatalf("attempt %d egress body bytes: got %d, want %d", attempt+1, got, len(payload))
+		}
+	}
+	select {
+	case got := <-commits:
+		t.Fatalf("duplicate egress commit: %d", got)
+	default:
+	}
+}
+
+func TestReverseRetryAsyncBodyCompletionEachAttemptCommitsOnce(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "retryable", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{
+			StatusCodes: []int{http.StatusTooManyRequests},
+			Body:        &model.PlatformResponseBodyMatch{Op: "contains", Value: "rate-limited"},
+		},
+		Action: model.PlatformResponseRuleAction{Type: "retry_next"},
+	}})
+	if err != nil {
+		t.Fatalf("compile response rule: %v", err)
+	}
+	plat.ResponseRules = rules
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	initial, err := env.router.RouteRequest("plat", "async-body", "https://example.com/retry")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	initial.RetryBudget = 2
+
+	const payload = `{"stream":true}`
+	type bodyObservation struct {
+		body     []byte
+		readErr  error
+		closeErr error
+	}
+	allowFirstBody := make(chan struct{})
+	firstBodyDone := make(chan struct{})
+	bodyObservations := make(chan bodyObservation, 2)
+	var calls atomic.Int32
+	attemptedIPs := make([]string, 0, 2)
+	commits := make(chan int64, 2)
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(candidate routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempt := int(calls.Add(1))
+				attemptedIPs = append(attemptedIPs, candidate.Route.EgressIP.String())
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace != nil {
+					trace.GotConn(httptrace.GotConnInfo{})
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+				}
+				if attempt == 1 {
+					if req.GetBody != nil {
+						t.Fatalf("async first attempt unexpectedly had GetBody")
+					}
+					go func() {
+						<-allowFirstBody
+						body, readErr := io.ReadAll(req.Body)
+						closeErr := req.Body.Close()
+						bodyObservations <- bodyObservation{body: body, readErr: readErr, closeErr: closeErr}
+						close(firstBodyDone)
+					}()
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     make(http.Header),
+						Body: &releaseAndWaitResponseBody{
+							release:   allowFirstBody,
+							completed: firstBodyDone,
+							reader:    strings.NewReader("rate-limited"),
+						},
+						Request: req,
+					}, nil
+				}
+
+				body, readErr := io.ReadAll(req.Body)
+				closeErr := req.Body.Close()
+				bodyObservations <- bodyObservation{body: body, readErr: readErr, closeErr: closeErr}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+		},
+		onAttemptEgress: func(_, bodyBytes int64) { commits <- bodyBytes },
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "https://example.com/retry", nil)
+	request.Body = io.NopCloser(strings.NewReader(payload))
+	request.GetBody = nil
+	request.ContentLength = int64(len(payload))
+	resp, err := retry.RoundTrip(request)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("async replayable 429 retry: resp=%#v err=%v attempts=%d", resp, err, calls.Load())
+	}
+	if body, readErr := io.ReadAll(resp.Body); readErr != nil || string(body) != "ok" {
+		t.Fatalf("async final response: body=%q err=%v", body, readErr)
+	}
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Fatalf("close async final response: %v", closeErr)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("async retry attempts: got %d, want 2", got)
+	}
+	if len(attemptedIPs) != 2 || attemptedIPs[0] == attemptedIPs[1] {
+		t.Fatalf("async retry did not use distinct egress IPs: %v", attemptedIPs)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		observation := waitForChannel(t, bodyObservations, "async request body completion")
+		if observation.readErr != nil || observation.closeErr != nil || string(observation.body) != payload {
+			t.Fatalf("attempt %d body completion: body=%q read=%v close=%v", attempt+1, observation.body, observation.readErr, observation.closeErr)
+		}
+		if got := waitForChannel(t, commits, "async egress commit"); got != int64(len(payload)) {
+			t.Fatalf("attempt %d egress body bytes: got %d, want %d", attempt+1, got, len(payload))
+		}
+	}
+	select {
+	case got := <-commits:
+		t.Fatalf("duplicate async egress commit: %d", got)
+	default:
 	}
 }
 
@@ -504,7 +649,7 @@ func (b *completionTrackingBody) Close() error {
 	return nil
 }
 
-func TestRoundTripWithBodyCompletionNeverCloseFailsClosed(t *testing.T) {
+func TestRoundTripWithBodyCompletionAcceptsResponseBeforeRequestBodyClose(t *testing.T) {
 	responseBody := &completionTrackingBody{closed: make(chan struct{})}
 	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: responseBody}, nil
@@ -513,10 +658,280 @@ func TestRoundTripWithBodyCompletionNeverCloseFailsClosed(t *testing.T) {
 	resp, err, bytes, complete := roundTripWithBodyCompletionBudget(
 		request.Context(), rt, request, 25*time.Millisecond,
 	)
-	if complete || !errors.Is(err, errAttemptBodyQuiescence) || resp != nil || bytes != 0 {
+	if complete || err != nil || resp == nil || bytes != 0 {
 		t.Fatalf("outcome: resp=%#v err=%v bytes=%d complete=%v", resp, err, bytes, complete)
 	}
+	if _, readErr := io.ReadAll(resp.Body); readErr != nil {
+		t.Fatalf("read accepted response: %v", readErr)
+	}
+	_ = resp.Body.Close()
 	waitForChannel(t, responseBody.closed, "response body close")
+}
+
+func TestRoundTripWithBodyCompletionReturnsStartedResponseBeforeRequestBodyClose(t *testing.T) {
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("started-before-request-close")),
+		}, nil
+	})
+	request := httptest.NewRequest(http.MethodPost, "http://example.com", strings.NewReader("request-body"))
+	started := time.Now()
+	resp, err, bytes, complete := roundTripWithBodyCompletionBudget(
+		request.Context(), rt, request, 250*time.Millisecond,
+	)
+	if err != nil || resp == nil || complete || bytes != 0 {
+		t.Fatalf("outcome: resp=%#v err=%v bytes=%d complete=%v", resp, err, bytes, complete)
+	}
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Fatalf("response was blocked on request-body close for %v", elapsed)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("read started response: %v", readErr)
+	}
+	if string(body) != "started-before-request-close" {
+		t.Fatalf("response body: got %q", body)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestAttemptBodyCompletionDoesNotAbortAcceptedResponseAfterQuiescenceBudget(t *testing.T) {
+	requestBody := &completionTrackingBody{closed: make(chan struct{})}
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("still-streaming")),
+		}, nil
+	})
+	request := httptest.NewRequest(http.MethodPost, "http://example.com", requestBody)
+	resp, err, _, complete := roundTripWithBodyCompletionBudget(
+		request.Context(), rt, request, 25*time.Millisecond,
+	)
+	if err != nil || resp == nil || complete {
+		t.Fatalf("outcome: resp=%#v err=%v complete=%v", resp, err, complete)
+	}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-requestBody.closed:
+		t.Fatal("accepted response completion aborted the request body on the old budget")
+	case <-timer.C:
+	}
+	if _, readErr := io.ReadAll(resp.Body); readErr != nil {
+		t.Fatalf("read accepted response after budget: %v", readErr)
+	}
+	_ = resp.Body.Close()
+	waitForChannel(t, requestBody.closed, "request body close after response close")
+}
+
+func TestAttemptBodyCompletionCloseFinalizesWithoutWaitingAndOnlyOnce(t *testing.T) {
+	requestBody := &completionTrackingBody{closed: make(chan struct{})}
+	responseUnderlying := &closeCountingResponseBody{reader: strings.NewReader("response")}
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       responseUnderlying,
+		}, nil
+	})
+	request := httptest.NewRequest(http.MethodPost, "http://example.com", requestBody)
+	resp, err, _, complete := roundTripWithBodyCompletionBudget(
+		request.Context(), rt, request, 250*time.Millisecond,
+	)
+	if err != nil || resp == nil || complete {
+		t.Fatalf("outcome: resp=%#v err=%v complete=%v", resp, err, complete)
+	}
+	completion := responseBodyCompletion(resp)
+	if completion == nil {
+		t.Fatal("accepted response has no body completion")
+	}
+	finalized := make(chan struct{}, 2)
+	var callbackCount atomic.Int32
+	var finalBytes atomic.Int64
+	var finalComplete atomic.Bool
+	completion.handoff(nil, func(bodyBytes int64, bodyComplete bool) {
+		callbackCount.Add(1)
+		finalBytes.Store(bodyBytes)
+		finalComplete.Store(bodyComplete)
+		finalized <- struct{}{}
+	})
+	started := time.Now()
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Fatalf("close response: %v", closeErr)
+	}
+	if elapsed := time.Since(started); elapsed >= 100*time.Millisecond {
+		t.Fatalf("response Close waited for request-body quiescence: %v", elapsed)
+	}
+	waitForChannel(t, finalized, "body completion callback")
+	if got := callbackCount.Load(); got != 1 {
+		t.Fatalf("callback count after Close: got %d, want 1", got)
+	}
+	if got := responseUnderlying.closes.Load(); got != 1 {
+		t.Fatalf("underlying response Close count: got %d, want 1", got)
+	}
+	if finalComplete.Load() || finalBytes.Load() != 0 {
+		t.Fatalf("incomplete request body was committed: complete=%v bytes=%d", finalComplete.Load(), finalBytes.Load())
+	}
+	_ = resp.Body.Close()
+	select {
+	case <-finalized:
+		t.Fatal("body completion callback fired more than once")
+	default:
+	}
+	if got := responseUnderlying.closes.Load(); got != 1 {
+		t.Fatalf("underlying response Close count after repeated Close: got %d, want 1", got)
+	}
+	waitForChannel(t, requestBody.closed, "abandoned request body close")
+}
+
+func TestAttemptBodyCompletionCancellationWaitsForResponseLifecycleToFinalize(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	requestBody := &completionTrackingBody{closed: make(chan struct{})}
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("response")),
+		}, nil
+	})
+	request := httptest.NewRequestWithContext(ctx, http.MethodPost, "http://example.com", requestBody)
+	resp, err, _, complete := roundTripWithBodyCompletionBudget(ctx, rt, request, time.Second)
+	if err != nil || resp == nil || complete {
+		t.Fatalf("outcome: resp=%#v err=%v complete=%v", resp, err, complete)
+	}
+	completion := responseBodyCompletion(resp)
+	if completion == nil {
+		t.Fatal("accepted response has no body completion")
+	}
+	finalized := make(chan struct{}, 1)
+	completion.handoff(nil, func(bodyBytes int64, bodyComplete bool) {
+		if bodyBytes != 0 || bodyComplete {
+			t.Errorf("canceled request body committed: complete=%v bytes=%d", bodyComplete, bodyBytes)
+		}
+		finalized <- struct{}{}
+	})
+	cancel()
+	select {
+	case <-finalized:
+		t.Fatal("context cancellation finalized lifecycle asynchronously")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Fatalf("close canceled response: %v", closeErr)
+	}
+	waitForChannel(t, finalized, "canceled body completion callback")
+	waitForChannel(t, requestBody.closed, "canceled request body close")
+}
+
+func TestReverseRetryStartedResponseDoesNotRetryBeforeRequestBodyCompletion(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "started-response", "https://example.com/started")
+	if err != nil {
+		t.Fatalf("initial route: %v", err)
+	}
+	// This test is a lifecycle canary, not a response-rule retry test. Disable
+	// the request-level capture budget so the attempt owner wraps requestBody
+	// itself and response Close is the only abandonment path under test.
+	initial.RequestTotalTimeout = 0
+
+	allowRequestBody := make(chan struct{})
+	allowResponseBody := make(chan struct{})
+	requestBodyClosed := make(chan struct{})
+	requestBody := &closeSignalReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("request-body")),
+		closed:     requestBodyClosed,
+	}
+	requestBodyRead := make(chan string, 1)
+	commits := make(chan int64, 1)
+	returned := make(chan struct{})
+	var calls atomic.Int32
+	traceOwner := newUpstreamRequestTrace()
+	retry := &reverseRetryRoundTripper{
+		router:  env.router,
+		pool:    env.pool,
+		initial: routedOutbound{Route: initial, Entry: initial.SelectedEntry()},
+		decorateAttempt: func(req *http.Request, _ routedOutbound) (*http.Request, *upstreamRequestAttemptTrace) {
+			attempt := traceOwner.newAttempt()
+			return req.WithContext(httptrace.WithClientTrace(req.Context(), attempt.clientTrace())), attempt
+		},
+		transportFor: func(routedOutbound) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace != nil {
+					trace.GotConn(httptrace.GotConnInfo{})
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+				}
+				go func() {
+					<-allowRequestBody
+					body, readErr := io.ReadAll(req.Body)
+					if readErr != nil {
+						t.Errorf("request body read: %v", readErr)
+					}
+					requestBodyRead <- string(body)
+				}()
+				close(returned)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       &gatedResponseBody{allow: allowResponseBody, reader: strings.NewReader("first-response")},
+				}, nil
+			})
+		},
+		onAttemptEgress: func(_, bodyBytes int64) { commits <- bodyBytes },
+	}
+
+	result := make(chan struct {
+		resp *http.Response
+		err  error
+	}, 1)
+	go func() {
+		resp, roundTripErr := retry.RoundTrip(httptest.NewRequest(
+			http.MethodPost,
+			"https://example.com/started",
+			requestBody,
+		))
+		result <- struct {
+			resp *http.Response
+			err  error
+		}{resp: resp, err: roundTripErr}
+	}()
+
+	waitForChannel(t, returned, "started response")
+	outcome := waitForChannel(t, result, "started response result")
+	if outcome.err != nil || outcome.resp == nil || outcome.resp.StatusCode != http.StatusOK {
+		t.Fatalf("started response result: resp=%#v err=%v", outcome.resp, outcome.err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("started response retried: got %d attempts, want 1", got)
+	}
+
+	oldBudget := time.NewTimer(attemptBodyQuiescenceBudget + 50*time.Millisecond)
+	defer oldBudget.Stop()
+	select {
+	case <-requestBodyClosed:
+		t.Fatal("accepted response inherited the old request-body quiescence timeout")
+	case <-oldBudget.C:
+	}
+
+	close(allowResponseBody)
+	body, readErr := io.ReadAll(outcome.resp.Body)
+	if readErr != nil || string(body) != "first-response" {
+		t.Fatalf("started response body: body=%q err=%v", body, readErr)
+	}
+	if closeErr := outcome.resp.Body.Close(); closeErr != nil {
+		t.Fatalf("close started response: %v", closeErr)
+	}
+	waitForChannel(t, requestBodyClosed, "aborted request body close")
+	close(allowRequestBody)
+	if got := waitForChannel(t, requestBodyRead, "aborted request body read"); got != "" {
+		t.Fatalf("aborted request body was replayed: %q", got)
+	}
+	select {
+	case got := <-commits:
+		t.Fatalf("incomplete started response committed egress: %d", got)
+	default:
+	}
 }
 
 func TestBodyCompletionCancellationFailsClosedForAllRealCallers(t *testing.T) {
@@ -628,9 +1043,12 @@ func TestBodyCompletionCancellationFailsClosedForReverseRetryCaller(t *testing.T
 	}()
 	waitForChannel(t, rt.returned, "never-close retry RoundTrip return")
 	cancel()
-	outcome := waitForChannel(t, result, "canceled reverse retry")
-	if outcome.resp != nil || !errors.Is(outcome.err, context.Canceled) {
+	outcome := waitForChannel(t, result, "accepted reverse retry response")
+	if outcome.resp == nil || outcome.err != nil {
 		t.Fatalf("retry outcome: resp=%#v err=%v", outcome.resp, outcome.err)
+	}
+	if closeErr := outcome.resp.Body.Close(); closeErr != nil {
+		t.Fatalf("close accepted retry response: %v", closeErr)
 	}
 	waitForChannel(t, responseBody.closed, "canceled retry response body close")
 	select {
@@ -681,15 +1099,27 @@ func TestRoundTripWithBodyCompletionCancellationDoesNotPublishCapture(t *testing
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
 	})
 
-	result := make(chan bool, 1)
+	result := make(chan struct {
+		resp     *http.Response
+		complete bool
+	}, 1)
 	go func() {
-		_, _, _, complete := roundTripWithBodyCompletionBudget(ctx, rt, request, time.Second)
-		result <- complete
+		resp, _, _, complete := roundTripWithBodyCompletionBudget(ctx, rt, request, time.Second)
+		result <- struct {
+			resp     *http.Response
+			complete bool
+		}{resp: resp, complete: complete}
 	}()
 	waitForChannel(t, source.readStarted, "blocked request read")
 	cancel()
-	if waitForChannel(t, result, "canceled attempt") {
+	outcome := waitForChannel(t, result, "canceled attempt")
+	if outcome.complete {
 		t.Fatal("canceled attempt reported a completed body")
+	}
+	if outcome.resp != nil {
+		if closeErr := outcome.resp.Body.Close(); closeErr != nil {
+			t.Fatalf("close canceled response: %v", closeErr)
+		}
 	}
 	waitForChannel(t, readDone, "blocked read exit")
 	lifecycle.finish()

@@ -933,6 +933,9 @@ func TestReverseRetryRoundTripper_TimeoutBeforeBodyReadCoolsAndRetriesReplayable
 	started := time.Now()
 	req := httptest.NewRequest(http.MethodPost, "https://example.com/ccload-like", strings.NewReader(string(payload)))
 	req.ContentLength = int64(len(payload))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
 	resp, err := retry.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("timeout retry: %v", err)
@@ -1051,6 +1054,9 @@ func TestReverseRetryRoundTripper_RetriesSmallUnknownLengthBodyAfterUnreadTimeou
 	req := httptest.NewRequest(http.MethodPost, "https://example.com/chunked", requestBody)
 	req.ContentLength = -1
 	req.TransferEncoding = []string{"chunked"}
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
 	if req.ContentLength >= 0 {
 		t.Fatalf("test request unexpectedly has known content length: %d", req.ContentLength)
 	}
@@ -1129,6 +1135,9 @@ func TestReverseRetryRoundTripper_RetriesUnknownEmptyBodyAfterUnreadTimeout(t *t
 	req := httptest.NewRequest(http.MethodPost, "https://example.com/empty", io.NopCloser(strings.NewReader("")))
 	req.ContentLength = -1
 	req.TransferEncoding = []string{"chunked"}
+	req.GetBody = func() (io.ReadCloser, error) {
+		return http.NoBody, nil
+	}
 	resp, err := retry.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("unknown empty body retry: %v", err)
@@ -1443,6 +1452,9 @@ func TestReverseRetryRoundTripper_KnownBodyBudgetDeadlineAbortsBeforeAttempt(t *
 	go func() {
 		req := httptest.NewRequest(http.MethodPost, "https://example.com/deadline-body", body)
 		req.ContentLength = 4
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("body")), nil
+		}
 		_, roundTripErr := retry.RoundTrip(req)
 		result <- roundTripErr
 	}()
@@ -1495,6 +1507,9 @@ func TestReverseRetryRoundTripper_KnownBodyCallerCancellationAbortsBeforeAttempt
 	go func() {
 		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "https://example.com/canceled-body", body)
 		req.ContentLength = 4
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("body")), nil
+		}
 		_, roundTripErr := retry.RoundTrip(req)
 		result <- roundTripErr
 	}()
@@ -1893,6 +1908,67 @@ func TestReverseRetryRoundTripper_UnconfiguredPlatformKeepsFullCallerLifetime(t 
 	_ = resp.Body.Close()
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("unconfigured platform attempts: got %d, want 1", got)
+	}
+}
+
+func TestForwardProxy_StartedResponseIdleTimeoutDoesNotRetry(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	plat, ok := env.pool.GetPlatform("plat-id")
+	if !ok {
+		t.Fatal("platform not found")
+	}
+	rules, err := platform.CompileResponseRules("plat-id", []model.PlatformResponseRule{{
+		ID: "idle-timeout", Enabled: true,
+		Match: model.PlatformResponseRuleMatch{FailureKinds: []string{"idle_timeout"}},
+		Action: model.PlatformResponseRuleAction{
+			Type:          "cooldown_then_retry_next",
+			CooldownScope: "egress_ip",
+			Fallback:      "fixed_duration",
+			FixedDuration: "1m",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompileResponseRules: %v", err)
+	}
+	plat.ResponseRules = rules
+	plat.ProxyRequestTotalTimeoutNs = int64(3 * time.Second)
+	setupResponseRetryNode(t, env, `{"type":"stub","server":"127.0.0.2","server_port":2}`, "203.0.113.11", "127.0.0.1:1")
+	routed, routeErr := resolveRoutedOutbound(env.router, env.pool, "plat", "started-idle", "example.com")
+	if routeErr != nil {
+		t.Fatalf("initial route: %v", routeErr)
+	}
+	if !env.router.CommitRouteForAccount(routed.Route, "started-idle") {
+		t.Fatal("failed to pin initial route for transport injection")
+	}
+
+	var attempts atomic.Int32
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool})
+	transport := fp.outboundHTTPTransport(routed)
+	transport.RegisterProtocol("http", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		trace := httptrace.ContextClientTrace(req.Context())
+		if trace == nil || trace.GotConn == nil || trace.WroteRequest == nil || trace.GotFirstResponseByte == nil {
+			t.Fatal("started-idle forward attempt missing trace callbacks")
+		}
+		trace.GotConn(httptrace.GotConnInfo{})
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+		trace.GotFirstResponseByte()
+		return nil, deadlineExceededErr{}
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/started-idle", nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.started-idle", "tok"))
+	response := httptest.NewRecorder()
+	fp.ServeHTTP(response, req)
+	if response.Code != http.StatusGatewayTimeout {
+		t.Fatalf("started-idle status: got %d body=%q resin=%q attempts=%d, want 504", response.Code, response.Body.String(), response.Header().Get("X-Resin-Error"), attempts.Load())
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("started-idle response retried: got %d attempts, want 1", got)
+	}
+	cooldowns, ok := env.router.SnapshotResponseCooldownsForPlatform("plat-id", time.Now())
+	if !ok || len(cooldowns) != 1 || cooldowns[0].EgressIP != routed.Route.EgressIP {
+		t.Fatalf("started-idle cooldowns: ok=%v cooldowns=%v initial_ip=%s", ok, cooldowns, routed.Route.EgressIP)
 	}
 }
 
@@ -2339,13 +2415,15 @@ func TestReverseRetryRoundTripper_WaitsForRequestBodyCompletionBeforeEgressCommi
 			case <-time.After(time.Second):
 				t.Fatal("request body did not finish")
 			}
-			select {
-			case got := <-committed:
-				if got != int64(len(payload)) {
-					t.Fatalf("egress body bytes: got %d, want %d", got, len(payload))
+			if tc.wantErr {
+				select {
+				case got := <-committed:
+					if got != int64(len(payload)) {
+						t.Fatalf("egress body bytes: got %d, want %d", got, len(payload))
+					}
+				case <-time.After(time.Second):
+					t.Fatal("egress was not committed after request body completion")
 				}
-			case <-time.After(time.Second):
-				t.Fatal("egress was not committed after request body completion")
 			}
 
 			outcome := <-result
@@ -2363,7 +2441,17 @@ func TestReverseRetryRoundTripper_WaitsForRequestBodyCompletionBeforeEgressCommi
 				if outcome.resp == nil || outcome.resp.StatusCode != http.StatusOK {
 					t.Fatalf("RoundTrip response: %#v, want 200", outcome.resp)
 				}
-				_ = outcome.resp.Body.Close()
+				if closeErr := outcome.resp.Body.Close(); closeErr != nil {
+					t.Fatalf("close response: %v", closeErr)
+				}
+				select {
+				case got := <-committed:
+					if got != int64(len(payload)) {
+						t.Fatalf("egress body bytes: got %d, want %d", got, len(payload))
+					}
+				case <-time.After(time.Second):
+					t.Fatal("egress was not committed after response close")
+				}
 			}
 		})
 	}

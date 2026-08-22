@@ -515,9 +515,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	proxy.ServeHTTP(w, r)
 	if retryTransport == nil && directAttemptTrace != nil && directBodyState != nil &&
-		directBodyState.complete && directAttemptTrace.commitEgress(directResponseReceived, directRoundTripErr) {
-		lifecycle.addEgressBytes(directBodyState.headerBytes)
-		lifecycle.addEgressBytes(directBodyState.bodyBytes)
+		directBodyState.complete.Load() && directAttemptTrace.commitEgress(directResponseReceived, directRoundTripErr) {
+		lifecycle.addEgressBytes(directBodyState.headerBytes.Load())
+		lifecycle.addEgressBytes(directBodyState.bodyBytes.Load())
 	}
 	if ingressBodyCounter != nil {
 		lifecycle.addIngressBytes(ingressBodyCounter.Total())

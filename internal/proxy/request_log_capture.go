@@ -318,6 +318,20 @@ func roundTripWithBodyCompletionBudget(
 	}
 	resp, err := transport.RoundTrip(req)
 	if owner != nil {
+		// A successful RoundTrip may return response headers while an HTTP/2 or
+		// full-duplex transport is still finishing the request body. The response
+		// is already the accepted upstream result at this boundary: never close it
+		// or turn it into a synthetic transport error just because Close is late.
+		if resp != nil && err == nil && ctx.Err() == nil {
+			select {
+			case <-owner.done:
+				return resp, err, counter.Total(), true
+			default:
+				completion := newAttemptBodyCompletion(owner, counter)
+				completion.wrapResponseBody(resp)
+				return resp, err, 0, false
+			}
+		}
 		if awaitErr := owner.await(ctx, budget); awaitErr != nil {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -338,10 +352,199 @@ func roundTripWithBodyCompletionBudget(
 	return resp, err, counter.Total(), true
 }
 
+// attemptBodyCompletion owns request-body accounting after a successful
+// RoundTrip has already returned a response. Its final callback is driven by
+// the response-body lifecycle and fires at most once. There is no second
+// request-body timeout after a response has been accepted: EOF/Close either
+// observes a completed owner or abandons it immediately and fails closed.
+type attemptBodyCompletion struct {
+	owner   *attemptRequestBody
+	counter *countingReadCloser
+
+	settleOnce   sync.Once
+	finalizeOnce sync.Once
+
+	mu              sync.Mutex
+	settledComplete bool
+	finalized       bool
+	finalBytes      int64
+	finalComplete   bool
+	onFinalized     func(int64, bool)
+	callbackCalled  bool
+}
+
+func newAttemptBodyCompletion(
+	owner *attemptRequestBody,
+	counter *countingReadCloser,
+) *attemptBodyCompletion {
+	return &attemptBodyCompletion{
+		owner:   owner,
+		counter: counter,
+	}
+}
+
+func (c *attemptBodyCompletion) settle(complete bool) {
+	if c == nil {
+		return
+	}
+	c.settleOnce.Do(func() {
+		if !complete {
+			c.owner.abort()
+		}
+		c.mu.Lock()
+		c.settledComplete = complete
+		c.mu.Unlock()
+	})
+}
+
+func (c *attemptBodyCompletion) abandon() {
+	if c == nil || c.owner == nil {
+		return
+	}
+	select {
+	case <-c.owner.done:
+		c.settle(true)
+	default:
+		c.owner.abort()
+		c.settle(false)
+	}
+}
+
+// handoff transfers the attempt-release and final accounting ownership to the
+// response lifecycle. Releasing the pre-response attempt timer immediately is
+// required once a response has been accepted; the completion object still
+// owns the one-shot final accounting callback.
+func (c *attemptBodyCompletion) handoff(
+	releaseAttempt func(),
+	onFinalized func(int64, bool),
+) {
+	if c == nil {
+		return
+	}
+	if releaseAttempt != nil {
+		releaseAttempt()
+	}
+	c.mu.Lock()
+	c.onFinalized = onFinalized
+	finalized := c.finalized
+	c.mu.Unlock()
+	if finalized {
+		c.invokeFinalized()
+	}
+}
+
+func (c *attemptBodyCompletion) finalize() {
+	if c == nil {
+		return
+	}
+	c.finalizeOnce.Do(func() {
+		// EOF/Close is the serialization point. If the transport has not closed
+		// the request body yet, abandon it immediately and fail closed; never
+		// block a successful response on a second quiescence timeout.
+		c.abandon()
+		c.mu.Lock()
+		complete := c.settledComplete
+		bodyBytes := int64(0)
+		if complete && c.counter != nil {
+			bodyBytes = c.counter.Total()
+		}
+		c.finalized = true
+		c.finalBytes = bodyBytes
+		c.finalComplete = complete
+		c.mu.Unlock()
+		c.invokeFinalized()
+	})
+}
+
+func (c *attemptBodyCompletion) invokeFinalized() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.finalized || c.callbackCalled || c.onFinalized == nil {
+		c.mu.Unlock()
+		return
+	}
+	c.callbackCalled = true
+	callback := c.onFinalized
+	bodyBytes := c.finalBytes
+	complete := c.finalComplete
+	c.mu.Unlock()
+	callback(bodyBytes, complete)
+}
+
+func (c *attemptBodyCompletion) wrapResponseBody(resp *http.Response) {
+	if c == nil || resp == nil {
+		return
+	}
+	if resp.Body == nil {
+		resp.Body = http.NoBody
+	}
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok {
+		resp.Body = &attemptResponseReadWriteBody{ReadWriteCloser: rwc, completion: c}
+		return
+	}
+	resp.Body = &attemptResponseBody{ReadCloser: resp.Body, completion: c}
+}
+
+type attemptResponseBody struct {
+	io.ReadCloser
+	completion *attemptBodyCompletion
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (b *attemptResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && b.completion != nil {
+		b.completion.finalize()
+	}
+	return n, err
+}
+
+func (b *attemptResponseBody) Close() error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.ReadCloser.Close()
+		if b.completion != nil {
+			b.completion.finalize()
+		}
+	})
+	return b.closeErr
+}
+
+type attemptResponseReadWriteBody struct {
+	io.ReadWriteCloser
+	completion *attemptBodyCompletion
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (b *attemptResponseReadWriteBody) Read(p []byte) (int, error) {
+	n, err := b.ReadWriteCloser.Read(p)
+	if err != nil && b.completion != nil {
+		b.completion.finalize()
+	}
+	return n, err
+}
+
+func (b *attemptResponseReadWriteBody) Write(p []byte) (int, error) {
+	return b.ReadWriteCloser.Write(p)
+}
+
+func (b *attemptResponseReadWriteBody) Close() error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.ReadWriteCloser.Close()
+		if b.completion != nil {
+			b.completion.finalize()
+		}
+	})
+	return b.closeErr
+}
+
 type attemptRoundTripState struct {
-	complete    bool
-	headerBytes int64
-	bodyBytes   int64
+	complete    atomic.Bool
+	headerBytes atomic.Int64
+	bodyBytes   atomic.Int64
 }
 
 type bodyCompletionRoundTripper struct {
@@ -352,17 +555,44 @@ type bodyCompletionRoundTripper struct {
 func (t bodyCompletionRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	headerBytes := headerWireLen(req.Header)
 	resp, err, bodyBytes, complete := roundTripWithBodyCompletion(req.Context(), t.next, req)
+	deferred := responseBodyCompletion(resp)
 	if t.state != nil {
-		t.state.complete = complete
-		if complete {
-			t.state.headerBytes = headerBytes
-			t.state.bodyBytes = bodyBytes
-		} else {
-			t.state.headerBytes = 0
-			t.state.bodyBytes = 0
+		setAttemptRoundTripState(t.state, complete, headerBytes, bodyBytes)
+		if deferred != nil {
+			deferred.handoff(nil, func(bodyBytes int64, complete bool) {
+				setAttemptRoundTripState(t.state, complete, headerBytes, bodyBytes)
+			})
 		}
 	}
 	return resp, err
+}
+
+func responseBodyCompletion(resp *http.Response) *attemptBodyCompletion {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	switch body := resp.Body.(type) {
+	case *attemptResponseBody:
+		return body.completion
+	case *attemptResponseReadWriteBody:
+		return body.completion
+	default:
+		return nil
+	}
+}
+
+func setAttemptRoundTripState(state *attemptRoundTripState, complete bool, headerBytes, bodyBytes int64) {
+	if state == nil {
+		return
+	}
+	state.complete.Store(complete)
+	if complete {
+		state.headerBytes.Store(headerBytes)
+		state.bodyBytes.Store(bodyBytes)
+		return
+	}
+	state.headerBytes.Store(0)
+	state.bodyBytes.Store(0)
 }
 
 // countingReadCloser wraps a body stream and records total read bytes.

@@ -14,10 +14,10 @@ import (
 	"github.com/Resinat/Resin/internal/routing"
 )
 
-// reverseRetryRoundTripper applies the same compiled response decision and
-// immutable retry snapshot used by the forward proxy. Reverse requests are
-// retried only after their body is fully captured and before ReverseProxy has
-// committed any downstream response bytes.
+// reverseRetryRoundTripper applies the compiled response decision and bounded
+// retry state used by the forward proxy. Reverse requests are retried only
+// after their body is fully captured and before ReverseProxy has committed any
+// downstream response bytes.
 type reverseRetryRoundTripper struct {
 	router              *routing.Router
 	pool                outbound.PoolAccessor
@@ -56,28 +56,37 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	var preparedBody []byte
 	var bodyPrepared bool
 	if budgetEnabled && baseReq.Body != nil && baseReq.Body != http.NoBody {
-		var prepared bool
-		var prepareErr error
-		var passthroughBody io.ReadCloser
-		preparedBody, prepared, passthroughBody, prepareErr = captureRequestBodyForRetry(requestCtx, req)
-		if prepareErr != nil {
-			releaseRequest()
-			cancelRequest()
-			return nil, prepareErr
-		}
-		bodyPrepared = prepared
 		baseReq = baseReq.Clone(baseReq.Context())
-		if prepared {
-			baseReq.Body = http.NoBody
-			baseReq.ContentLength = int64(len(preparedBody))
-			baseReq.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(preparedBody)), nil
-			}
-		} else if passthroughBody != nil {
-			baseReq.Body = passthroughBody
-		} else {
+		if baseReq.GetBody == nil {
+			// Real reverse-proxy requests normally arrive without GetBody. Keep
+			// their first attempt full-duplex: capture only the bounded bytes
+			// actually consumed by the transport, and decide replayability after
+			// the response rule has finished reading the response.
 			capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
 			baseReq.Body = capture
+		} else {
+			var prepared bool
+			var prepareErr error
+			var passthroughBody io.ReadCloser
+			preparedBody, prepared, passthroughBody, prepareErr = captureRequestBodyForRetry(requestCtx, req)
+			if prepareErr != nil {
+				releaseRequest()
+				cancelRequest()
+				return nil, prepareErr
+			}
+			bodyPrepared = prepared
+			if prepared {
+				baseReq.Body = http.NoBody
+				baseReq.ContentLength = int64(len(preparedBody))
+				baseReq.GetBody = func() (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(preparedBody)), nil
+				}
+			} else if passthroughBody != nil {
+				baseReq.Body = passthroughBody
+			} else {
+				capture = newReplayBodyCapture(baseReq.Body, baseReq.ContentLength)
+				baseReq.Body = capture
+			}
 		}
 	}
 	finishResponse := func(resp *http.Response, accepted bool, cancelAttempt context.CancelFunc) (*http.Response, error) {
@@ -173,6 +182,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		resp, err, bodyBytes, bodyComplete := roundTripWithBodyCompletion(
 			attemptCtx, t.transportFor(current), outReq,
 		)
+		deferredBody := responseBodyCompletion(resp)
 		bodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
 		retryCurrent := func() bool {
 			if cancelAttempt != nil {
@@ -185,7 +195,7 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			current = next
 			return true
 		}
-		if !bodyComplete {
+		if !bodyComplete && deferredBody == nil {
 			if err != nil {
 				failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
 				canRetry := budgetEnabled && failureMatched && failureMatch.RetryNext() && (attemptTrace == nil || !attemptTrace.responseStarted()) && resp == nil && bounded &&
@@ -200,11 +210,18 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 			t.promotable = false
 			return nil, err
 		}
-		if attemptTrace != nil && attemptTrace.commitEgress(resp != nil && err == nil, err) && t.onAttemptEgress != nil {
+		if bodyComplete && attemptTrace != nil && attemptTrace.commitEgress(resp != nil && err == nil, err) && t.onAttemptEgress != nil {
 			t.onAttemptEgress(pendingHeaderBytes, bodyBytes)
 		}
 		if bodyComplete && resp != nil && err == nil {
 			releaseAttempt()
+		} else if deferredBody != nil && resp != nil && err == nil {
+			deferredBody.handoff(releaseAttempt, func(bodyBytes int64, complete bool) {
+				if !complete || attemptTrace == nil || !attemptTrace.commitEgress(true, nil) || t.onAttemptEgress == nil {
+					return
+				}
+				t.onAttemptEgress(pendingHeaderBytes, bodyBytes)
+			})
 		}
 		if err != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(t.router, current.Route, attemptTrace, err)
@@ -224,7 +241,8 @@ func (t *reverseRetryRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 
 		decision, matched := applyResponseRules(t.router, current.Route, resp)
 		finalAccepted := !matched || decision.Action == platform.ResponseRuleActionPassthrough
-		if !matched || !budgetEnabled || !decision.RetryNext() || !bodyReplayable || attempt+1 >= budget {
+		responseBodyReplayable := bodyPrepared || requestCanBeReplayed(req, capture)
+		if !matched || !budgetEnabled || !decision.RetryNext() || !responseBodyReplayable || attempt+1 >= budget {
 			return finishResponse(resp, finalAccepted, cancelAttempt)
 		}
 		if requestCtx.Err() != nil {

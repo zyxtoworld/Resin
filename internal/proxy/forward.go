@@ -653,10 +653,12 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// any response bytes are written to the downstream client.
 		var bodyBytes int64
 		var bodyComplete bool
+		var deferredBody *attemptBodyCompletion
 		resp, roundTripErr, bodyBytes, bodyComplete = roundTripWithBodyCompletion(
 			attemptCtx, transport, outReq,
 		)
-		if !bodyComplete {
+		deferredBody = responseBodyCompletion(resp)
+		if !bodyComplete && deferredBody == nil {
 			resp = nil
 			if cancelAttempt != nil {
 				cancelAttempt()
@@ -670,6 +672,14 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			// The pre-response timer has served its purpose. Do not let the
 			// platform retry budget truncate an accepted streaming response.
 			releaseAttempt()
+		} else if deferredBody != nil && resp != nil && roundTripErr == nil {
+			deferredBody.handoff(releaseAttempt, func(bodyBytes int64, complete bool) {
+				if !complete || !upstreamAttemptTrace.commitEgress(true, nil) {
+					return
+				}
+				lifecycle.addEgressBytes(pendingEgressHeaderBytes)
+				lifecycle.addEgressBytes(bodyBytes)
+			})
 		}
 		if roundTripErr != nil {
 			failureMatch, failureMatched, _ := applyTransportFailureRule(p.router, route, upstreamAttemptTrace, roundTripErr)
