@@ -350,7 +350,7 @@ func newTopologyRuntime(
 				callerDeadline = event.CallerDeadline.UTC().Format(time.RFC3339Nano)
 			}
 			log.Printf(
-				"subscription_refresh correlation_id=%s parent_correlation_id=%s subscription_id=%s attempt_seq=%d stage=%s source_type=%s elapsed_ms=%d result=%s caller_deadline=%s fetch_total_timeout=%s fetch_attempt_timeout_cap=%s prepared_nodes=%d",
+				"subscription_refresh correlation_id=%s parent_correlation_id=%s subscription_id=%s attempt_seq=%d stage=%s source_type=%s elapsed_ms=%d result=%s caller_deadline=%s fetch_total_timeout=%s fetch_attempt_timeout_cap=%s prepared_nodes=%d runtime_preparation_total=%d runtime_preparation_completed=%d runtime_preparation_errors=%d runtime_preparation_stale=%d runtime_preparation_dropped=%d runtime_preparation_coalesced=%d",
 				event.CorrelationID,
 				event.ParentCorrelationID,
 				event.SubscriptionID,
@@ -363,6 +363,12 @@ func newTopologyRuntime(
 				event.FetchTotalTimeout,
 				event.FetchAttemptTimeoutCap,
 				event.PreparedNodeCount,
+				event.RuntimePreparationTotal,
+				event.RuntimePreparationCompleted,
+				event.RuntimePreparationErrors,
+				event.RuntimePreparationStale,
+				event.RuntimePreparationDropped,
+				event.RuntimePreparationCoalesced,
 			)
 		},
 		RunRefreshMutation: func(fn func(topology.PersistenceAdmission)) bool {

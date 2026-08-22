@@ -43,6 +43,11 @@ type runtimePreparationBatch struct {
 	started   bool
 	ended     bool
 	result    string
+	completed int
+	errors    int
+	stale     int
+	dropped   int
+	coalesced int
 }
 
 func newRuntimePreparationBatch(parent *refreshTrace) *runtimePreparationBatch {
@@ -69,8 +74,9 @@ func (b *runtimePreparationBatch) start() {
 	}
 	b.started = true
 	total := b.total
+	summary := b.summaryLocked()
 	b.mu.Unlock()
-	b.trace.emit(RefreshStageRuntimePreparationStart, "started", total)
+	b.trace.emitWithPreparationSummary(RefreshStageRuntimePreparationStart, "started", total, summary)
 }
 
 func (b *runtimePreparationBatch) complete(result string) {
@@ -84,6 +90,7 @@ func (b *runtimePreparationBatch) complete(result string) {
 	)
 	b.mu.Lock()
 	b.result = mergeRuntimePreparationResult(b.result, result)
+	b.countResultLocked(result)
 	if b.remaining > 0 {
 		b.remaining--
 	}
@@ -96,9 +103,10 @@ func (b *runtimePreparationBatch) complete(result string) {
 		endCount = b.total
 		shouldEnd = true
 	}
+	summary := b.summaryLocked()
 	b.mu.Unlock()
 	if shouldEnd {
-		b.trace.emit(RefreshStageRuntimePreparationEnd, endResult, endCount)
+		b.trace.emitWithPreparationSummary(RefreshStageRuntimePreparationEnd, endResult, endCount, summary)
 	}
 }
 
@@ -108,6 +116,7 @@ func (b *runtimePreparationBatch) finishEmpty(result string) {
 	}
 	b.mu.Lock()
 	b.result = mergeRuntimePreparationResult(b.result, result)
+	b.countResultLocked(result)
 	if b.ended {
 		b.mu.Unlock()
 		return
@@ -118,8 +127,41 @@ func (b *runtimePreparationBatch) finishEmpty(result string) {
 	if endResult == "" {
 		endResult = "dropped"
 	}
+	summary := b.summaryLocked()
 	b.mu.Unlock()
-	b.trace.emit(RefreshStageRuntimePreparationEnd, endResult, 0)
+	b.trace.emitWithPreparationSummary(RefreshStageRuntimePreparationEnd, endResult, 0, summary)
+}
+
+func (b *runtimePreparationBatch) countResultLocked(result string) {
+	if b == nil {
+		return
+	}
+	switch result {
+	case "completed":
+		b.completed++
+	case "error":
+		b.errors++
+	case "stale":
+		b.stale++
+	case "dropped":
+		b.dropped++
+	case "coalesced":
+		b.coalesced++
+	}
+}
+
+func (b *runtimePreparationBatch) summaryLocked() RuntimePreparationSummary {
+	if b == nil {
+		return RuntimePreparationSummary{}
+	}
+	return RuntimePreparationSummary{
+		Total:     b.total,
+		Completed: b.completed,
+		Errors:    b.errors,
+		Stale:     b.stale,
+		Dropped:   b.dropped,
+		Coalesced: b.coalesced,
+	}
 }
 
 func mergeRuntimePreparationResult(current, next string) string {
@@ -476,7 +518,12 @@ func (s *SubscriptionScheduler) enqueueRuntimePreparation(
 	// Publish the scheduled lifecycle event before making the request visible
 	// to the worker. Otherwise an already-running worker can emit start/end
 	// before this goroutine gets to the observer callback.
-	batch.trace.emit(RefreshStageRuntimePreparationScheduled, "scheduled", batch.total)
+	batch.trace.emitWithPreparationSummary(
+		RefreshStageRuntimePreparationScheduled,
+		"scheduled",
+		batch.total,
+		RuntimePreparationSummary{Total: batch.total},
+	)
 	var replaced *runtimePreparationRequest
 	needStart := false
 

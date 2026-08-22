@@ -96,6 +96,9 @@ func TestSchedulerRuntimePreparationCommitGateAndFailureIsObservable(t *testing.
 	if prepEnd == nil || prepEnd.Result != "error" || prepEnd.ParentCorrelationID == "" {
 		t.Fatalf("runtime preparation failure event = %+v", prepEnd)
 	}
+	if prepEnd.RuntimePreparationTotal != 1 || prepEnd.RuntimePreparationCompleted != 0 || prepEnd.RuntimePreparationErrors != 1 || prepEnd.RuntimePreparationStale != 0 || prepEnd.RuntimePreparationDropped != 0 {
+		t.Fatalf("runtime preparation failure summary = total:%d completed:%d errors:%d stale:%d dropped:%d", prepEnd.RuntimePreparationTotal, prepEnd.RuntimePreparationCompleted, prepEnd.RuntimePreparationErrors, prepEnd.RuntimePreparationStale, prepEnd.RuntimePreparationDropped)
+	}
 }
 
 func TestSchedulerRuntimePreparationTwoLargeSubscriptionsAreNotNodeCapped(t *testing.T) {
@@ -464,5 +467,27 @@ func TestRuntimePreparationBatchDoesNotHideMixedStaleOutcome(t *testing.T) {
 	defer mu.Unlock()
 	if result != "stale" {
 		t.Fatalf("mixed preparation result = %q, want stale", result)
+	}
+}
+
+func TestRuntimePreparationBatchCountsCompletedAndErrorSeparately(t *testing.T) {
+	var got RefreshEvent
+	trace := newRefreshTrace(context.Background(), "partial-batch", 1, 0, 0, func(event RefreshEvent) {
+		if event.Stage == RefreshStageRuntimePreparationEnd {
+			got = event
+		}
+	})
+	batch := newRuntimePreparationBatch(trace)
+	batch.total = 2
+	batch.remaining = 2
+	batch.start()
+	batch.complete("completed")
+	batch.complete("error")
+
+	if got.Result != "error" {
+		t.Fatalf("partial preparation result = %q, want error", got.Result)
+	}
+	if got.RuntimePreparationTotal != 2 || got.RuntimePreparationCompleted != 1 || got.RuntimePreparationErrors != 1 || got.RuntimePreparationStale != 0 || got.RuntimePreparationDropped != 0 {
+		t.Fatalf("partial preparation summary = total:%d completed:%d errors:%d stale:%d dropped:%d", got.RuntimePreparationTotal, got.RuntimePreparationCompleted, got.RuntimePreparationErrors, got.RuntimePreparationStale, got.RuntimePreparationDropped)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -269,5 +270,77 @@ func TestAPIContract_SubscriptionRefreshAction_E2ELocalSource(t *testing.T) {
 	}
 	if got, _ := subBody["last_error"].(string); got != "" {
 		t.Fatalf("local subscription last_error: got %q, want empty", got)
+	}
+}
+
+func TestAPIContract_RuntimePreparationErrorDoesNotPolluteSubscriptionRefreshStatus(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	oldScheduler := cp.Scheduler
+	oldScheduler.Stop()
+
+	const rawOutbound = `{"type":"shadowsocks","tag":"prep-status","server":"198.18.0.10","server_port":443,"method":"aes-256-gcm","password":"secret"}`
+	localContent := `{"outbounds":[` + rawOutbound + `]}`
+	wantHash := node.HashFromRawOptions([]byte(rawOutbound)).Hex()
+	prepDone := make(chan struct{})
+	var prepOnce sync.Once
+	cp.Pool.SetOnNodeAddedRuntime(func(hash node.Hash, entry *node.NodeEntry) {
+		if hash.Hex() != wantHash {
+			return
+		}
+		entry.SetLastError("outbound build: test preparation failure")
+		prepOnce.Do(func() { close(prepDone) })
+	})
+	cp.Scheduler = topology.NewSubscriptionScheduler(topology.SchedulerConfig{
+		SubManager: cp.SubMgr,
+		Pool:       cp.Pool,
+		Fetcher:    func(context.Context, string) ([]byte, error) { return []byte(localContent), nil },
+	})
+	t.Cleanup(func() { cp.Scheduler.Stop() })
+
+	createRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions", map[string]any{
+		"name":        "prep-status",
+		"source_type": "local",
+		"content":     localContent,
+	}, true)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create subscription status: got %d, body=%s", createRec.Code, createRec.Body.String())
+	}
+	subID, _ := decodeJSONMap(t, createRec)["id"].(string)
+	if subID == "" {
+		t.Fatal("create subscription missing id")
+	}
+
+	refreshRec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/subscriptions/"+subID+"/actions/refresh", nil, true)
+	if refreshRec.Code != http.StatusOK {
+		t.Fatalf("refresh status: got %d, body=%s", refreshRec.Code, refreshRec.Body.String())
+	}
+	select {
+	case <-prepDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime preparation did not report its node failure")
+	}
+
+	getRec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/subscriptions/"+subID, nil, true)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get subscription status: got %d, body=%s", getRec.Code, getRec.Body.String())
+	}
+	subBody := decodeJSONMap(t, getRec)
+	if got, _ := subBody["last_error"].(string); got != "" {
+		t.Fatalf("runtime preparation error polluted subscription last_error: %q", got)
+	}
+	if got, _ := subBody["last_updated"].(string); strings.TrimSpace(got) == "" {
+		t.Fatalf("successful subscription commit lost last_updated: body=%s", getRec.Body.String())
+	}
+	if got := subBody["node_count"]; got != float64(1) {
+		t.Fatalf("subscription node_count: got %v, want 1", got)
+	}
+
+	failedNodes := doJSONRequest(t, srv, http.MethodGet, "/api/v1/nodes?subscription_id="+subID+"&has_outbound=false", nil, true)
+	if failedNodes.Code != http.StatusOK {
+		t.Fatalf("failed node projection status: got %d, body=%s", failedNodes.Code, failedNodes.Body.String())
+	}
+	failedBody := decodeJSONMap(t, failedNodes)
+	if got := failedBody["total"]; got != float64(1) {
+		t.Fatalf("runtime failure node projection total: got %v, want 1", got)
 	}
 }

@@ -45,6 +45,27 @@ type RefreshEvent struct {
 	FetchTotalTimeout      time.Duration
 	FetchAttemptTimeoutCap time.Duration
 	PreparedNodeCount      int
+	// RuntimePreparation* are fixed-size outcome counters. They are populated
+	// only on the independent runtime-preparation correlation, so a terminal
+	// "error" can be distinguished from queue drops, coalescing, and stale
+	// generation invalidation without claiming every node became ready.
+	RuntimePreparationTotal     int
+	RuntimePreparationCompleted int
+	RuntimePreparationErrors    int
+	RuntimePreparationStale     int
+	RuntimePreparationDropped   int
+	RuntimePreparationCoalesced int
+}
+
+// RuntimePreparationSummary is a bounded result summary for one preparation
+// batch. It contains counts only; per-node details remain in node state/logs.
+type RuntimePreparationSummary struct {
+	Total     int
+	Completed int
+	Errors    int
+	Stale     int
+	Dropped   int
+	Coalesced int
 }
 
 // RefreshObserver receives one safe event at a time. Implementations must be
@@ -108,23 +129,38 @@ func newRuntimePreparationTrace(parent *refreshTrace) *refreshTrace {
 }
 
 func (t *refreshTrace) emit(stage RefreshStage, result string, preparedNodeCount int) {
+	t.emitWithPreparationSummary(stage, result, preparedNodeCount, RuntimePreparationSummary{})
+}
+
+func (t *refreshTrace) emitWithPreparationSummary(
+	stage RefreshStage,
+	result string,
+	preparedNodeCount int,
+	summary RuntimePreparationSummary,
+) {
 	if t == nil || t.observe == nil {
 		return
 	}
 	t.observe(RefreshEvent{
-		CorrelationID:          t.correlationID,
-		ParentCorrelationID:    t.parentCorrelationID,
-		SubscriptionID:         t.subscriptionID,
-		AttemptSeq:             t.attemptSeq,
-		Stage:                  stage,
-		SourceType:             t.sourceType,
-		Elapsed:                time.Since(t.started),
-		Result:                 result,
-		CallerDeadlineSet:      t.callerDeadlineSet,
-		CallerDeadline:         t.callerDeadline,
-		FetchTotalTimeout:      t.fetchTotalTimeout,
-		FetchAttemptTimeoutCap: t.fetchAttemptTimeoutCap,
-		PreparedNodeCount:      preparedNodeCount,
+		CorrelationID:               t.correlationID,
+		ParentCorrelationID:         t.parentCorrelationID,
+		SubscriptionID:              t.subscriptionID,
+		AttemptSeq:                  t.attemptSeq,
+		Stage:                       stage,
+		SourceType:                  t.sourceType,
+		Elapsed:                     time.Since(t.started),
+		Result:                      result,
+		CallerDeadlineSet:           t.callerDeadlineSet,
+		CallerDeadline:              t.callerDeadline,
+		FetchTotalTimeout:           t.fetchTotalTimeout,
+		FetchAttemptTimeoutCap:      t.fetchAttemptTimeoutCap,
+		PreparedNodeCount:           preparedNodeCount,
+		RuntimePreparationTotal:     summary.Total,
+		RuntimePreparationCompleted: summary.Completed,
+		RuntimePreparationErrors:    summary.Errors,
+		RuntimePreparationStale:     summary.Stale,
+		RuntimePreparationDropped:   summary.Dropped,
+		RuntimePreparationCoalesced: summary.Coalesced,
 	})
 }
 
